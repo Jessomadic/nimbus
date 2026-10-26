@@ -28,3 +28,15 @@ export function redact(text) {
   if (CRED_WORDS.test(s)) s = s.replace(UUID, MASK);
   return s;
 }
+
+// Redact values before encoding JSON. Applying a text regex to encoded JSON
+// can replace a numeric token-count plus its closing brace and corrupt state.
+export function redactValue(value) {
+  if (typeof value === 'string') return redact(value);
+  if (Array.isArray(value)) return value.map(redactValue);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key,item]) => [key,
+    typeof item === 'string' && /^(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization)$/i.test(key)
+      ? '[REDACTED]' : redactValue(item)]));
+  return value;
+}
+export function encodeRedacted(value) { return JSON.stringify(redactValue(value)); }
