@@ -1,186 +1,155 @@
-# Nimbus
+# Nimbus for Windows
 
-Your personal team of always-on AI bots. Each bot is Claude Code running headless on your
-server, under your own Claude login. You talk to them in a web app, they work in the
-background, and they stop and ask before anything risky.
+A team of independent AI workers with a shared local inference pool and OpenAI subscription execution through the Codex CLI. Workers have their own instructions, working memory, task histories, artifacts and browser groups. They share model capacity, rather than loading a model for every worker.
 
-- Chat with each bot and watch a live work trace of every tool call
-- Group chats where bots @mention each other to hand off work
-- Approvals: risky actions (send, pay, delete, push, merge) pause until you approve
-- Effort per bot (Low → Max) to control how much of your plan each one uses
-- Routines on a schedule (cron), running even when the app is closed
-- Per-bot memory the bot updates itself (`MEMORY.md`)
-- Themes, accent color, light/dark
-- Email + password accounts with optional two-factor codes; reach it from your phone through Twingate
-- Android app (build it yourself, see [android/README.md](android/README.md)): dictation, file uploads, notifications
-- Voice dictation transcribed on your own server (whisper.cpp), file and image attachments, bots that message each other
+This replaces the original execution backend. Nimbus runs independently. **Lumos integration is deliberately disconnected.**
 
-No npm packages. Needs only **Node 22.13+** and **Claude Code**.
+Workers can edit Nimbus itself through a [validated self-update workflow](docs/CAPABILITIES.md#self-updates): source snapshot, exact edits, syntax/tests, supervised restart and a new-process receipt. They also have patching, terminal sessions, task plans, user questions, image input and local skill discovery. **Full Codex parity remains a target, not a completed claim**; see the [capability coverage and remaining integrations](docs/CAPABILITIES.md).
 
-## Proxmox VE (one line)
+The current registry contains **67 native tools, including 48 specialist tools**, for orchestration, engineering/Git, research/evidence, data/documents/browser audits, and host automation. The [specialist tool directory](docs/TOOLS.md) describes these workflows. Every built-in agent receives tools matched to its role. Use `tool_catalog` inside a worker to inspect its actual enabled tools and connected MCP capabilities.
 
-In the Proxmox host shell, paste:
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Brandon-Rios/nimbus/main/proxmox/nimbus-lxc.sh)"
-```
-It asks a few questions (container ID, size, network, who may sign in), creates a Debian 13 LXC container (Debian 12 on older Proxmox),
-installs Nimbus in it as a dedicated `nimbus` user with a service that starts on boot, and prints the address.
-Then sign the bots in to Claude once: `pct enter <id>`, `su - nimbus -c claude`, `systemctl restart nimbus`.
+When a reusable capability is genuinely absent, workers can use the [missing-tool development workflow](docs/TOOL-DEVELOPMENT.md). Nimbus reports the gap at the original request, parks that task, assigns design/build/QA/review work, validates and applies the update, and resumes the task only after installed-tool verification. Access/setup failures are reported separately.
 
-## Quick install
+The team includes an Orchestrator and twenty [specialist roles](docs/WORKERS.md), including a GitHub coordinator with five registered subagents. Each has a comprehensive shared system brief, focused workflow and editable model preference. The local router adapts that preference to the task; availability failures can fall back between local and OpenAI execution. Cloud inference uses temporary Codex sessions so Nimbus tasks stay in Nimbus's own history.
 
-On a Linux server (Debian/Ubuntu tested), as the user Nimbus should run as:
+The sidebar starts with the Orchestrator. Its disclosure control collapses the whole team branch; inside it are the collapsible Engineering, Quality & Security, Research & Knowledge, Operations, and GitHub display groups, followed by agents. The Orchestrator chat opens separately from its disclosure control. Change a specialist's **Display group** in its settings to organize navigation. Display groups do not restrict communication or tool permissions; existing GitHub subagents retain their hierarchy. Collapse preferences stay in your browser, and collapsed branches retain activity and attention indicators.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Brandon-Rios/nimbus/main/install.sh | bash
-```
+This installation exposes remote iPhone access through a Cloudflare Tunnel at [nimbus.jessecopas.com](https://nimbus.jessecopas.com). A new installation needs its own tunnel or reverse proxy. See [remote access](docs/REMOTE-ACCESS.md) for home-screen installation, live updates, authentication and network verification.
 
-It installs Node 22 and Claude Code if needed, helps you log in to Claude, asks who may sign in, optionally
-sets up voice dictation and a system service, and prints the address to open. Safe to re-run. Prefer to
-read it first? `git clone` the repo and run `./install.sh`.
+## Changes from the base project
 
-## Manual setup (Linux VPS or home server)
+Version **0.2.0** builds on base commit [`c373399`](https://github.com/Jessomadic/nimbus/commit/c373399). Development changes are published in separate `feat`, `fix` and documentation commits so each area can be reviewed in Git history.
 
-```bash
-# 1. Node 22 and Claude Code
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs
-npm install -g @anthropic-ai/claude-code
+| Feature area | What changed |
+| --- | --- |
+| Windows deployment | PowerShell setup, hidden supervisor, graceful stop, optional sign-in startup and protected local credentials replace the Linux/Claude deployment path. See [migration](docs/WINDOWS-MIGRATION.md). |
+| Model execution | Shared, resource-guarded LM Studio capacity and Codex subscription execution use task-based routing, explicit model selection and recorded availability fallback. |
+| Worker team | An Orchestrator and twenty specialist roles have persistent instructions, independent task checkpoints, delegation and task-result collection. [Worker guide](docs/WORKERS.md). |
+| Native tools | Host file/patch tools, resumable terminal sessions, images, plans, user questions, isolated browser groups and engineering, research, content and operations tools. [Tool directory](docs/TOOLS.md). |
+| Connectors | Independently configured MCP services expose their discovered tools through the same host approval and journal boundary. |
+| Self-maintenance | Source snapshots, exact-hash validation, supervised update/restore and staged development of missing tools. [Capabilities](docs/CAPABILITIES.md), [tool development](docs/TOOL-DEVELOPMENT.md). |
+| Dashboard and mobile | Runtime/task evidence, browser previews, collapsible worker groups, passkey management and installable web-app assets. [Remote access](docs/REMOTE-ACCESS.md). |
+| Authentication and recovery | Username/password plus required owner passkeys, encrypted portable backups and Windows access controls. [Passkeys](docs/PASSKEYS.md), [security](docs/SECURITY.md). |
 
-# 2. Log in to Claude once, as the user Nimbus will run as
-claude            # finish the login, then type /exit
+Bug-fix commits cover valid JSON redaction, bounded tool attempts and model-input previews, session revocation and live-stream authorization, duplicate scheduled work, startup-script parsing, read-only health-probe failure handling, provider action isolation, and task-history/checkpoint recovery. Regression tests cover these boundaries; fresh automated results and historical live checks are recorded in [verification](docs/VERIFICATION.md).
 
-# 3. Get Nimbus
-git clone https://github.com/Brandon-Rios/nimbus.git && cd nimbus
-NIMBUS_ALLOWED_EMAILS=you@example.com npm start
-# → Nimbus running at http://0.0.0.0:8787
+External connectors, desktop control, generated media, the Hermes/Lumos bridge and Windows Server deployment each have separate setup or verification requirements. The [capability inventory](docs/CAPABILITIES.md) records the remaining gaps.
+
+## Start on this PC
+
+```powershell
+.\Setup-Nimbus.ps1
+.\Start-Nimbus.ps1
 ```
 
-Nimbus won't start without a login method: `NIMBUS_ALLOWED_EMAILS` (email accounts) or `NIMBUS_PASSWORD`.
+Open `http://127.0.0.1:8787` for a fresh local installation, or the configured HTTPS address for remote access. This installation's owner login is **Jessomadic + the existing password + a required passkey**; passkey enrollment requires the configured canonical HTTPS origin. Follow [passkey setup](docs/PASSKEYS.md) for first enrollment, additional keys and owner recovery. To display the generated dashboard password locally:
 
-**Email + password:** anyone on `NIMBUS_ALLOWED_EMAILS` can choose **Create account** on the login page.
-Nimbus can't send email, so it can't verify an address; only listed emails can sign up, once each.
-Everyone who signs in shares the same bots.
-You sign in once per device; sessions last 90 days.
-
-## Reach it from your phone (Twingate)
-
-1. In the Twingate admin console, add a **Resource** for the server: its LAN IP or hostname,
-   port `8787`, served by a Connector that can reach the server.
-2. Give your account access to that Resource and install the Twingate client on your phone.
-3. With Twingate on, open `http://<server-ip-or-hostname>:8787` and log in.
-4. In Safari/Chrome, choose **Add to Home Screen**.
-
-Keep port 8787 closed to the internet on your router/VPS firewall, so only Twingate can reach it:
-
-```bash
-sudo ufw allow from <connector-ip> to any port 8787   # or your LAN subnet, e.g. 192.168.1.0/24
-sudo ufw deny 8787
+```powershell
+node bin/ui-password.mjs
 ```
 
-**Notifications and HTTPS:** phone notifications need HTTPS, which plain `http://` over Twingate
-doesn't give you. Everything else works without it. To get notifications, put Nimbus behind
-Caddy with an internal certificate (`tls internal`) and trust Caddy's root certificate on your
-phone, then point the Twingate Resource at Caddy's port and set `NIMBUS_SECURE_COOKIE=1`.
+Alternatively, in shared-password mode, `node --env-file-if-exists=.env bin/nimbus.mjs OPEN` issues a one-time local sign-in link. It expires after one minute and is accepted once. Email-account mode requires signing in with an account password. Setup and startup restrict Windows file access to the checkout owner, SYSTEM and administrators; see [security details](docs/SECURITY.md).
 
-## Keep it running (systemd)
+`Start-Nimbus.ps1` starts the hidden Windows supervisor. Logs live under `data/`. `Stop-Nimbus.ps1` drains and stops the runtime through its authenticated local endpoint. Optional sign-in startup is installed by `Install-NimbusStartup.ps1`; it uses the current Windows account and does not require administrator rights.
 
-Edit `deploy/nimbus.service` (user name, paths, time zone), then:
+## Requirements
 
-```bash
-sudo cp deploy/nimbus.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now nimbus
-journalctl -u nimbus -f      # logs
+- Windows with Node.js 22.13 or newer and npm.
+- Codex CLI available on PATH, or an absolute `cloud.codexBin` in `nimbus.config.json`.
+- A ChatGPT subscription login for cloud workers: run `codex login` as the Windows account that runs Nimbus. Nimbus verifies the native account type and does not switch to API-key billing.
+- LM Studio and its `lms` CLI for local inference. Start its loopback API server on port 1234. The managed Nimbus pool uses port 12438.
+- A local model capable of structured tool calls. The default cold-load model is `google/gemma-4-e4b`.
+- An NVIDIA GPU with readable `nvidia-smi` memory measurements for the default resource guard.
+
+No hypervisor is required. Windows Server 2025 is the migration target; see [migration](docs/WINDOWS-MIGRATION.md). This checkout has been exercised on the current Windows PC; Server 2025 needs its own deployment checks. Separate VM desktops are outside this version; Hyper-V can be added later if needed.
+
+## Model routing and shared capacity
+
+The local model selects `local`, `luna`, `terra`, `sol`, or `astra` for automatic tasks, with an effort level and a recorded reason. The initial tier guidance is configurable code in `runtime/router.js`; it is not a measured claim that every tier is better for a particular task. Worker settings can explicitly override the tier.
+
+Cloud family names resolve to exact model IDs advertised by the signed-in Codex account. A catalogue entry is not an entitlement guarantee: a successful turn verifies access. Explicit IDs configured under `cloud.models` are honored, and failures are recorded. The actual model and fallback reason appear in each task's timeline.
+
+The default local pool is **one inference request at a time** across all workers, including the router. It reuses a loaded approved/tool-capable model. When the pool is empty, Nimbus loads its one configured model with a five-minute idle TTL. It never creates one resident model per worker, unloads another application's model, or bypasses the 90% RAM/VRAM ceiling. A cold load also checks conservative projected RAM and VRAM use.
+
+When OpenAI is unavailable or exhausted, tasks use local capacity. When local admission/loading/inference is unavailable, including insufficient RAM or VRAM, Nimbus falls back to the OpenAI subscription. If the local router itself cannot run, the host uses the worker's preferred cloud family, or `routing.cloudFallbackTier` (Luna by default) for Local/no preference. This availability decision is labeled separately from a model-authored routing decision and its cause is recorded. Explicit Local selections also allow this availability fallback. If neither backend can proceed, the task pauses with its checkpoint; uncertain tool actions always remain held for review.
+
+Changing a local/cloud route preserves canonical task history and completed tool results. An action whose outcome is uncertain is held for review. Restarted active tasks are interrupted, not automatically replayed. Queued tasks survive restart.
+
+## Tools and browser groups
+
+Both local and cloud routes use Nimbus's own shell, files, shared notes, worker handoffs, browser and configured MCP tool layer. Cloud inference runs through Codex app-server with native side-effect tools disabled and a read-only native sandbox; Nimbus executes and journals the permitted dynamic tools.
+
+Each worker owns a Playwright browser context: tabs, cookies, local storage and sign-ins are isolated from other workers while sharing a browser process. Requests address a tab within that worker's group. A foreign tab ID is rejected. Browser actions do not use the desktop pointer. The team overview shows group tabs and previews. These are Nimbus browser groups, not tab groups inside your personal Chrome profile.
+
+Workers retain private `MEMORY.md` files and provider-independent instructions in `AGENTS.md`. The `shared_note` tool accesses the explicit `data/shared/` knowledge area. Shell and file tools are powerful host tools, not filesystem sandboxes. Scope workers through their enabled tools, instructions and approval rules.
+
+MCP connectors are configured independently in the Marketplace or `mcpServers` in the local config. They do not inherit another app's connector login. Saved connector credentials and browser storage are protected with Windows DPAPI for the running account. Existing user model credentials can be referenced without copying plaintext into configuration.
+
+## Configuration
+
+Copy `nimbus.config.example.json` to `nimbus.config.json` if setup has not already created it. Active config, `.env`, logs and `data/` are ignored by Git.
+
+Important fields:
+
+- `cloud.models`: family-to-model mappings; `auto` resolves against the native Codex catalogue.
+- `local.baseUrl`, `local.model`, `local.approvedModels`, `local.reuseLoaded`.
+- `local.managed`: the standalone pool's LM Studio executable, upstream URL, model key, GPU ratio and conservative load forecasts. Set `enabled: false` to use an independently managed compatible endpoint instead.
+- `local.tokenDpapiFile`: an existing Windows-DPAPI-protected UTF-8 local-server token; alternatively use the environment variable named by `local.tokenEnv`.
+- `workers.maxConcurrent`, `cloud.maxConcurrent`, `workers.maxSteps` and task timeout.
+- `browser.headless`, group limit and per-worker tab limit. Browser mode changes require restarting Nimbus.
+
+The managed local service binds only to loopback. The dashboard also defaults to loopback. Set a deliberate host binding and configure TLS/reverse proxy before network access. HTTPS is optional; an externally supplied TLS proxy is appropriate for server deployment.
+
+## Task API
+
+Local scripts use `data/admin.token` through `bin/nimbus.mjs`. The admin token is accepted only from loopback and is not sent to models or connectors.
+
+```powershell
+node --env-file-if-exists=.env bin/nimbus.mjs GET /api/runtime
+node --env-file-if-exists=.env bin/nimbus.mjs GET /api/tasks
+node --env-file-if-exists=.env bin/nimbus.mjs POST /api/tasks '{"worker":"Builder","task":"Create and verify a small artifact","requestId":"my-unique-request"}'
+node --env-file-if-exists=.env bin/nimbus.mjs GET /api/runs/1/events
 ```
 
-## Settings (environment variables)
+`POST /api/tasks` accepts a worker ID/name, task, context, file paths and an idempotency key (`requestId`). Omitting both worker selectors routes to the unique Orchestrator. Each incoming API/Hermes/Lumos job starts with its own supplied context and checkpoint, without importing another job's or human chat's model conversation. Use the same request ID to retrieve the accepted job, or resume that job's own checkpoint. Reusing a key with different data conflicts. Task status, events, resume and cancellation are separate endpoints.
 
-| Variable | Default | What it does |
-|---|---|---|
-| `PORT` | `8787` | Port to listen on |
-| `HOST` | `0.0.0.0` | Address to listen on. Set to the server's LAN IP to limit it further. |
-| `NIMBUS_DATA` | `./data` | Database and bot workspaces |
-| `NIMBUS_ALLOWED_EMAILS` | — | Comma-separated emails allowed to create an email + password account |
-| `NIMBUS_AGENT_URL` / `NIMBUS_AGENT_TOKEN` / `NIMBUS_CALLBACK_URL` | — | Give bots their own computers. See [deploy/computer/README.md](deploy/computer/README.md) |
-| `NIMBUS_PASSWORD` | — | Optional single shared password (if you don't want accounts) |
-| `NIMBUS_SECURE_COOKIE` | — | Set to `1` when serving over HTTPS |
-| `NIMBUS_WINDOW_BUDGET_USD` | — | If set, the sidebar meter shows % of this per 5 hours |
-| `NIMBUS_RUN_TIMEOUT_MIN` | `45` | Kill a run that takes longer than this |
-| `CLAUDE_BIN` | `claude` | Path to Claude Code |
-| `TZ` | system | Time zone routines run in, e.g. `America/New_York` |
+`GET /api/orchestrator` discovers the designated coordinator and its contact contract. `POST /api/orchestrator/tasks` always targets that coordinator, so Hermes/Lumos does not need to store a mutable worker ID or name. Submit `task`, `context`, `files`, `requestId` and `source` (`hermes`, `lumos` or `api`); retain the returned run ID and poll its status/events. Preserve the owning Hermes task correlation in the idempotency key/context, and return results to that task. Keep authentication credentials on the host, outside model prompts. These endpoints prepare the contact; a running Hermes/Lumos adapter and end-to-end delivery remain separately unconfigured and must not be reported as connected.
 
-## How it works
+For an existing installation, preview `node --env-file-if-exists=.env bin/setup-orchestrator.mjs`, then use `--apply` to install the unique coordinator and adopt parentless workers while preserving existing nested relationships and settings. New specialist templates default to the coordinator when it exists; explicit parent choices are retained. Direct cross-agent handoffs remain available.
 
-- Each bot has a folder at `data/bots/<id>/`. Nimbus writes `CLAUDE.md` there from the bot's
-  settings, and the bot keeps `MEMORY.md` itself. That folder is its working directory.
-- A message runs `claude -p --output-format stream-json --effort <level>` in that folder.
-  Direct chats resume the same Claude session so the bot remembers the conversation;
-  **New chat** starts fresh (memory is kept). Each bot works on one task at a time; extra tasks queue.
-- Bots run with `bypassPermissions` so they don't stall. A `PreToolUse` hook
-  (`hooks/approval-hook.js`) checks every tool call against the bot's **Ask me before** rules
-  and, on a match, waits until you tap Approve or Reject. A rejection note is passed to the bot.
-- Group chats: your message goes to the bots you @mention, otherwise the lead. When a bot's
-  reply @mentions another member, that bot runs next (up to 4 hops).
-- **Usage** shows Claude Code's reported cost for each run. On a Pro/Max plan you aren't billed that; treat it as a
-  relative measure of which bots use the most. Lower effort = less usage.
+The coordinator assigns substantial investigation/implementation to specialists rather than spending its tool budget doing their host work. Existing installations can preview `bin/repair-orchestrator.mjs` and apply it with `--apply`; the repair changes only the coordinator's tool assignment and profile instructions. Task details expose actual child tasks and budget counters. Status collection has a separate bounded attempt allowance, and full tool evidence remains retained even when model input uses a partial preview. See [worker recovery](docs/WORKERS.md#tool-budgets-and-recovery) for an audited instruction refresh when resuming an older paused checkpoint.
 
-## Server settings
+## Backups and migration
 
-**Server settings** in the user menu holds the bot-computer VM (agent URL, token, callback URL) and an
-optional Proxmox API token. Saved values override the matching env vars and apply without a restart.
-With Proxmox set, the Activity panel shows host load and any guests that aren't running.
+`node --env-file-if-exists=.env bin/backup.mjs` creates an authenticated encrypted `.nbak` archive using AES-256-GCM, a consistent SQLite snapshot, artifacts, configuration and portable connector/browser credentials. Backups are retained under `data/backups/` (last fourteen), with an optional additional local or UNC copy destination.
 
-## Scripting Nimbus from the server
+Export the recovery key to a separate private location before moving machines:
 
-`node bin/nimbus.mjs <METHOD> <path> [json]` calls the API from the server itself without logging in,
-e.g. `node bin/nimbus.mjs POST /api/bots '{"name":"Helper"}'`. It uses `data/admin.token`, which Nimbus
-creates on start (readable only by its user) and accepts only from localhost.
+```powershell
+node --env-file-if-exists=.env bin/backup.mjs --export-key D:\Private\nimbus-recovery-key.txt
+node bin/backup.mjs --restore D:\Backups\nimbus-example.nbak D:\Nimbus-Restore D:\Private\nimbus-recovery-key.txt
+```
 
-Attach files and pictures with the paperclip, by pasting, or by dropping them on the chat (up to 10 files, 20 MB each).
-They are saved in `data/uploads/` and the bot gets their paths. `POST /api/admin/restart` restarts Nimbus once no bot is running.
+Restore requires an empty destination. The entire archive is authenticated before extraction. Credentials are protected again for the destination Windows account; native Codex subscription sign-in must be performed on the destination. Do not keep the recovery key alongside a shared backup.
 
-Bots can message each other: every bot's CLAUDE.md lists its teammates and how to run `bin/ask-bot.mjs`
-(ask and wait for the answer, or `--no-wait` to just pass something on). A bot can't message one that is
-waiting on it, and chains stop after 4 bots. Messages show up in the receiving bot's chat.
+## Verification
 
-Nimbus also serves HTTPS on port 8443 (`NIMBUS_HTTPS_PORT`, `0` turns it off) with a self-signed certificate it makes
-in `data/tls/`. Bot desktops and phone notifications need HTTPS; accept the browser warning once per device.
+Install the locked dependencies with `npm ci` when checking out the project on another machine. Setup also installs dependencies and the browser. Run automated checks before starting verification that uses real models:
 
-Voice dictation: the mic button records in the browser (HTTPS only) and Nimbus transcribes it locally with
-whisper.cpp (`~/opt/whisper.cpp`, model `~/opt/whisper-models/ggml-small.en.bin`; override with
-`NIMBUS_WHISPER_BIN` / `NIMBUS_WHISPER_MODEL`). Nimbus starts the whisper server itself on 127.0.0.1:8178.
+```powershell
+npm test
+npm run doctor
+npm run verify:live
+# Optional: verify the other cloud families and a cancelled real host action.
+node --no-warnings --env-file-if-exists=.env bin/verify-models.mjs
+# With the main server stopped (the managed pool port must be free):
+node --no-warnings bin/verify-restart.mjs
+```
 
-Bot computers: attachments are copied to the bot's computer with each task; the computer dialog has a Files tab
-to download what the bot saved (~/Downloads, ~/work); idle computers sleep after 2 h (`NIMBUS_COMPUTER_SLEEP_MIN`, 0 = never)
-and wake on the next task; Server settings → Update computers rebuilds them with the latest Claude Code and Chromium.
+Automated tests use independent temporary state. Live verification requires a running Nimbus server and performs real model/tool tasks in dedicated verification workers, retaining a receipt under `data/verification/`. It consumes normal subscription/local inference capacity. Inspect the receipt rather than treating configuration or a model catalogue as execution proof.
 
-Approvals: `@self-email` in a bot's Always-allow lets it email only you; time waiting for approval doesn't count toward the
-run limit. Routines can be quiet checks (only report problems) and are skipped when the plan's 5-hour limit is over 85%
-(`NIMBUS_ROUTINE_GUARD_PCT`). `data/shared/HOMELAB.md` is included in every bot's brief. Nightly encrypted backups:
-`bin/backup.mjs` (restore with `--restore`). Read-aloud uses Piper (`~/opt/piper`). `bin/team-status.mjs` summarizes the team.
+The optional cancellation check deliberately leaves its worker task held for review, with the observed command marker retained. This demonstrates that cancellation cannot silently replay an uncertain action.
 
-Secrets that look like API keys, tokens or passwords are masked as `[REDACTED]` before chat
-messages, run logs and approvals are saved. The bot still receives your original message.
+## Attribution
 
-## Giving bots tools
-
-Bots have everything Claude Code has on that server: files, shell, web search and fetch.
-For Gmail, Calendar, GitHub, Slack and so on, add MCP servers to Claude Code on the server
-(`claude mcp add --scope user ...`) and every bot can use them. Connector tools show up as
-`mcp__<server>__<tool>`, which is what the approval rules match (e.g. `mcp__gmail__send*`).
-
-To give one bot a code repo, put the path in its instructions ("Work in /home/me/myapp"),
-or clone the repo inside its folder.
-
-## Privacy
-
-- Whether your conversations may be used to train Claude is an **account setting**: claude.ai → Settings →
-  Privacy → **Help improve Claude**. Turn it off there; it covers Claude Code (and so every Nimbus bot) for that account.
-- Nimbus also starts every bot with Claude Code's telemetry, error reporting and feedback surveys turned off.
-
-## Security notes
-
-- Bots can run any command as the Nimbus user. Run Nimbus as a dedicated user that only has
-  access to what the bots should touch.
-- Approval rules are a safety net, not a sandbox. Review the defaults in each bot's settings.
-- Don't open port 8787 to the internet; let Twingate be the only way in. The password is a second lock.
-- Failed logins are rate-limited (8 tries, then 15 minutes). Logins last 90 days per device; **Log out** in the sidebar ends one.
+This Windows port builds on [Jessomadic/nimbus](https://github.com/Jessomadic/nimbus), whose original documentation credits [Brandon-Rios/nimbus](https://github.com/Brandon-Rios/nimbus). The original Git history and interface identity are preserved.
