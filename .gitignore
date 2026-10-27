@@ -1,7 +1,9 @@
 .env
+nimbus.config.json
+*.log
 data/
+.dev/
 node_modules/
-deploy/computer/agent.env
 public/nimbus.apk
 android/.gradle/
 android/build/

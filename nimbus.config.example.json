@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "cloud": {
+    "enabled": true,
+    "codexBin": "codex",
+    "maxConcurrent": 3,
+    "models": { "luna": "auto", "terra": "auto", "sol": "auto", "astra": "auto" }
+  },
+  "local": {
+    "enabled": true,
+    "baseUrl": "http://127.0.0.1:12438/v1",
+    "model": "nimbus-local",
+    "approvedModels": ["nimbus-local"],
+    "reuseLoaded": true,
+    "contextTokens": 131072,
+    "maxConcurrent": 1,
+    "resourceCeiling": 90,
+    "timeoutSeconds": 240,
+    "tokenEnv": "NIMBUS_LOCAL_TOKEN",
+    "tokenDpapiFile": "",
+    "managed": {
+      "enabled": true,
+      "lmsBin": "lms",
+      "modelKey": "google/gemma-4-e4b",
+      "gpuRatio": 0.2,
+      "forecastGpuMB": 6500,
+      "forecastRamMB": 15625,
+      "upstreamUrl": "http://127.0.0.1:1234/v1"
+    }
+  },
+  "routing": { "cloudFallbackTier": "luna" },
+  "workers": { "maxConcurrent": 4, "maxSteps": 32, "timeoutMinutes": 45 },
+  "browser": { "enabled": true, "headless": true, "maxGroups": 12, "maxTabsPerGroup": 8 },
+  "mcpServers": {}
+}
