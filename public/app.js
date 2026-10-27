@@ -1,7 +1,11 @@
 // Nimbus web app. Plain JS, no build step.
+import { createRuntimeUI } from './runtime.js';
+import {hierarchyRows} from './team-tree.js';
+import {DISPLAY_GROUPS,defaultDisplayGroup} from './agent-groups.js';
 import { attachAutocorrect } from './autocorrect.js';
 import { THEMES, resolveTheme, applyThemeVars } from './themes.js';
 import { startRecording, stopRecording, cancelRecording, isRecording, browserDictation } from './dictation.js';
+import { passkeyRequest, performPasskey, passkeyError, canonicalPasskeyOrigin } from './passkeys.js';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const EFFORTS = [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max']];
@@ -31,6 +35,7 @@ const ICON = {
 };
 
 const S = { data: null, current: null, messages: [], loadingThread: false, market: null };
+let runtimeUI;
 
 // ---------- API ----------
 async function api(path, opts = {}) {
@@ -70,6 +75,12 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme
 const bot = (id) => S.data?.bots.find((b) => b.id === Number(id));
 const room = (id) => S.data?.rooms.find((r) => r.id === Number(id));
 const threadKey = () => S.current ? `${S.current.type}:${S.current.id}` : null;
+function describeTool(tool,input={}){
+  tool=String(tool||'Tool');input=input&&typeof input==='object'&&!Array.isArray(input)?input:{};
+  if(['shell','exec_command','Bash'].includes(tool))return 'Run: '+String(input.command||'').slice(0,80);
+  const pretty=tool.replace(/^mcp__/,'').replace(/__/g,' › ').replace(/_/g,' '),hint=input.to||input.subject||input.title||input.url||input.path||input.file_path||'';
+  return pretty+(hint?' — '+String(hint).slice(0,60):'');
+}
 // A bot's look is stored in `shape` as "hat/glasses/body/face/extra". Older bots only have
 // "hat/glasses"; the missing parts fall back to the original cloud with a smile.
 const HATS = ['none', 'cap', 'beanie', 'tophat', 'crown', 'party', 'headphones', 'halo', 'wizard', 'chef', 'cowboy', 'bow', 'flower', 'horns', 'antenna', 'santa', 'sprout'];
@@ -236,44 +247,116 @@ function userName() {
 
 // ---------- sidebar ----------
 let sideQuery = '';
-function renderSide() {
-  const d = S.data;
-  const key = threadKey();
-  const items = [
-    ...d.bots.map((b) => ({ key: 'bot:' + b.id, name: b.name, av: avatar(b, 38), state: b.status.state, last: d.last['bot:' + b.id], fallback: b.role, created: b.created_at })),
-    ...d.rooms.map((r) => ({ key: 'room:' + r.id, name: r.name, av: roomAvatar(r, 38), state: r.members.some((id) => bot(id)?.status.state === 'working') ? 'working' : 'idle', last: d.last['room:' + r.id], fallback: `${r.members.length} bots`, created: r.created_at }))
-  ].filter((it) => !sideQuery || it.name.toLowerCase().includes(sideQuery))
-    .sort((a, b) => (b.last?.at || b.created || 0) - (a.last?.at || a.created || 0));
-  // Your own order (from dragging) wins; chats not placed yet stay on top, newest first.
-  if (d.sideOrder) {
-    const pos = new Map(d.sideOrder.map((k, i) => [k, i]));
-    items.sort((a, b) => (pos.has(a.key) ? pos.get(a.key) : -1) - (pos.has(b.key) ? pos.get(b.key) : -1));
+let connectionState=navigator.onLine?'Connecting…':'Offline — instructions stay on this device';
+let liveEvents;
+const pendingSends=new Map();
+function connectionStatus(text){connectionState=text;const el=$('#connection-status');if(el)el.textContent=text;}
+let sidebarPrefsKey='',sidebarPrefs={collapsed:{},seen:{},seeded:false,rootCollapsed:false};
+const revealedDisplayGroups=new Set();
+let revealedOrchestratorBranch=false;
+const knownDisplayGroups=new Set(DISPLAY_GROUPS.map(group=>group.id));
+function displayGroup(bot){return Object.hasOwn(bot,'display_group')?(knownDisplayGroups.has(bot.display_group)?bot.display_group:''):defaultDisplayGroup(bot.template);}
+function sidebarPreferences(){
+  const identity=String(S.data?.user?.id??S.data?.user?.email??'local'),storageKey='nimbus.sidebar.v1.'+encodeURIComponent(identity);
+  if(storageKey!==sidebarPrefsKey){sidebarPrefsKey=storageKey;revealedDisplayGroups.clear();revealedOrchestratorBranch=false;let saved;try{saved=JSON.parse(localStorage.getItem(storageKey)||'null');}catch{}
+    sidebarPrefs={collapsed:saved?.collapsed&&typeof saved.collapsed==='object'&&!Array.isArray(saved.collapsed)?saved.collapsed:Object.fromEntries([...DISPLAY_GROUPS.map(group=>group.id),'rooms'].map(group=>[group,true])),seen:saved?.seen&&typeof saved.seen==='object'&&!Array.isArray(saved.seen)?saved.seen:{},seeded:saved?.seeded===true,rootCollapsed:saved?.rootCollapsed===true};
   }
-  const pending = d.approvals.length;
+  return sidebarPrefs;
+}
+function saveSidebarPreferences(){try{localStorage.setItem(sidebarPrefsKey,JSON.stringify(sidebarPrefs));}catch{}}
+function lastSignature(last){return last?JSON.stringify([last.at??null,String(last.author??''),String(last.text??'')]):null;}
+function syncSidebarSeen(){
+  const prefs=sidebarPreferences(),last=S.data?.last||{};let changed=false;
+  if(!prefs.seeded){for(const [key,value]of Object.entries(last))prefs.seen[key]=lastSignature(value);prefs.seeded=true;changed=true;}
+  for(const [key,value]of Object.entries(last))if(key===threadKey()||value.author==='user'){const signature=lastSignature(value);if(prefs.seen[key]!==signature){prefs.seen[key]=signature;changed=true;}}
+  if(changed)saveSidebarPreferences();
+}
+function unreadThread(key){const last=S.data?.last?.[key];return !!last&&key!==threadKey()&&last.author!=='user'&&sidebarPrefs.seen[key]!==lastSignature(last);}
+function orchestratorAgents(){return(S.data?.bots||[]).filter(agent=>agent.template==='orchestrator');}
+function rootOrchestrator(){const agents=orchestratorAgents();return agents.length===1?agents[0]:null;}
+function revealSidebarThread(key){
+  const list=$('.side-list'),item=list?[...list.querySelectorAll('.side-item')].find(row=>row.dataset.key===key):null;if(!list||!item)return;
+  if(item.classList.contains('fixed-root')){list.scrollTop=0;return;}
+  const bounds=list.getBoundingClientRect(),row=item.getBoundingClientRect(),fixed=list.querySelector('.side-orchestrator'),visibleTop=fixed?Math.max(bounds.top,fixed.getBoundingClientRect().bottom):bounds.top;
+  // Scroll this vertical list only; the mobile drawer can be offscreen without
+  // moving the document, changing focus or disturbing the current draft.
+  if(row.top<visibleTop)list.scrollTop-=visibleTop-row.top+4;
+  else if(row.bottom>bounds.bottom)list.scrollTop+=row.bottom-bounds.bottom+4;
+}
+function sidebarItems(){
+  const d=S.data;
+  const items = [
+    ...d.bots.map((b) => ({ key:'bot:'+b.id,parent:b.parent_bot_id?'bot:'+b.parent_bot_id:null,group:b.template==='orchestrator'?null:displayGroup(b),rootCandidate:b.template==='orchestrator',name:b.name,av:avatar(b,38),state:b.status?.state||'idle',last:d.last['bot:'+b.id],fallback:b.role,created:b.created_at })),
+    ...d.rooms.map((r) => ({ key:'room:'+r.id,parent:null,group:'rooms',name:r.name,av:roomAvatar(r,38),state:d.approvals.some(a=>a.thread==='room:'+r.id)?'waiting':r.members.some(id=>bot(id)?.status.state==='working')?'working':'idle',last:d.last['room:'+r.id],fallback:`${r.members.length} agents`,created:r.created_at }))
+  ].sort((a,b)=>(b.last?.at||b.created||0)-(a.last?.at||a.created||0));
+  // Your own order (from dragging) wins; chats not placed yet stay on top, newest first.
+  if(Array.isArray(d.sideOrder)){const pos=new Map(d.sideOrder.map((key,index)=>[key,index]));items.sort((a,b)=>(pos.has(a.key)?pos.get(a.key):-1)-(pos.has(b.key)?pos.get(b.key):-1));}
+  return items;
+}
+function sidebarGroup(group,members){
+  if(!members.length)return '';
+  const key=threadKey(),known=new Map(members.map(item=>[item.key,item])),matches=members.filter(item=>!sideQuery||item.name.toLowerCase().includes(sideQuery)),visible=new Set(matches.map(item=>item.key));
+  if(sideQuery){for(const match of matches){let parent=match.parent;const visited=new Set();while(parent&&known.has(parent)&&!visited.has(parent)){visited.add(parent);visible.add(parent);parent=known.get(parent).parent;}}if(!matches.length)return '';}
+  const expanded=!!sideQuery||revealedDisplayGroups.has(group.id)||sidebarPrefs.collapsed[group.id]!==true,bodyId='side-display-'+(group.id||'other');
+  const current=members.find(item=>item.key===key),working=members.filter(item=>['working','running','routing'].includes(item.state)).length,waiting=members.filter(item=>/^waiting(?:_|$)|^(?:paused|needs_review)$/.test(item.state)).length,queued=members.filter(item=>item.state==='queued').length,unread=members.filter(item=>unreadThread(item.key)).length;
+  const ids=new Set(members.map(item=>item.key)),approvals=S.data.approvals.filter(approval=>group.id==='rooms'?ids.has(approval.thread):ids.has('bot:'+approval.bot_id)).length;
+  const badges=[current?{kind:'current',text:'Current',label:'Current chat: '+current.name}:null,working?{kind:'working',text:working+' working'}:null,waiting?{kind:'waiting',text:waiting+' waiting'}:null,queued?{kind:'queued',text:queued+' queued'}:null,approvals?{kind:'approval',text:approvals+(approvals===1?' approval':' approvals')}:null,unread?{kind:'unread',text:unread+' unread',label:unread+' unread '+(unread===1?'thread':'threads')}:null].filter(Boolean);
+  const unit=group.id==='rooms'?'group chats':'agents',label=group.label+', '+members.length+' '+unit+(badges.length?', '+badges.map(badge=>badge.label||badge.text).join(', '):'');
+  const rows=hierarchyRows(members).filter(item=>!sideQuery||visible.has(item.key));
+  return `<section class="side-display-group ${expanded?'expanded':'collapsed'}" data-display-section="${esc(group.id)}">
+    <button type="button" class="side-group-heading" data-display-group="${esc(group.id)}" aria-expanded="${expanded}" aria-controls="${bodyId}" aria-label="${esc(label)}" ${sideQuery?'aria-disabled="true" title="Search results stay expanded until search is cleared"':''}>
+      <span class="side-group-label">${ICON.chevron}<span>${esc(group.label)}</span><span class="side-group-count" aria-hidden="true">${members.length}</span>${sideQuery?`<small>${matches.length} ${matches.length===1?'match':'matches'}</small>`:''}</span>
+      ${badges.length?`<span class="side-group-badges" aria-hidden="true">${badges.map(badge=>`<span class="side-group-badge side-badge-${badge.kind}" data-group-badge="${badge.kind}">${esc(badge.text)}</span>`).join('')}</span>`:''}
+    </button>
+    <div class="side-group-members" id="${bodyId}" data-display-group-body="${esc(group.id)}" ${expanded?'':'hidden'}>${rows.map(item=>{
+      const unread=unreadThread(item.key),context=sideQuery&&!matches.some(match=>match.key===item.key),orderParent=item.parent&&known.has(item.parent)?item.parent:'',parentOutsideGroup=item.parent&&!known.has(item.parent)?bot(item.parent.slice(4)):null,externalParent=parentOutsideGroup?.id===rootOrchestrator()?.id?null:parentOutsideGroup;
+      return `<button class="side-item ${item.depth?'subagent':''} ${key===item.key?'active':''} ${unread?'unread':''} ${context?'search-context':''}" style="--worker-depth:${Math.min(item.depth,4)}" data-open="${item.key}" data-key="${item.key}" data-order-parent="${orderParent}" data-depth="${item.depth}" ${key===item.key?'aria-current="page"':''} ${unread?`aria-label="${esc(item.name)}, unread update"`:''}>
+        <span class="av-wrap">${item.av}${item.state!=='idle'?`<span class="dot ${esc(item.state)}"></span>`:''}</span>
+        <span class="meta"><span class="row1"><span class="name">${esc(item.name)}</span>${unread?'<span class="side-unread-dot" aria-hidden="true"></span>':''}<span class="time">${item.last?stamp(item.last.at):''}</span></span><span class="sub">${esc(item.last?(item.last.author==='user'?'You: ':'')+item.last.text:item.fallback||'Say hi')}</span>${externalParent?`<span class="side-parent-context">Subagent of ${esc(externalParent.name)}</span>`:''}</span>
+      </button>`;
+    }).join('')}</div>
+  </section>`;
+}
+function orchestratorRow(item,{ambiguous=false}={}){
+  const active=threadKey()===item.key,unread=unreadThread(item.key),preview=item.last?(item.last.author==='user'?'You: ':'')+item.last.text:item.fallback||'Open the Orchestrator chat';
+  return `<button type="button" class="side-item fixed-root ${active?'active':''} ${unread?'unread':''}" data-open="${item.key}" data-key="${item.key}" ${active?'aria-current="page"':''} aria-label="${esc(item.name)}${ambiguous?', Orchestrator setup candidate':', configured Hermes/Lumos contact'}${unread?', unread update':''}">
+    <span class="av-wrap">${item.av}${item.state!=='idle'?`<span class="dot ${esc(item.state)}"></span>`:''}</span>
+    <span class="meta"><span class="row1"><span class="name">${esc(item.name)}</span>${unread?'<span class="side-unread-dot" aria-hidden="true"></span>':''}<span class="time">${item.last?stamp(item.last.at):''}</span></span><span class="side-orchestrator-contact">${ambiguous?'Orchestrator setup candidate':'Configured Hermes/Lumos contact'}</span><span class="sub">${esc(preview)}</span></span>
+  </button>`;
+}
+function sidebarOrchestrator(rootItem,items,sections){
+  const agents=items.filter(item=>!item.rootCandidate&&item.key.startsWith('bot:')),branch=items.filter(item=>!item.rootCandidate),current=branch.find(item=>item.key===threadKey()),working=agents.filter(item=>['working','running','routing'].includes(item.state)).length,waiting=agents.filter(item=>/^waiting(?:_|$)|^(?:paused|needs_review)$/.test(item.state)).length,queued=agents.filter(item=>item.state==='queued').length,unread=branch.filter(item=>unreadThread(item.key)).length;
+  const agentKeys=new Set(agents.map(item=>item.key)),roomKeys=new Set(branch.filter(item=>item.group==='rooms').map(item=>item.key)),approvals=S.data.approvals.filter(approval=>agentKeys.has('bot:'+approval.bot_id)||roomKeys.has(approval.thread)).length;
+  const badges=[current?{kind:'current',text:'Current: '+current.name}:null,working?{kind:'working',text:working+' working'}:null,waiting?{kind:'waiting',text:waiting+' waiting'}:null,queued?{kind:'queued',text:queued+' queued'}:null,approvals?{kind:'approval',text:approvals+(approvals===1?' approval':' approvals')}:null,unread?{kind:'unread',text:unread+' unread threads'}:null].filter(Boolean),expanded=!!sideQuery||revealedOrchestratorBranch||!sidebarPrefs.rootCollapsed,matches=sideQuery?branch.filter(item=>item.name.toLowerCase().includes(sideQuery)).length:0;
+  return `<div class="side-orchestrator" data-orchestrator-root>${orchestratorRow(rootItem)}<button type="button" class="side-orchestrator-toggle" data-orchestrator-toggle aria-expanded="${expanded}" aria-controls="side-orchestrator-team" aria-label="${expanded?'Collapse':'Expand'} subordinate team, ${agents.length} agents${badges.length?', '+badges.map(badge=>badge.text).join(', '):''}" ${sideQuery?'aria-disabled="true" title="Search results stay expanded until search is cleared"':''}><span class="side-group-label">${ICON.chevron}<span>Team agents</span><span class="side-group-count" aria-hidden="true">${agents.length}</span>${sideQuery?`<small>${matches} ${matches===1?'match':'matches'}</small>`:''}</span>${badges.length?`<span class="side-group-badges" aria-hidden="true">${badges.map(badge=>`<span class="side-group-badge side-badge-${badge.kind}" data-orchestrator-badge="${badge.kind}">${esc(badge.text)}</span>`).join('')}</span>`:''}</button></div>
+  <div class="side-orchestrator-branch" id="side-orchestrator-team" data-orchestrator-body ${expanded?'':'hidden'}>${sections||`<div class="side-empty">${sideQuery?'No team agents or group chats match':'No subordinate agents yet'}</div>`}</div>`;
+}
+function renderSide() {
+  const d=S.data;syncSidebarSeen();
+  const items=sidebarItems(),pending=d.approvals.length,scroll=$('.side-list')?.scrollTop||0,focused=document.activeElement,focusGroup=focused?.hasAttribute?.('data-display-group')?focused.getAttribute('data-display-group'):null,focusRoot=focused?.hasAttribute?.('data-orchestrator-toggle'),focusKey=focused?.dataset?.key||null,roots=items.filter(item=>item.rootCandidate);
+  const sections=[...DISPLAY_GROUPS,{id:'rooms',label:'Group chats'}].map(group=>sidebarGroup(group,items.filter(item=>item.group===group.id))).join('');
+  const ordering=sideQuery?'':d.sideOrder?'<button class="side-reset" data-act="side-recent">↺ Sort by recent activity</button>':items.length>1?'<div class="side-hint">Drag peers within a group to arrange them</div>':'';
+  const grouped=sections?sections+ordering:sideQuery?'<div class="side-empty">No agents or group chats match</div>':`<div class="side-empty">No bots yet.<br><button class="link" data-act="market">Browse the Marketplace</button> or <button class="link" data-act="new-bot">make one</button>.</div>`;
+  const sidebarBody=roots.length===1?sidebarOrchestrator(roots[0],items,sections+ordering):roots.length>1?`<section class="side-orchestrator-warning" role="note"><b>Orchestrator setup needs attention</b><p>${roots.length} agents use the Orchestrator profile. Choose the intended root in setup; no root has been selected automatically.</p>${roots.map(item=>orchestratorRow(item,{ambiguous:true})).join('')}</section>${grouped}`:grouped;
   $('#side').innerHTML = `
     <div class="side-top">
       <label class="search">${ICON.search}<input id="side-search" placeholder="Search" value="${esc(sideQuery)}" autocomplete="off"></label>
       <button class="icon-btn" data-act="new-menu" aria-label="New">${ICON.plus}</button>
     </div>
     <div class="side-list">
-      ${items.length ? items.map((it) => `
-        <button class="side-item ${key === it.key ? 'active' : ''}" data-open="${it.key}" data-key="${it.key}">
-          <span class="av-wrap">${it.av}${it.state !== 'idle' ? `<span class="dot ${it.state}"></span>` : ''}</span>
-          <span class="meta">
-            <span class="row1"><span class="name">${esc(it.name)}</span><span class="time">${it.last ? stamp(it.last.at) : ''}</span></span>
-            <span class="sub">${esc(it.last ? (it.last.author === 'user' ? 'You: ' : '') + it.last.text : it.fallback || 'Say hi')}</span>
-          </span>
-        </button>`).join('') + (sideQuery ? '' : d.sideOrder ? '<button class="side-reset" data-act="side-recent">↺ Sort by recent activity</button>'
-          : items.length > 1 ? '<div class="side-hint">Tip: drag chats to arrange them</div>' : '')
-        : sideQuery ? '<div class="side-empty">No chats match</div>'
-        : `<div class="side-empty">No bots yet.<br><button class="link" data-act="market">Browse the Marketplace</button> or <button class="link" data-act="new-bot">make one</button>.</div>`}
+      ${sidebarBody}
     </div>
     ${sideQuery.length >= 2 ? `<div class="side-hits" id="side-hits"><div class="side-empty">Searching messages…</div></div>` : ''}
-    <div class="side-foot">
+    <div class="side-foot"><button class="foot-item" data-act="team">${ICON.monitor}<span>Team overview</span></button>
+      <small id="connection-status" class="connection-status" role="status">${esc(connectionState)}</small>
       ${pending ? `<button class="foot-item" data-act="panel">${ICON.bell}<span>Approvals</span><span class="badge">${pending}</span></button>` : ''}
       <button class="foot-item" data-act="market">${ICON.grid}<span>Marketplace</span></button>
       <button class="foot-item user" data-act="user-menu"><span class="initial">${esc(userName()[0])}</span><span>${esc(userName())}</span></button>
     </div>`;
+  $('.side-list').scrollTop=scroll;
+  if(focusRoot)document.querySelector('[data-orchestrator-toggle]')?.focus({preventScroll:true});
+  else if(focusGroup!==null)[...document.querySelectorAll('[data-display-group]')].find(button=>button.getAttribute('data-display-group')===focusGroup)?.focus({preventScroll:true});
+  else if(focusKey)[...document.querySelectorAll('.side-item')].find(button=>button.dataset.key===focusKey&&!button.closest('[hidden]'))?.focus({preventScroll:true});
 }
 
 const _renderSide = renderSide;
@@ -289,16 +372,20 @@ let drag = null; // { item, list, startY, grabDy, ty, started, timer, touch }
 let suppressClickUntil = 0;
 document.addEventListener('click', (e) => { if (Date.now() < suppressClickUntil) { e.stopPropagation(); e.preventDefault(); } }, true);
 function dragBegin(item, y, touch) {
-  if (sideQuery) return; // the list is filtered while searching
-  drag = { item, list: item.parentElement, startY: y, started: false, touch };
+  if (sideQuery||item.classList.contains('fixed-root')) return; // root is fixed; filtered rows cannot be reordered
+  const list=item.closest('.side-group-members');if(!list||list.hidden)return;
+  drag = { item,list,scrollList:item.closest('.side-list'),startY:y,started:false,touch,parent:item.dataset.orderParent||'' };
   if (touch) drag.timer = setTimeout(() => dragStart(y), 320);
 }
+function sidebarSubtree(item){const block=[item],depth=Number(item.dataset.depth)||0;for(let next=item.nextElementSibling;next?.classList.contains('side-item')&&Number(next.dataset.depth)>depth;next=next.nextElementSibling)block.push(next);return block;}
 function dragStart(y) {
   if (!drag) return;
   drag.started = true;
   const r = drag.item.getBoundingClientRect();
   drag.grabDy = y - r.top;
+  drag.block=sidebarSubtree(drag.item);
   drag.item.classList.add('dragging');
+  for(const child of drag.block.slice(1))child.classList.add('drag-follow');
   document.body.classList.add('reordering');
   buzz(12);
 }
@@ -309,14 +396,18 @@ function dragMove(y) {
     if (drag.touch) { clearTimeout(drag.timer); drag = null; return; } // moved before the hold: it's a scroll
     dragStart(drag.startY);
   }
-  const { item, list } = drag;
+  const { item,list,block,parent }=drag;
+  const bounds=list.getBoundingClientRect(),blockHeight=block.at(-1).offsetTop+block.at(-1).offsetHeight-item.offsetTop,minPointer=bounds.top+drag.grabDy,maxPointer=Math.max(minPointer,bounds.bottom-blockHeight+drag.grabDy);y=Math.max(minPointer,Math.min(maxPointer,y));
   // Follow the pointer, then swap with a neighbour once the pointer passes its middle.
-  const siblings = [...list.querySelectorAll('.side-item:not(.dragging)')];
+  // Only actual peers may trade places. A parent and all its displayed children
+  // move together; display headers never become delegation parents.
+  const siblings=[...list.children].filter(el=>el.classList.contains('side-item')&&!block.includes(el)&&(el.dataset.orderParent||'')===parent);
   const target = siblings.find((el) => { const r = el.getBoundingClientRect(); return y < r.top + r.height / 2; });
-  const before = siblings.map((el) => [el, el.getBoundingClientRect().top]);
-  const next = item.nextElementSibling?.classList.contains('side-item') ? item.nextElementSibling : null;
+  const before=[...list.children].filter(el=>el.classList.contains('side-item')&&!block.includes(el)).map(el=>[el,el.getBoundingClientRect().top]);
+  const peers=[...list.children].filter(el=>el.classList.contains('side-item')&&(el.dataset.orderParent||'')===parent),next=peers[peers.indexOf(item)+1]||null;
   if ((target || null) !== next) {
-    list.insertBefore(item, target || siblings.at(-1)?.nextSibling || null);
+    const anchor=target||(siblings.length?sidebarSubtree(siblings.at(-1)).at(-1).nextSibling:null);
+    if(!block.includes(anchor))for(const row of block)list.insertBefore(row,anchor);
     // Slide the others into their new places (FLIP).
     for (const [el, top] of before) {
       const dy = top - el.getBoundingClientRect().top;
@@ -325,20 +416,25 @@ function dragMove(y) {
   }
   const natural = item.getBoundingClientRect().top - (drag.ty || 0); // where it sits without the offset
   drag.ty = y - drag.grabDy - natural;
-  item.style.transform = `translateY(${drag.ty}px) scale(1.03)`;
+  for(const row of block)row.style.transform=`translateY(${drag.ty}px) scale(1.03)`;
   // Scroll the list when dragging near its edges.
-  const lr = list.getBoundingClientRect();
-  if (y < lr.top + 40) list.scrollTop -= 8; else if (y > lr.bottom - 40) list.scrollTop += 8;
+  const scroller=drag.scrollList||list,lr=scroller.getBoundingClientRect();
+  if(y<lr.top+40)scroller.scrollTop-=8;else if(y>lr.bottom-40)scroller.scrollTop+=8;
 }
 async function dragEnd() {
   if (!drag) return;
   clearTimeout(drag.timer);
   const was = drag; drag = null;
   if (!was.started) return;
-  was.item.classList.remove('dragging'); was.item.style.transform = '';
+  for(const row of was.block||[was.item]){row.classList.remove('dragging','drag-follow');row.style.transform='';}
   document.body.classList.remove('reordering');
   suppressClickUntil = Date.now() + 400; // the click that follows a drag shouldn't open the chat
-  const order = [...was.list.querySelectorAll('.side-item')].map((el) => el.dataset.key);
+  const visibleOrder=[...was.list.children].filter(el=>el.classList.contains('side-item')).map(el=>el.dataset.key),reordered=new Set(visibleOrder);
+  // Merge the changed group's slots into the complete order. Collapsed groups,
+  // hidden rooms, and entries arriving during a drag retain their positions.
+  const currentKeys=sidebarItems().map(item=>item.key),fullOrder=[...new Set([...currentKeys,...(Array.isArray(S.data.sideOrder)?S.data.sideOrder:[])])];let index=0;
+  const order=fullOrder.map(key=>reordered.has(key)?visibleOrder[index++]:key);
+  for(const key of visibleOrder)if(!order.includes(key))order.push(key);
   S.data.sideOrder = order;
   renderSide();
   try { await api('/api/side-order', { method: 'PUT', body: { order } }); } catch (err) { toast(err.message); }
@@ -383,8 +479,6 @@ function renderAside() {
       ${d.learned.length ? d.learned.map((l) => `<div class="learned">“${esc(l.text)}” <span class="muted">· ${esc(bot(l.botId)?.name)}</span></div>`).join('')
         : '<div class="muted">When you tell a bot a rule, it shows up here.</div>'}
     </section>
-    ${d.computers ? '<section id="comp-box"><h4>Bot computers</h4><div class="muted">Loading…</div></section>' : ''}
-    ${d.proxmox ? '<section id="pve-box"><h4>Proxmox</h4><div class="muted">Loading…</div></section>' : ''}
     ${d.usage.byBot?.length ? `<section><h4>Usage by bot · 7 days</h4>${(() => { const total = d.usage.byBot.reduce((a, x) => a + x.cost, 0) || 1;
       return d.usage.byBot.slice(0, 6).map((x) => { const b = bot(x.bot_id); const pc = Math.round((x.cost / total) * 100);
         return `<div class="ubot">${avatar(b, 20)}<span class="un">${esc(b?.name || 'Deleted bot')}</span><span class="muted">${x.runs} runs · ${b ? esc(EFFORTS.find((e) => e[0] === b.effort)?.[1] || b.effort) : ''}</span><b>${pc}%</b></div>
@@ -392,15 +486,12 @@ function renderAside() {
       <div class="muted small">Heavy bots on High or Max effort usually do fine on Medium for routine work.</div></section>` : ''}
     <section class="usage" id="usage-box">${usageFallback(d, pct)}</section>`;
   loadPlanUsage();
-  if (d.proxmox) loadProxmox();
-  if (d.computers) loadComputers();
 }
 
-// Plan usage: the real % of your Claude plan's limits left (like /usage in Claude Code).
-// Falls back to the old cost estimate if Anthropic's usage check isn't available.
+// Plan usage: the real % of your OpenAI subscription's limits left (like /usage in Codex).
+// Missing usage information is shown as unknown, never as an API charge.
 function usageFallback(d, pct) {
-  return (pct != null ? `<div class="row"><span>Usage, last 5 hours</span><span>${pct}%</span></div><div class="meter"><div style="width:${pct}%"></div></div>`
-    : `<div class="row"><span>Est. usage, last 5 hours</span><span>$${d.usage.windowCost.toFixed(2)}</span></div>`)
+  return `<h4>OpenAI subscription</h4><div class="muted">Usage status is not available yet. Local capacity remains available.</div>`
     + `<div class="muted">${d.usage.running} running · ${d.bots.filter((b) => b.status.state === 'working').length} bots busy</div>`;
 }
 let planLast = null, planAt = 0;
@@ -420,61 +511,12 @@ function resetsIn(iso) {
 function drawPlanUsage(p) {
   const box = $('#usage-box'); if (!box || !p?.ok) return;
   const d = S.data;
-  box.innerHTML = `<h4>Claude plan${p.plan ? ` · ${esc(p.plan[0].toUpperCase() + p.plan.slice(1))}` : ''}</h4>` + p.windows.map((w) => {
+  box.innerHTML = `<h4>OpenAI subscription${p.plan ? ` · ${esc(p.plan[0].toUpperCase() + p.plan.slice(1))}` : ''}</h4>` + p.windows.map((w) => {
     const left = Math.max(0, Math.round(100 - w.used));
     return `<div class="row"><span>${esc(w.label)}</span><span><b>${left}% left</b></span></div>
       <div class="meter ${w.used >= 90 ? 'hot' : w.used >= 70 ? 'warm' : ''}"><div style="width:${Math.min(100, w.used)}%"></div></div>
       <div class="muted small">${Math.round(w.used)}% used${w.resets ? ` · resets in ${resetsIn(w.resets)}` : ''}</div>`;
   }).join('') + `<div class="muted">${d.usage.running} running · ${d.bots.filter((b) => b.status.state === 'working').length} bots busy</div>`;
-}
-
-// Bot computers: which are awake or asleep, their memory, and the VM's memory.
-let compLast = null, compAt = 0;
-async function loadComputers() {
-  if (compLast) drawComputers(compLast);
-  if (Date.now() - compAt < 15000) return;
-  compAt = Date.now();
-  try { compLast = await api('/api/computers'); } catch (err) { compLast = { error: err.message }; }
-  drawComputers(compLast);
-}
-function drawComputers(c) {
-  const box = $('#comp-box'); if (!box) return;
-  if (c.error) { box.innerHTML = `<h4>Bot computers</h4><div class="muted">Couldn’t reach the computer VM: ${esc(c.error)}</div>`; return; }
-  const pct = c.vm ? Math.round((c.vm.memUsed / c.vm.memTotal) * 100) : 0;
-  box.innerHTML = `<h4>Bot computers</h4>
-    ${(c.computers || []).length ? c.computers.map((x) => `<button class="card-item comp-row" data-computer="${x.bot}">${avatar(bot(x.bot), 26)}
-      <span><small>${x.running ? `<span class="dot-inline on"></span>Awake${x.mem ? ` · ${esc(x.mem)}` : ''}` : '<span class="dot-inline"></span>Asleep'}</small>${esc(bot(x.bot)?.name || 'Bot ' + x.bot)}</span></button>`).join('')
-      : '<div class="muted">No bot has its own computer yet.</div>'}
-    ${c.vm ? `<div class="row"><span>VM memory</span><span>${(c.vm.memUsed / 2 ** 30).toFixed(1)} of ${(c.vm.memTotal / 2 ** 30).toFixed(1)} GB</span></div>
-      <div class="meter ${pct >= 90 ? 'hot' : pct >= 75 ? 'warm' : ''}"><div style="width:${pct}%"></div></div>` : ''}
-    ${c.sleepAfterMin ? `<div class="muted small">Idle computers sleep after ${c.sleepAfterMin >= 60 ? c.sleepAfterMin / 60 + ' h' : c.sleepAfterMin + ' min'}.</div>` : ''}`;
-}
-
-// Host load and guest status, fetched separately so a slow Proxmox never delays the app.
-let pveLast = null, pveAt = 0;
-async function loadProxmox() {
-  if (pveLast) drawProxmox(pveLast);
-  if (Date.now() - pveAt < 15000) return;
-  pveAt = Date.now();
-  try { pveLast = await api('/api/proxmox'); } catch (err) { pveLast = { error: err.message }; }
-  drawProxmox(pveLast);
-}
-function drawProxmox(p) {
-  const box = $('#pve-box'); if (!box) return;
-  const pc = (a, b) => (b ? Math.round((a / b) * 100) : 0);
-  const meter = (label, v) => `<div class="row"><span>${label}</span><span>${v}%</span></div><div class="meter"><div style="width:${v}%"></div></div>`;
-  const down = (p.guests || []).filter((g) => g.status !== 'running');
-  box.innerHTML = `<h4>Proxmox</h4>${p.error ? `<div class="muted">Couldn’t reach Proxmox: ${esc(p.error)}</div>`
-    : (p.nodes || []).map((n) => `<div class="pve-node"><b>${esc(n.name)}</b> <span class="muted">${n.status === 'online' ? `up ${Math.floor(n.uptime / 86400)}d` : esc(n.status)}</span>
-        ${meter('CPU', Math.round(n.cpu * 100))}${meter('Memory', pc(n.mem, n.maxmem))}${meter('Root disk', pc(n.disk, n.maxdisk))}</div>`).join('')
-      + `<div class="muted">${(p.guests || []).length - down.length} of ${(p.guests || []).length} guests running</div>`
-      + down.map((g) => `<div class="sched"><span>${esc(g.status)}</span><span>${g.id} · ${esc(g.name)}</span></div>`).join('')}`;
-}
-function describeTool(tool, input = {}) {
-  if (tool === 'Bash') return 'Run: ' + String(input.command || '').slice(0, 80);
-  const pretty = tool.replace(/^mcp__/, '').replace(/__/g, ' › ').replace(/_/g, ' ');
-  const hint = input.to || input.subject || input.title || input.url || input.file_path || '';
-  return pretty + (hint ? ' — ' + String(hint).slice(0, 60) : '');
 }
 
 // ---------- main ----------
@@ -486,7 +528,7 @@ function renderMain() {
       <div class="thread"><div class="empty">
         <img class="logo-art" src="/nimbus.webp" alt="Nimbus" width="160" height="160">
         <h2>${none ? 'Build your team' : 'Pick a bot to talk to'}</h2>
-        <p>${none ? 'Bots are teammates you hand work to. They run on your computer with Claude Code and ask before anything risky.' : 'Hand off a task. You’ll see each step, and it’ll check with you before sending, paying, deleting or merging.'}</p>
+        <p>${none ? 'Workers share local inference and use your OpenAI subscription when the task needs it. Each has its own workspace and browser group.' : 'Hand off a task. You’ll see each step, and it’ll check with you before sending, paying, deleting or merging.'}</p>
         ${none ? `<div class="row"><button class="btn primary" data-act="market">${ICON.grid} Browse Marketplace</button><button class="btn" data-act="new-bot">${ICON.plus} New bot</button></div>` : ''}
       </div></div>`;
     return;
@@ -608,7 +650,7 @@ document.addEventListener('contextmenu', (e) => {
 });
 
 // ---------- slash commands in the message box ----------
-const SLASH = [['/compact', 'Shrink this chat’s history so it uses less context (memory is kept)'], ['/new', 'Start a fresh chat with this bot (memory is kept)']];
+const SLASH = [['/new', 'Start a fresh chat with this bot (memory is kept)']];
 function slashHint(v) {
   let box = $('#slash-hint');
   const show = S.current?.type === 'bot' && /^\/\w*$/.test(v);
@@ -760,6 +802,14 @@ function renderMessage(m, prev) {
   const b = bot(m.author) || { name: 'Deleted bot', color: '#555' };
   if (m.kind === 'trace') return renderTrace(m, prev);
   if (m.kind === 'approval') return renderApproval(m, b, prev);
+  if(m.kind==='capability'){
+    const request=JSON.parse(m.body);
+    return `<div class="msg bot" data-mid="${m.id}"><section class="runtime-capability-card compact"><div class="runtime-capability-heading"><b>${esc(request.title||'Tool development')}</b><span class="task-status ${esc(request.status)}">${esc(String(request.status||'queued').replaceAll('_',' '))}</span></div><p class="runtime-capability-message">${esc(request.message||'')}</p><div class="runtime-capability-meta"><code>${esc(request.toolName||'')}</code><button class="btn small" data-tool-development="${esc(request.requestId)}">View progress</button></div></section></div>`;
+  }
+  if (m.kind === 'question') {
+    const q=JSON.parse(m.body),pending=q.status==='pending';
+    return `<div class="msg bot" data-mid="${m.id}">${speakerLabel(m,prev)}<div class="approval" data-question-id="${q.questionId}"><b>${pending?'Your input is needed':esc(q.status)}</b>${q.questions.map((item,index)=>`<label class="field">${esc(item.question)}${pending?`${item.options?.length?`<select data-question-choice="${index}"><option value="">Choose an answer or type below</option>${item.options.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select>`:''}<textarea data-question-answer="${index}" rows="2"></textarea>`:`<p>${esc(q.answers?.[index]||'No answer recorded')}</p>`}</label>`).join('')}${pending?'<button class="btn primary" data-answer-question>Submit answers</button>':''}</div></div>`;
+  }
   return `<div class="msg bot ${m.kind === 'error' ? 'error' : ''}" data-mid="${m.id}" title="${clock(m.created_at)}">${speakerLabel(m, prev)}<div class="bubble md">${md(m.body)}</div>
     <div class="msg-actions"><button data-copy="${m.id}">Copy</button>${m.kind === 'error' ? '<button data-continue="1">Try again</button>' : `<button data-speak="${m.id}">▶ Read aloud</button><button data-continue="1">Continue</button>`}</div></div>`;
 }
@@ -779,41 +829,60 @@ const LOADER = '<span class="loader" aria-hidden="true"><i></i><i></i><i></i></s
 const fmtTok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n));
 function traceStats(t) {
   const bits = [];
-  if (t.tokens) bits.push(`<span title="Tokens read / written this run (including cached context)">${fmtTok(t.tokens.in)} in · ${fmtTok(t.tokens.out)} out</span>`);
-  if (t.context) {
-    const win = t.contextWindow || 200000, pc = Math.min(100, Math.round((t.context / win) * 100));
+  if(t.model) bits.push(`<span>${esc(t.model)}</span>`);
+  if (t.tokens && typeof t.tokens==='object') bits.push(`<span title="Tokens read / written this run (including cached context)">${fmtTok(t.tokens.in)} in · ${fmtTok(t.tokens.out)} out</span>`);
+  else if(typeof t.tokens==='number')bits.push(`<span>${fmtTok(t.tokens)} tokens</span>`);
+  if (t.context && t.contextWindow) {
+    const win = t.contextWindow, pc = Math.min(100, Math.round((t.context / win) * 100));
     bits.push(`<span class="ctx ${pc >= 80 ? 'hot' : pc >= 60 ? 'warm' : ''}" title="Context in use: ${t.context.toLocaleString()} of ${win.toLocaleString()} tokens. Near full, start a New chat (memory is kept).">ctx ${pc}%</span>`);
   }
   const five = planLast?.ok && planLast.windows.find((w) => w.label === '5-hour limit');
-  if (five && t.status !== 'running') bits.push(`<span title="Claude plan: 5-hour limit left right now">${Math.max(0, Math.round(100 - five.used))}% left</span>`);
+  if (five && t.status !== 'running') bits.push(`<span title="OpenAI subscription: 5-hour limit left right now">${Math.max(0, Math.round(100 - five.used))}% left</span>`);
   return bits.length ? ' · ' + bits.join(' · ') : '';
 }
 
 function renderTrace(m, prev) {
   const t = JSON.parse(m.body);
   const running = t.status === 'running';
-  if (t.status === 'done' && !t.steps.length) return `<div data-mid="${m.id}" hidden></div>`;
+  if (t.status === 'done' && !t.steps.length && !t.model) return `<div data-mid="${m.id}" hidden></div>`;
   const secs = Math.round((t.ended ? Math.max(0, t.ended - t.started) : elapsedMs(t.started)) / 1000);
   const dur = fmtDur(secs);
   const mark = { done: '✓', waiting: '⏸', error: '✗', rejected: '✗', stopped: '■', running: '' };
   const waiting = running && t.steps.some((s) => s.state === 'waiting');
-  const label = running ? (waiting ? 'Waiting for your approval' : t.source === 'auto-compact' || t.compacting ? '<span class="shimmer">Compacting the chat…</span>' : `<span class="shimmer" data-phrase>${workPhrase(t.started)}</span>`) :
-    t.status === 'done' ? `${t.steps.length} step${t.steps.length === 1 ? '' : 's'}` : t.status === 'stopped' ? 'Stopped' : t.status === 'interrupted' ? 'Interrupted' : 'Run failed';
+  const label = running ? (waiting ? (t.steps.some(s=>s.tool==='request_user_input'&&s.state==='waiting')?'Waiting for your answer':'Waiting for your approval') : t.source === 'auto-compact' || t.compacting ? '<span class="shimmer">Compacting the chat…</span>' : `<span class="shimmer" data-phrase>${workPhrase(t.started)}</span>`) :
+    t.status === 'done' ? `${t.steps.length} step${t.steps.length === 1 ? '' : 's'}` : t.status === 'waiting_tool'?'Waiting for a new tool':t.status === 'stopped' ? 'Stopped' : t.status === 'interrupted' ? 'Interrupted' : t.status === 'paused' ? 'Task paused' : t.status === 'needs_review' ? 'Action needs review' : 'Run failed';
   const open = running || openTraces.has(m.id);
   return `<div class="msg bot" data-mid="${m.id}">${speakerLabel(m, prev)}<details class="trace ${running ? 'live' : ''} ${waiting ? 'paused' : ''}" ${open ? 'open' : ''} data-started="${t.started}">
     <summary>${running ? LOADER : ICON.chevron}<span>${label}</span><span class="sp"><span data-dur>${dur}</span>${traceStats(t)}</span>${running ? `<button class="stop" data-stop="${m.run_id}">Stop</button>` : ''}</summary>
     <div class="steps">
+      ${t.plan?`<div class="task-plan">${t.plan.explanation?`<p>${esc(t.plan.explanation)}</p>`:''}<ol>${t.plan.steps.map(s=>`<li>${s.status==='completed'?'✓ ':s.status==='in_progress'?'→ ':''}${esc(s.step)}</li>`).join('')}</ol></div>`:''}
       ${t.steps.map((s) => `<div class="step"><span class="mark ${s.state}">${mark[s.state] ?? ''}</span><span>${esc(s.text)}</span></div>`).join('')}
       ${running && t.lastThought ? `<div class="thought">${esc(t.lastThought)}</div>` : ''}
     </div>
   </details></div>`;
 }
 const openTraces = new Set();
+document.addEventListener('click',async event=>{
+  const button=event.target.closest('[data-tool-development]');if(!button)return;
+  try{await runtimeUI.toolRequest(button.dataset.toolDevelopment);}catch(error){toast(error.message);}
+});
+document.addEventListener('change',e=>{
+  if(!e.target.matches('[data-question-choice]'))return;
+  const box=e.target.closest('[data-question-id]');box.querySelector(`[data-question-answer="${e.target.dataset.questionChoice}"]`).value=e.target.value;
+});
+document.addEventListener('click',async e=>{
+  const button=e.target.closest('[data-answer-question]');if(!button)return;
+  const box=button.closest('[data-question-id]'),answers=[...box.querySelectorAll('[data-question-answer]')].map(f=>f.value.trim());
+  if(answers.some(a=>!a))return toast('Answer each question before submitting');
+  button.disabled=true;
+  try{await api(`/api/questions/${box.dataset.questionId}/answer`,{method:'POST',body:{answers}});toast('Answers sent');}
+  catch(error){button.disabled=false;toast(error.message);}
+});
 
 function renderApproval(m, b, prev) {
   const a = JSON.parse(m.body);
   const pending = a.status === 'pending';
-  const input = a.tool === 'Bash' ? a.input.command : JSON.stringify(a.input, null, 2);
+  const input = a.tool === 'shell' ? a.input.command : JSON.stringify(a.input, null, 2);
   const done = { approved: 'Approved', rejected: 'Rejected', expired: 'Expired' }[a.status];
   return `<div class="msg bot" data-mid="${m.id}">${speakerLabel(m, prev)}<div class="approval ${pending ? '' : 'decided'}">
     <div class="label">${ICON.lock} ${pending ? 'Needs your approval' : done}</div>
@@ -825,7 +894,7 @@ function renderApproval(m, b, prev) {
       <button class="btn" data-reject="${a.approvalId}">Reject…</button>
       <label>Then <select data-remember="${a.approvalId}">
         <option value="">ask again next time</option>
-        <option value="exact">always allow ${a.tool === 'Bash' ? 'this exact command' : 'this tool'}</option>
+        <option value="exact">always allow ${a.tool === 'shell' ? 'this exact command' : 'this tool'}</option>
         ${a.pattern ? `<option value="pattern">always allow “${esc(a.pattern)}”</option>` : ''}
       </select></label>
     </div>` : ''}
@@ -838,10 +907,11 @@ async function openThread(key) {
   const prev = threadKey();
   if (prev) sessionDraft.set(prev, $('#msg')?.value || '');
   S.current = { type, id: Number(id) };
+  sidebarPreferences();sideQuery='';const target=type==='bot'?bot(id):null;if(target?.template!=='orchestrator'){revealedOrchestratorBranch=true;revealedDisplayGroups.add(type==='room'?'rooms':displayGroup(target||{}));}syncSidebarSeen();
   history.replaceState(null, '', '#' + key);
   S.loadingThread = true; S.messages = [];
   $('#side').classList.remove('open'); $('#aside').classList.remove('open');
-  renderSide(); renderMain();
+  renderSide();revealSidebarThread(key);renderMain();
   S.messages = await api(`/api/threads/${encodeURIComponent(key)}/messages`);
   S.loadingThread = false;
   if (threadKey() === key) { renderMain(); $('.thread-inner')?.classList.add('fade-in'); }
@@ -861,7 +931,7 @@ async function refreshState() {
 
 // ---------- live updates ----------
 function connect() {
-  const es = new EventSource('/api/events');
+  liveEvents?.close();const es=liveEvents=new EventSource('/api/events');
   es.addEventListener('message', (e) => {
     const m = JSON.parse(e.data);
     if (m.thread === threadKey() && !S.messages.some((x) => x.id === m.id)) {
@@ -896,9 +966,12 @@ function connect() {
   let pending;
   const soon = () => { clearTimeout(pending); pending = setTimeout(async () => { await refreshState(); if (S.current) updateHeaderBits(); }, 150); };
   for (const ev of ['bot_status', 'state_changed', 'approvals_changed']) es.addEventListener(ev, soon);
-  es.onerror = () => { fetch('/api/state').then((r) => { if (r.status === 401) location.href = '/login'; }).catch(() => {}); };
-  es.onopen = () => { refreshState(); if (S.current) openThread(threadKey()); };
+  es.onerror = () => { connectionStatus(navigator.onLine?'Reconnecting…':'Offline — instructions stay on this device');fetch('/api/state').then((r) => { if (r.status === 401) location.href = '/login'; }).catch(() => {}); };
+  es.onopen = () => { connectionStatus('Live · connected');refreshState(); if (S.current) openThread(threadKey()); };
 }
+window.addEventListener('offline',()=>connectionStatus('Offline — instructions stay on this device'));
+window.addEventListener('online',()=>{connectionStatus('Reconnecting…');connect();});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&navigator.onLine){connectionStatus('Reconnecting…');connect();}});
 function updateHeaderBits() {
   const b = S.current?.type === 'bot' ? bot(S.current.id) : null;
   const st = $('.head .status');
@@ -964,8 +1037,10 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (!$('
 
 function botModal(b) {
   const isNew = !b;
-  b = b || { name: '', role: '', instructions: '', color: BOT_COLORS[S.data.bots.length % BOT_COLORS.length], shape: 'none/none', effort: 'medium', model: '',
-    approval_rules: ['Bash(git push*)', 'Bash(rm -rf*)', 'Bash(*gh pr merge*)', 'mcp__*send*', 'mcp__*delete*', 'mcp__*pay*', 'mcp__*create_event*'], allow_rules: [] };
+  const toolOptions=S.data.toolCatalog||['shell','exec_command','write_stdin','apply_patch','read_file','write_file','list_files','view_image','skills','update_plan','request_user_input','capabilities','browser','shared_note','ask_worker','self_update'].map(name=>({name,description:''}));
+  b = b || { name: '', role: '', instructions: '', color: BOT_COLORS[S.data.bots.length % BOT_COLORS.length], shape: 'none/none', effort: 'medium', model: 'auto', default_model:'',
+    approval_rules: ['shell(git push*)', 'shell(*Remove-Item*)', 'shell(*gh pr merge*)', 'mcp__*send*', 'mcp__*delete*', 'mcp__*pay*', 'mcp__*create_event*','automation_schedule(enable)'], allow_rules: [] };
+  const fixedRoot=b.template==='orchestrator';
   let color = b.color;
   const look = outfit(b);
   const el = modal(`
@@ -980,25 +1055,34 @@ function botModal(b) {
       </div></div>
     <label class="field">Name<input id="f-name" value="${esc(b.name)}" placeholder="e.g. Inbox Manager"></label>
     <label class="field">Role (one line)<input id="f-role" value="${esc(b.role)}" placeholder="Gets my inbox to zero and drafts replies"></label>
-    <label class="field">Instructions<textarea id="f-instr" rows="6" placeholder="What this bot is for, how it should work, what tools or folders to use…">${esc(b.instructions)}</textarea></label>
+    ${fixedRoot?`<div class="field">Sidebar position<input type="hidden" id="f-display-group" value="${esc(displayGroup(b))}"><span class="hint">The root Orchestrator stays first, above the display groups. Its position is fixed and its chat is separate from the team disclosure.</span></div>`:`<label class="field">Display group<select id="f-display-group">${DISPLAY_GROUPS.map(group=>`<option value="${esc(group.id)}" ${displayGroup(b)===group.id?'selected':''}>${esc(group.label)}</option>`).join('')}</select><span class="hint">Organizes the sidebar only. Agent communication, delegation, permissions and the parent agent stay unchanged.</span></label>`}
+    <label class="field">Parent agent<select id="f-parent" ${fixedRoot?'disabled':''}><option value="">Independent agent</option>${S.data.bots.filter(p=>p.id!==b.id).map(p=>`<option value="${p.id}" ${Number(b.parent_bot_id)===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select><span class="hint">${fixedRoot?'The root Orchestrator has no parent. Root setup manages this relationship.':'Register this worker as a subagent. Delegated tasks have their own checkpoints and results; cycles are blocked.'}</span></label>
+    <label class="field">Specialist instructions<textarea id="f-instr" rows="10" placeholder="What this bot is for, how it should work, what tools or folders to use…">${esc(b.instructions)}</textarea><span class="hint">Combined with Nimbus’s shared system instructions for evidence, Windows tools, browser ownership, handoffs, recovery and truthful completion.</span></label>
     <div class="two">
       <label class="field">Effort<select id="f-effort">${EFFORTS.map(([v, l]) => `<option value="${v}" ${b.effort === v ? 'selected' : ''}>${l}</option>`).join('')}</select><span class="hint">Lower effort uses less of your plan.</span></label>
-      <label class="field">Model<input id="f-model" value="${esc(b.model)}" placeholder="Default"><span class="hint">Optional, e.g. sonnet or opus.</span></label>
+      <label class="field">Role model preference<select id="f-default-model">${[['','No preference'],['local','Shared local model'],['luna','Luna'],['terra','Terra'],['sol','Sol'],['astra','Astra']].map(([v,n])=>`<option value="${v}" ${(b.default_model||'')===v?'selected':''}>${n}</option>`).join('')}</select><span class="hint">The local router uses this starting point and chooses the model suited to each task.</span></label>
     </div>
-    <label class="toggle-row"><span class="p-icon" style="width:34px;height:34px;background:#2a3a6b">${ICON.monitor}</span>
-      <span class="m-text"><b>Own computer</b><span>${S.data.computers ? 'Works on its own desktop on your computer VM, with its own browser and sign-ins.' : 'Set up the computer VM first in Server settings (see deploy/computer/README.md).'}</span></span>
-      <input type="checkbox" class="switch" id="f-computer" ${b.computer ? 'checked' : ''} ${S.data.computers ? '' : 'disabled'}></label>
+    <label class="field">Model override<select id="f-model">${[['auto','Automatic — use role preference and task needs'],['local','Use shared local model'],['luna','Use Luna'],['terra','Use Terra'],['sol','Use Sol'],['astra','Use Astra']].map(([v,n])=>`<option value="${v}" ${(b.model||'auto')===v?'selected':''}>${n}</option>`).join('')}</select><span class="hint">An explicit choice overrides automatic routing. Local and OpenAI outages can fall back to the other backend. Workers share local capacity.</span></label>
+    <details class="adv"><summary>Worker tools · ${toolOptions.length} available</summary><label class="field">Find a tool<input data-tool-filter placeholder="Search names and descriptions"></label><div class="tool-picks specialist-picks">${toolOptions.map(tool=>`<label data-tool-option data-search="${esc((tool.name+' '+tool.description).toLowerCase())}" title="${esc(tool.description)}"><input type="checkbox" data-worker-tool="${esc(tool.name)}" ${(!b.tools||JSON.parse(b.tools).includes(tool.name))?'checked':''}><span><b>${esc(tool.name.replaceAll('_',' '))}</b><small>${esc(tool.description)}</small></span></label>`).join('')}</div><p class="hint">Each specialist receives tools for its role. Connector tools are configured in Plugins. Tool descriptions report supported workflows and limits.</p></details>
     <details class="adv"><summary>Approval rules</summary>
       <label class="field">Ask me before (one rule per line)<textarea id="f-rules" class="code" rows="5">${esc(b.approval_rules.join('\n'))}</textarea>
-        <span class="hint">Tool names with * wildcards. Bash(pattern) matches commands, e.g. Bash(git push*). Plugin tools start with mcp__.</span></label>
+        <span class="hint">Tool names with * wildcards. shell(pattern) matches commands, e.g. shell(git push*). Plugin tools start with mcp__.</span></label>
       <label class="field">Always allow (overrides the list above)<textarea id="f-allow" class="code" rows="2">${esc(b.allow_rules.join('\n'))}</textarea>
-        <span class="hint">Add <code>@self-email</code> to let this bot email only you without asking.</span></label>
+        <span class="hint">Allow rules override matching approval rules for this worker.</span></label>
     </details>
     <div class="modal-foot">
       ${isNew ? '' : '<button class="btn danger left" id="f-del">Delete bot</button>'}
       <button class="btn" data-close>Cancel</button>
       <button class="btn primary" id="f-save">${isNew ? 'Create bot' : 'Save'}</button>
     </div>`, { wide: true });
+  const botFormValue=()=>{
+    const lines=id=>$(id,el).value.split('\n').map(value=>value.trim()).filter(Boolean),selected=[...el.querySelectorAll('[data-worker-tool]:checked')].map(input=>input.dataset.workerTool),selectedSet=new Set(selected),advertised=new Set(toolOptions.map(tool=>tool.name)),existing=b.tools?JSON.parse(b.tools):[];
+    const tools=[...existing.filter(name=>!advertised.has(name)||selectedSet.has(name)),...selected.filter(name=>!existing.includes(name))];
+    return {name:$('#f-name',el).value.trim(),role:$('#f-role',el).value.trim(),instructions:$('#f-instr',el).value,color,shape:lookShape(look),display_group:$('#f-display-group',el).value,parent_bot_id:$('#f-parent',el).value?Number($('#f-parent',el).value):null,effort:$('#f-effort',el).value,default_model:$('#f-default-model',el).value,tools,model:$('#f-model',el).value.trim(),approval_rules:lines('#f-rules'),allow_rules:lines('#f-allow')};
+  };
+  // Compare editor values with their opening values, not stale server fields.
+  // A display-only change must not resend or reorder runtime configuration.
+  const initialBotForm=botFormValue();
   const preview = () => { $('#f-preview', el).innerHTML = avatar({ color, shape: lookShape(look) }, 84); };
   let tab = 'body';
   const setColor = (c) => {
@@ -1033,17 +1117,18 @@ function botModal(b) {
       await api(`/api/bots/${b.id}`, { method: 'DELETE' }); closeModal(); S.current = null; history.replaceState(null, '', '#'); await refreshState(); renderMain();
     }
     if (e.target.id === 'f-save') {
-      const lines = (id) => $(id, el).value.split('\n').map((s) => s.trim()).filter(Boolean);
-      const payload = { name: $('#f-name', el).value.trim(), role: $('#f-role', el).value.trim(), instructions: $('#f-instr', el).value, color, shape: lookShape(look),
-        effort: $('#f-effort', el).value, computer: $('#f-computer', el).checked, model: $('#f-model', el).value.trim(), approval_rules: lines('#f-rules'), allow_rules: lines('#f-allow') };
-      if (!payload.name) return toast('Give the bot a name');
+      const values=botFormValue(),payload=isNew?values:Object.fromEntries(Object.entries(values).filter(([key,value])=>JSON.stringify(value)!==JSON.stringify(initialBotForm[key])));
+      if (!values.name) return toast('Give the bot a name');
       try {
-        const saved = isNew ? await api('/api/bots', { method: 'POST', body: payload }) : await api(`/api/bots/${b.id}`, { method: 'PATCH', body: payload });
+        const saved=isNew?await api('/api/bots',{method:'POST',body:payload}):Object.keys(payload).length?await api(`/api/bots/${b.id}`,{method:'PATCH',body:payload}):b;
         closeModal(); await refreshState(); openThread('bot:' + saved.id);
       } catch (err) { toast(err.message); }
     }
   });
   drawPicks();
+  el.querySelector('[data-tool-filter]')?.addEventListener('input',event=>{
+    const query=event.target.value.trim().toLowerCase();for(const label of el.querySelectorAll('[data-tool-option]'))label.hidden=!label.dataset.search.includes(query);
+  });
 }
 
 function roomModal(r) {
@@ -1169,11 +1254,11 @@ async function marketModal(focus = '') {
   const row = (p, kind) => {
     const isBot = kind === 'bot';
     const btn = isBot ? `<button class="btn pill" data-add-bot="${p.id}">${p.added ? 'Add again' : 'Add'}</button>`
-      : p.kind === 'claude' ? `<button class="btn pill ${p.installed ? 'ghost' : ''}" data-connect="${p.id}">${p.installed ? 'Connected' : 'Connect'}</button>`
+      : p.kind === 'builtin' ? `<button class="btn pill ${p.installed ? 'ghost' : ''}" data-connect="${p.id}">${p.installed ? 'Connected' : 'Connect'}</button>`
       : p.installed ? `<button class="btn pill ghost" data-manage="${p.id}">Installed</button>`
       : `<button class="btn pill" data-install="${p.id}">Add</button>`;
     return `<div class="m-row">${isBot ? avatar(p, 40) : pluginIcon(p)}
-      <div class="m-text"><b>${esc(p.name)}</b><span>${esc(isBot ? p.role : p.desc)}</span></div>${btn}</div>`;
+      <div class="m-text"><b>${esc(p.name)}</b><span>${esc(isBot ? p.role : p.desc)}</span>${isBot?`<small class="muted">Prefers ${esc(p.default_model==='local'?'shared local':(p.default_model||'automatic'))} · ${esc(p.effort)} effort · editable</small>`:''}</div>${btn}</div>`;
   };
   const section = (title, list, kind) => list.length ? `<section><h3>${title}</h3><div class="m-grid">${list.map((p) => row(p, kind)).join('')}</div></section>` : '';
   const draw = () => {
@@ -1205,11 +1290,8 @@ async function marketModal(focus = '') {
 }
 
 function connectModal(p) {
-  const el = modal(`<div class="modal-head"><div class="ph">${pluginIcon(p, 44)}<h2>${esc(p.name)}</h2></div><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
-    <p>${esc(p.desc)}</p>
-    <p class="muted">${esc(p.name)} is a Claude connector. Connect it once in your Claude settings, signed in with the same account you use for Claude Code, and every bot can use it. Sending, deleting and creating events still wait for your approval.</p>
-    <div class="modal-foot"><button class="btn" data-back>Back</button><a class="btn primary" href="${esc(p.connectUrl)}" target="_blank" rel="noopener">Open Claude connectors</a></div>`);
-  el.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) closeModal(); if (e.target.closest('[data-back]')) marketModal(); });
+  const el=modal(`<div class="modal-head"><h2>${esc(p.name)}</h2><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div><p>${esc(p.desc)}</p><p>Browser groups are built into Nimbus. Enable the browser tool in a worker’s settings to give it its own tabs and sign-ins.</p>`);
+  el.addEventListener('click',e=>{if(e.target.closest('[data-close]'))closeModal();});
 }
 
 function installModal(p) {
@@ -1217,7 +1299,7 @@ function installModal(p) {
     <p>${esc(p.desc)}</p>
     ${p.fields.length ? p.fields.map((f) => `<label class="field">${esc(f.label)}<input type="password" data-key="${esc(f.key)}" autocomplete="off" placeholder="${p.installed ? 'Saved · paste to replace' : ''}">${f.help ? `<span class="hint">Get one at ${esc(f.help)}</span>` : ''}</label>`).join('')
       : '<p class="muted">No setup needed.</p>'}
-    <p class="muted">Stored on this computer in Nimbus’s database. After installing, switch it on for a bot from that bot’s plugin button.</p>
+    <p class="muted">Credentials are protected for this Windows account. After configuring, enable the connector for the workers that need it.</p>
     <div class="modal-foot">
       ${p.installed ? '<button class="btn danger left" data-remove>Remove</button>' : ''}
       <button class="btn" data-back>Back</button>
@@ -1245,35 +1327,10 @@ function installModal(p) {
   });
 }
 
-async function botPluginsModal(b, fresh = false) {
-  const market = S.market = await api('/api/marketplace' + (fresh ? '?fresh=1' : ''));
-  const on = new Set(b.plugins);
-  const usable = market.plugins.filter((p) => p.installed && p.kind !== 'claude');
-  const known = market.plugins.filter((p) => p.kind === 'claude');
-  // Everything connected on the Claude account, plus catalog connectors not connected yet.
-  const conns = [...market.connectors.map((c) => ({ ...c, p: known.find((k) => k.connector?.name === c.name) })),
-    ...known.filter((k) => !k.connector).map((k) => ({ name: k.name, status: 'not connected', p: k }))];
-  const connIcon = (c) => c.p ? pluginIcon(c.p, 34) : `<span class="p-icon" style="width:34px;height:34px;background:#d97757">${esc(c.name[0])}</span>`;
-  const el = modal(`<div class="modal-head"><h2>Plugins</h2><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
-    <p class="muted">Tools ${esc(b.name)} can use. Risky actions (send, delete, pay) still ask you first.</p>
-    <h3>Claude connectors</h3>
-    <p class="muted">From your Claude account, shared by every bot. Manage them at <a href="https://claude.ai/settings/connectors" target="_blank" rel="noopener">claude.ai/settings/connectors</a>. <button class="link" data-refresh>Refresh</button></p>
-    <div class="stack-list">${conns.map((c) => `<div class="toggle-row">${connIcon(c)}<span class="m-text"><b>${esc(c.name)}</b><span>${c.status === 'connected' ? 'Connected · available to every bot' : esc(c.status[0].toUpperCase() + c.status.slice(1))}</span></span>
-      ${c.status === 'connected' ? `<span class="pill-ok">${ICON.check}</span>` : '<a class="btn small" href="https://claude.ai/settings/connectors" target="_blank" rel="noopener">Connect</a>'}</div>`).join('')}</div>
-    <h3>Nimbus plugins</h3>
-    <div class="stack-list">${usable.length ? usable.map((p) => `<label class="toggle-row">${pluginIcon(p, 34)}<span class="m-text"><b>${esc(p.name)}</b><span>${esc(p.desc)}</span></span>
-      <input type="checkbox" class="switch" data-plugin="${p.id}" ${on.has(p.id) ? 'checked' : ''}></label>`).join('') : '<p class="muted">None installed yet. Browse plugins to add GitHub, Browser, Notion and more.</p>'}</div>
-    <div class="modal-foot"><button class="btn left" data-browse>${ICON.grid} Browse plugins</button><button class="btn" data-close>Cancel</button><button class="btn primary" data-save>Save</button></div>`, { wide: true });
-  el.addEventListener('click', async (e) => {
-    if (e.target.closest('[data-close]')) return closeModal();
-    if (e.target.closest('[data-refresh]')) { toast('Checking your Claude connectors…'); return botPluginsModal(b, true); }
-    if (e.target.closest('[data-browse]')) return marketModal('plugins');
-    if (e.target.closest('[data-save]')) {
-      const plugins = [...el.querySelectorAll('[data-plugin]')].filter((i) => i.checked).map((i) => i.dataset.plugin);
-      await api(`/api/bots/${b.id}/plugins`, { method: 'PUT', body: { plugins } });
-      closeModal(); await refreshState(); renderMain(); toast('Plugins saved. They apply from the next task.');
-    }
-  });
+async function botPluginsModal(b) {
+  const market=await api('/api/marketplace'),on=new Set(b.plugins||[]),usable=market.plugins.filter(p=>p.installed&&p.kind==='mcp');
+  const el=modal(`<div class="modal-head"><h2>${esc(b.name)}’s connectors</h2><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div><p>These Nimbus connectors are available to the worker on local and OpenAI model routes. Credentials are configured independently.</p><div class="stack-list">${usable.map(p=>`<label class="toggle-row">${pluginIcon(p,34)}<span class="m-text"><b>${esc(p.name)}</b><span>${esc(p.desc)}</span></span><input type="checkbox" class="switch" data-plugin="${p.id}" ${on.has(p.id)?'checked':''}></label>`).join('')||'<p class="muted">No connectors configured yet. Add one from the Marketplace.</p>'}</div><div class="modal-foot"><button class="btn left" data-browse>Browse connectors</button><button class="btn" data-close>Cancel</button><button class="btn primary" data-save>Save</button></div>`,{wide:true});
+  el.addEventListener('click',async e=>{if(e.target.closest('[data-close]'))closeModal();if(e.target.closest('[data-browse]'))marketModal('plugins');if(e.target.closest('[data-save]')){try{await api(`/api/bots/${b.id}/plugins`,{method:'PUT',body:{plugins:[...el.querySelectorAll('[data-plugin]:checked')].map(i=>i.dataset.plugin)}});closeModal();await refreshState();toast('Connectors saved for the next task');}catch(err){toast(err.message);}}});
 }
 
 function appearanceModal() {
@@ -1355,155 +1412,93 @@ async function activityLogModal() {
 }
 
 // ---------- server settings ----------
-async function serverModal() {
-  let v;
-  try { v = await api('/api/settings'); } catch (err) { return toast(err.message); }
-  const secret = (k) => `type="password" autocomplete="off" placeholder="${v[k] ? 'Saved · paste to replace' : ''}"`;
-  const el = modal(`<div class="modal-head"><h2>Server settings</h2><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
-    <h3>Bot computers</h3>
-    <p class="muted">The VM that runs each bot’s own desktop. See deploy/computer/README.md to set it up.</p>
-    <label class="field">Agent URL<input id="s-agent_url" value="${esc(v.agent_url)}" placeholder="http://<computer-vm-ip>:8788"></label>
-    <label class="field">Agent token<input id="s-agent_token" ${secret('agent_token')}></label>
-    <label class="field">Callback URL<input id="s-callback_url" value="${esc(v.callback_url)}" placeholder="http://<this-server-ip>:8787"><span class="hint">How the VM reaches this Nimbus for approvals.</span></label>
-    <h3>Proxmox</h3>
-    <p class="muted">Shows host load and guest status in the Activity panel. A read-only (PVEAuditor) API token is enough.</p>
-    <label class="field">Host<input id="s-pve_host" value="${esc(v.pve_host)}" placeholder="<proxmox-host-ip>"></label>
-    <label class="field">Token ID<input id="s-pve_token_id" value="${esc(v.pve_token_id)}" placeholder="user@pve!tokenname"></label>
-    <label class="field">Token secret<input id="s-pve_token_secret" ${secret('pve_token_secret')}></label>
-    <div class="update-box"><button class="btn small" data-update>Update computers</button><span class="muted" id="upd-status">Rebuilds them with the latest Claude Code and Chromium. Files, browsers and sign-ins are kept; computers restart.</span></div>
-    <h3>Chats</h3>
-    <label class="field">Auto-compact at (% of context)<input id="s-auto_compact_pct" type="number" min="0" max="95" value="${esc(v.auto_compact_pct || '20')}"><span class="hint">When a chat’s context passes this, Nimbus compacts it between messages. 0 turns it off. You can also type <code>/compact</code> in any chat.</span></label>
-    <h3>Backups</h3>
-    <p class="muted">Every night at 3:15 Nimbus saves an encrypted copy of all bots, chats, memories and settings (last 14 kept on this server).
-      Set a target to also copy each backup to another machine. Keep the key file <code>~/opt/nimbus-backup.key</code> somewhere safe: backups can’t be opened without it.</p>
-    <label class="field">Copy backups to (optional)<input id="s-backup_target" value="${esc(v.backup_target || '')}" placeholder="user@nas:/mnt/pool/nimbus-backups"><span class="hint">Over SSH, using this server’s key.</span></label>
-    <div class="update-box"><button class="btn small" data-backup>Back up now</button><span class="muted" id="bk-status">Checking…</span></div>
-    <div class="modal-foot"><button class="btn left" data-test>Test computer VM</button><button class="btn" data-close>Cancel</button><button class="btn primary" data-save>Save</button></div>`);
-  api('/api/backup').then(({ last }) => { const st = $('#bk-status', el); if (st) st.textContent = !last ? 'No backup yet.'
-    : last.ok ? `Last backup ${timeAgo(Math.round(last.at / 1000))}: ${fmtSize(last.size)}${last.remote ? ', copied to ' + last.remote : ', on this server only'}` : `✗ Last backup failed: ${last.error}`; }).catch(() => {});
-  const values = () => {
-    const out = {};
-    for (const k of Object.keys(v)) { const i = $('#s-' + k, el); if (!i) continue; out[k] = i.type === 'password' && !i.value ? (v[k] ? '__saved__' : '') : i.value; }
-    return out;
-  };
-  el.addEventListener('click', async (e) => {
-    if (e.target.closest('[data-close]')) return closeModal();
-    try {
-      if (e.target.closest('[data-backup]')) {
-        await api('/api/settings', { method: 'PUT', body: values() });
-        $('#bk-status', el).textContent = 'Backing up…';
-        const r = await api('/api/backup', { method: 'POST' });
-        $('#bk-status', el).textContent = r.ok ? `✓ Saved ${fmtSize(r.size)}${r.remote ? ' and copied to ' + r.remote : ''}` : '✗ ' + r.error;
-        return;
-      }
-      if (e.target.closest('[data-update]')) {
-        if (!confirm('Update all bot computers now? Each one restarts, so any task running on a computer is interrupted. It takes a few minutes.')) return;
-        await api('/api/computers/update', { method: 'POST' });
-        const st = $('#upd-status', el), btn = e.target.closest('[data-update]');
-        btn.disabled = true;
-        const poll = async () => {
-          const u = await api('/api/computers/update').catch(() => null);
-          if (!document.body.contains(st)) return;
-          if (u?.running) { st.textContent = 'Updating… ' + (u.log.trim().split('\n').pop() || ''); return setTimeout(poll, 4000); }
-          btn.disabled = false;
-          st.textContent = u?.ok ? '✓ Computers updated.' : '✗ Update failed: ' + (u?.log.trim().split('\n').pop() || 'unknown error');
-          compAt = 0;
-        };
-        st.textContent = 'Updating…'; return poll();
-      }
-      if (e.target.closest('[data-test]')) {
-        await api('/api/settings', { method: 'PUT', body: values() });
-        const h = await api('/api/settings/test-agent', { method: 'POST' });
-        return toast(h.ok ? 'Computer VM is reachable' : 'Computer VM answered, but isn’t healthy');
-      }
-      if (e.target.closest('[data-save]')) {
-        await api('/api/settings', { method: 'PUT', body: values() });
-        pveAt = 0; closeModal(); await refreshState(); toast('Settings saved');
-      }
-    } catch (err) { toast(err.message); }
-  });
-}
+async function serverModal() { return runtimeUI.settings(); }
+async function computerModal(b) { return runtimeUI.group(b.id); }
 
-// ---------- bot computers ----------
-async function computerModal(b) {
-  if (!window.isSecureContext && !S.httpsPort) S.httpsPort = (await api('/api/https-port').catch(() => ({}))).port;
-  const el = modal(`<div class="modal-head"><h2>${esc(b.name)}’s computer</h2>
-      <div class="seg cm-tabs"><button data-tab="screen" aria-pressed="true">Screen</button><button data-tab="files" aria-pressed="false">Files</button></div>
-      <button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
-    <div id="cm-body"><div class="muted">Checking…</div></div>`, { wide: true, cls: 'computer' });
-  let tab = 'screen', dir = 'Downloads', info = null;
-  const drawScreen = (c) => {
-    $('#cm-body', el).innerHTML = !c.exists
-      ? `<p>${esc(b.name)} doesn’t have a computer yet. It gets one automatically on its next task, or you can start it now to sign it into websites first.</p>
-         <div class="modal-foot"><button class="btn primary" data-start>Start computer</button></div>`
-      : !c.running
-      ? `<p>😴 ${esc(b.name)}’s computer is asleep to save memory. It wakes up by itself on the next task, with its files, browser and sign-ins as they were.</p>
-         <div class="modal-foot"><button class="btn primary" data-start>Wake it now</button></div>`
-      : !window.isSecureContext
-      ? `<p>The desktop needs a secure (HTTPS) connection, and this page is plain HTTP.</p>
-         <p class="muted">Open Nimbus over HTTPS instead. The first time, your browser warns that the certificate isn’t trusted: choose <b>Advanced → Proceed</b>. It’s Nimbus’s own certificate on your network.</p>
-         <div class="modal-foot"><a class="btn primary" href="https://${location.hostname}:${S.httpsPort || 8443}/#bot:${b.id}">Open Nimbus over HTTPS</a></div>`
-      : `<div class="screen"><iframe src="/computer/${b.id}/" title="${esc(b.name)}’s screen" allow="clipboard-read; clipboard-write"></iframe></div>
-         <div class="cm-info">
-           <span class="muted">Shown through Nimbus, so no sign-in needed. Direct link: ${esc(c.url)} (user <code>${esc(c.user)}</code>, password <button class="link" data-reveal="${esc(c.password)}">show</button>)</span>
-           <span class="grow"></span>
-           <a class="btn small" href="/computer/${b.id}/" target="_blank" rel="noopener">Open in new tab</a>
-           <button class="btn small danger" data-delete>Delete computer</button>
-         </div>
-         <p class="muted">You can use this screen yourself, for example to sign ${esc(b.name)} into a website. Anything the bot opens in its browser shows up here.</p>`;
+async function passkeysModal() {
+  const el = modal(`<div class="modal-head"><h2>Passkeys</h2><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
+    <div data-passkey-body><p class="muted">Loading passkeys…</p></div>
+    <p data-passkey-status role="alert" hidden></p><a href="/login" data-passkey-signin hidden>Sign in again</a>
+    <div class="modal-foot"><button class="btn" data-close>Close</button></div>`);
+  let state = null, busy = false;
+  const body = $('[data-passkey-body]', el), status = $('[data-passkey-status]', el), signIn = $('[data-passkey-signin]', el);
+  const date = (value, fallback) => {
+    if (value == null || value === '') return fallback;
+    const number = typeof value === 'number' || /^\d+$/.test(String(value)) ? Number(value) : null;
+    const parsed = new Date(number == null ? value : number < 1e12 ? number * 1000 : number);
+    return Number.isNaN(parsed.getTime()) ? fallback : parsed.toLocaleString();
   };
-  // Files: the bot's home folder on its computer. Downloads first, since that's where browser downloads land.
-  const drawFiles = async () => {
-    const body = $('#cm-body', el);
-    if (!info?.exists) { body.innerHTML = `<p class="muted">${esc(b.name)} doesn’t have a computer yet.</p>`; return; }
-    body.innerHTML = '<div class="muted">Loading files…</div>';
-    let r;
-    try { r = await api(`/api/bots/${b.id}/files?dir=${encodeURIComponent(dir)}`); } catch (err) { body.innerHTML = `<p class="muted">${esc(err.message)}</p>`; return; }
-    const parts = r.dir ? r.dir.split('/') : [];
-    const crumbs = [`<button class="link" data-dir="">Home</button>`, ...parts.map((p, i) => `<button class="link" data-dir="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`)].join(' / ');
-    const hidden = new Set(['browser-profile', 'ssl', 'Templates', 'Public']);
-    const nimbusFiles = new Set(['CLAUDE.md', 'MEMORY.md', 'ask-bot.mjs']); // Nimbus's own files in ~/work
-    const items = r.items.filter((it) => (r.dir ? !(r.dir === 'work' && nimbusFiles.has(it.name)) : !hidden.has(it.name)));
-    body.innerHTML = `<div class="files-bar"><span>${crumbs}</span><span class="grow"></span>
-        ${['Downloads', 'work', 'Desktop'].map((d) => `<button class="btn small ${r.dir === d ? 'primary' : ''}" data-dir="${d}">${d === 'work' ? 'Bot’s work' : d}</button>`).join('')}
-        <button class="icon-btn" data-dir="${esc(r.dir)}" title="Refresh" aria-label="Refresh">↻</button></div>
-      ${r.error ? `<p class="muted">${esc(r.error === 'Folder not found' ? 'This folder is empty or doesn’t exist yet.' : r.error)}</p>` : ''}
-      <div class="file-list">${items.length ? items.map((it) => {
-        const rel = (r.dir ? r.dir + '/' : '') + it.name;
-        return it.dir
-          ? `<button class="file-row" data-dir="${esc(rel)}"><span class="fi">📁</span><span class="fn">${esc(it.name)}</span><span class="fm">${timeAgo(it.mtime)}</span></button>`
-          : `<a class="file-row" href="/api/bots/${b.id}/file?path=${encodeURIComponent(rel)}" download><span class="fi">📄</span><span class="fn">${esc(it.name)}</span><span class="fm">${fmtSize(it.size)} · ${timeAgo(it.mtime)}</span><span class="fd">⬇</span></a>`;
-      }).join('') : (r.error ? '' : '<p class="muted">Nothing here yet. When the bot downloads or saves files here, you can download them.</p>')}</div>`;
-  };
-  const draw = () => (tab === 'screen' ? drawScreen(info) : drawFiles());
-  const load = async (method = 'GET') => {
-    try { info = await api(`/api/bots/${b.id}/computer`, { method }); draw(); }
-    catch (err) { $('#cm-body', el).innerHTML = `<p class="muted">${esc(err.message)}</p>`; }
-  };
-  load();
-  el.addEventListener('click', async (e) => {
-    if (e.target.closest('[data-close]')) return closeModal();
-    const tb = e.target.closest('[data-tab]');
-    if (tb) { tab = tb.dataset.tab; el.querySelectorAll('[data-tab]').forEach((x) => x.setAttribute('aria-pressed', x === tb)); return info ? draw() : load(); }
-    const dv = e.target.closest('[data-dir]');
-    if (dv) { dir = dv.dataset.dir; return drawFiles(); }
-    const rv = e.target.closest('[data-reveal]');
-    if (rv) { rv.outerHTML = `<code class="secret-inline">${esc(rv.dataset.reveal)}</code>`; return; }
-    if (e.target.closest('[data-start]')) { $('#cm-body', el).innerHTML = '<div class="muted">Starting… this can take up to a minute.</div>'; return load('POST'); }
-    if (e.target.closest('[data-delete]')) {
-      if (!confirm(`Delete ${b.name}’s computer? Its files, browser and sign-ins are erased. The bot stays, and works on this PC until you turn “Own computer” back on.`)) return;
-      try { await api(`/api/bots/${b.id}/computer`, { method: 'DELETE' }); closeModal(); await refreshState(); renderMain(); toast('Computer deleted'); }
-      catch (err) { toast(err.message); }
+  function showMessage(message, error = false) {
+    status.textContent = message; status.hidden = !message;
+    status.className = error ? 'runtime-warning' : 'muted';
+  }
+  function setBusy(value) {
+    busy = value; el.setAttribute('aria-busy', String(value));
+    const wrongOrigin = canonicalPasskeyOrigin(state?.origin) !== location.origin;
+    for (const field of body.querySelectorAll('input')) field.disabled = value;
+    for (const button of body.querySelectorAll('[data-passkey-add], [data-passkey-remove]')) {
+      button.disabled = value || !state?.available || wrongOrigin || button.hasAttribute('data-passkey-remove') && state.passkeys.length <= 1;
     }
+  }
+  function render() {
+    const origin = canonicalPasskeyOrigin(state.origin);
+    const wrongOrigin = origin !== location.origin;
+    if (!state.available) {
+      body.innerHTML = '<p>Passkeys are unavailable for this sign-in method.</p>';
+      return;
+    }
+    body.innerHTML = `<p>${state.required ? 'Your username, password and a passkey are required to sign in.' : 'Use a passkey with your Nimbus account.'}${state.username ? ` Signed in as ${esc(state.username)}.` : ''}</p>
+      ${wrongOrigin ? `<p class="runtime-warning">Manage your passkeys at the Nimbus sign-in address.${origin ? ` <a href="${esc(origin)}">${esc(origin)}</a>` : ' The configured address is unavailable.'}</p>` : ''}
+      <div class="stack-list">${state.passkeys.length ? state.passkeys.map(key => `<div class="panel"><div class="top"><b>${esc(key.label || 'Passkey')}</b><span class="grow"></span><button class="btn small danger" data-passkey-remove="${esc(key.id)}" ${state.passkeys.length <= 1 ? 'disabled title="Add another passkey before removing the last one"' : ''}>Remove</button></div><p class="muted">Created ${esc(date(key.createdAt, 'at an unknown time'))}<br>Last used: ${esc(date(key.lastUsedAt, 'not used yet'))}</p></div>`).join('') : '<p class="muted">No passkeys are registered.</p>'}</div>
+      <p class="muted">Sign in within the last five minutes and enter your current password to add or remove a passkey. Add another passkey before removing your last one.</p>
+      <label class="field">Current password<input type="password" data-passkey-password autocomplete="current-password"></label>
+      <label class="field">New passkey name (optional)<input data-passkey-label maxlength="80" autocomplete="off" placeholder="For example, my phone"></label>
+      <div class="modal-foot"><button class="btn primary" data-passkey-add>Add passkey</button></div>`;
+    setBusy(busy);
+  }
+  async function load() {
+    state = await passkeyRequest('/api/passkeys', { method: 'GET' });
+    if (!Array.isArray(state.passkeys)) throw new Error('Nimbus returned an incomplete passkey list. Try again.');
+    if (document.body.contains(el)) render();
+  }
+  function showError(error) {
+    showMessage(passkeyError(error, { signIn: false }), true);
+    signIn.hidden = error.status !== 401;
+  }
+  el.addEventListener('click', async event => {
+    const button = event.target.closest('button');
+    if (!button) return;
+    if (button.hasAttribute('data-close')) return closeModal();
+    if (busy || !state?.available || !button.matches('[data-passkey-add], [data-passkey-remove]')) return;
+    const passwordField = $('[data-passkey-password]', el), password = passwordField?.value || '';
+    if (!password) { showMessage('Enter your current password to continue.', true); passwordField?.focus(); return; }
+    if (canonicalPasskeyOrigin(state.origin) !== location.origin) { showMessage('Open the Nimbus sign-in address to manage passkeys.', true); return; }
+    setBusy(true); showMessage(''); signIn.hidden = true;
+    try {
+      if (button.hasAttribute('data-passkey-add')) {
+        const label = $('[data-passkey-label]', el).value.trim();
+        const enrollment = await passkeyRequest('/api/passkeys/enrollment/start', { body: { password, label } });
+        passwordField.value = '';
+        await performPasskey({ ticket: enrollment.ticket, registration: true, label, origin: state.origin });
+        await load(); showMessage('Passkey added.');
+      } else {
+        if (state.passkeys.length <= 1) throw new Error('Add another passkey before removing your last one.');
+        const id = button.dataset.passkeyRemove;
+        if (!state.passkeys.some(key => String(key.id) === id)) throw new Error('That passkey is no longer in the list. Reopen Passkeys to refresh it.');
+        await passkeyRequest(`/api/passkeys/${encodeURIComponent(id)}`, { method: 'DELETE', body: { password } });
+        await load(); showMessage('Passkey removed.');
+      }
+    } catch (error) { showError(error); }
+    finally { if (passwordField) passwordField.value = ''; setBusy(false); }
   });
+  try { await load(); } catch (error) { body.textContent = 'Passkeys could not be loaded.'; showError(error); }
 }
 
-// ---------- two-factor ----------
 function loadQrLib() {
   if (window.QRCode) return Promise.resolve();
   return new Promise((ok, fail) => {
     const sc = document.createElement('script');
-    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+    sc.src = '/vendor/qrcode.min.js';
     sc.onload = ok; sc.onerror = fail; document.head.append(sc);
   });
 }
@@ -1581,6 +1576,15 @@ document.addEventListener('click', async (e) => {
   }
   if (t.closest('#modal-root')) return;
   const cur = S.current?.type === 'bot' ? bot(S.current.id) : null;
+  if(t.hasAttribute('data-orchestrator-toggle')){
+    if(sideQuery)return;
+    sidebarPreferences();sidebarPrefs.rootCollapsed=t.getAttribute('aria-expanded')==='true';revealedOrchestratorBranch=false;saveSidebarPreferences();renderSide();document.querySelector('[data-orchestrator-toggle]')?.focus({preventScroll:true});return;
+  }
+  if(t.hasAttribute('data-display-group')){
+    if(sideQuery)return;
+    const group=t.getAttribute('data-display-group');sidebarPreferences();sidebarPrefs.collapsed[group]=t.getAttribute('aria-expanded')==='true';revealedDisplayGroups.delete(group);saveSidebarPreferences();renderSide();
+    [...document.querySelectorAll('[data-display-group]')].find(button=>button.getAttribute('data-display-group')===group)?.focus({preventScroll:true});return;
+  }
   if (t.dataset.open) return openThread(t.dataset.open);
   if (t.dataset.computer) { const cb = bot(t.dataset.computer); if (cb) return computerModal(cb); }
   if (t.dataset.copy) { const m = S.messages.find((x) => x.id === Number(t.dataset.copy)); await navigator.clipboard?.writeText(m?.body || '').catch(() => {}); buzz(6); return toast('Copied'); }
@@ -1597,8 +1601,9 @@ document.addEventListener('click', async (e) => {
   const act = t.dataset.act;
   if (act) closePopover();
   switch (act) {
+    case 'team': return runtimeUI.overview();
     case 'new-menu': e.stopPropagation(); return popover(t, [['new-bot', 'New bot', ICON.plus], ['new-room', 'New group chat', ICON.compose], ['market', 'Browse Marketplace', ICON.grid]]);
-    case 'user-menu': e.stopPropagation(); return popover(t, [['appearance', 'Appearance', ICON.gear], ['server', 'Server settings', ICON.monitor], ['log', 'Activity log', ICON.clock], ['mfa', 'Two-factor authentication', ICON.lock], ['notify', 'Notifications', ICON.bell], ...(window.NimbusApp ? [['app-server', 'App: server address', ICON.gear]] : []), ['logout', 'Log out', ICON.close]]);
+    case 'user-menu': e.stopPropagation(); return popover(t, [['appearance', 'Appearance', ICON.gear], ['server', 'Server settings', ICON.monitor], ['log', 'Activity log', ICON.clock], ['passkeys', 'Passkeys', ICON.lock], ['mfa', 'Two-factor authentication', ICON.lock], ['notify', 'Notifications', ICON.bell], ...(window.NimbusApp ? [['app-server', 'App: server address', ICON.gear]] : []), ['logout', 'Log out', ICON.close]]);
     case 'new-bot': return botModal();
     case 'edit-bot': return botModal(cur);
     case 'new-room': return roomModal();
@@ -1611,6 +1616,7 @@ document.addEventListener('click', async (e) => {
     case 'attach': return $('#file-pick').click();
     case 'dictate': return toggleDictation(t);
     case 'mfa': return mfaModal();
+    case 'passkeys': return passkeysModal();
     case 'server': return serverModal();
     case 'log': return activityLogModal();
     case 'app-server': return window.NimbusApp?.changeServer();
@@ -1635,7 +1641,7 @@ document.addEventListener('click', async (e) => {
       });
       return;
     }
-    case 'menu': e.stopPropagation(); return $('#side').classList.toggle('open');
+    case 'menu': e.stopPropagation(); {const open=$('#side').classList.toggle('open');if(open&&threadKey())revealSidebarThread(threadKey());return open;}
     case 'panel': e.stopPropagation(); $('#side').classList.remove('open'); return $('#aside').classList.toggle('open');
     case 'logout': await api('/api/logout', { method: 'POST' }); location.href = '/login'; return;
     case 'notify':
@@ -1690,12 +1696,16 @@ document.addEventListener('submit', async (e) => {
   if (attachments.some((a) => !a.id && !a.error)) return toast('Still uploading…');
   const files = attachments.filter((a) => a.id).map((a) => a.id);
   if (!text && !files.length) return;
+  if(!navigator.onLine)return toast('You’re offline. Your instructions have not been sent.');
+  const targetThread=threadKey(),sendKey=JSON.stringify({targetThread,text,files});
+  if(!pendingSends.has(sendKey))pendingSends.set(sendKey,crypto.randomUUID());
+  const requestId=pendingSends.get(sendKey);
   const kept = attachments;
   const sendBtn = $('.composer .send');
   sendBtn?.classList.remove('launch'); void sendBtn?.offsetWidth; sendBtn?.classList.add('launch');
   buzz(10);
   ta.value = ''; autosize(ta); $('#slash-hint')?.remove(); sessionDraft.delete(threadKey()); attachments = []; drawAttachments();
-  try { await api(`/api/threads/${encodeURIComponent(threadKey())}/messages`, { method: 'POST', body: { text, files } }); kept.forEach((a) => a.preview && URL.revokeObjectURL(a.preview)); }
+  try { await api(`/api/threads/${encodeURIComponent(targetThread)}/messages`, { method: 'POST', body: { text, files,requestId } });pendingSends.delete(sendKey); kept.forEach((a) => a.preview && URL.revokeObjectURL(a.preview)); }
   catch (err) { ta.value = text; attachments = kept; drawAttachments(); toast(err.message); }
 });
 
@@ -1719,13 +1729,15 @@ window.addEventListener('hashchange', () => {
 });
 
 // ---------- boot ----------
+runtimeUI = createRuntimeUI({api,esc,modal,closeModal,toast,bot,avatar,S,openThread,refreshState});
 applyTheme();
 (async () => {
   await refreshState();
   const hash = location.hash.slice(1);
-  const first = Object.entries(S.data.last).sort((a, b) => b[1].at - a[1].at)[0]?.[0];
+  const root=rootOrchestrator(),candidates=orchestratorAgents(),first=Object.entries(S.data.last).filter(([key])=>{const[type,id]=key.split(':');return type==='bot'?!!bot(id):type==='room'?!!room(id):false;}).sort((a,b)=>b[1].at-a[1].at)[0]?.[0];
   if (/^(bot|room):\d+$/.test(hash)) openThread(hash);
-  else if (matchMedia('(min-width: 761px)').matches && (first || S.data.bots[0])) openThread(first || 'bot:' + S.data.bots[0].id);
+  else if(matchMedia('(min-width:761px)').matches&&root)openThread('bot:'+root.id);
+  else if(candidates.length===0&&matchMedia('(min-width:761px)').matches&&(first||S.data.bots[0]))openThread(first||'bot:'+S.data.bots[0].id);
   else renderMain();
   connect();
 })();
