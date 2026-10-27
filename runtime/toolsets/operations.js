@@ -15,7 +15,7 @@ export const tools=[
   spec('host_snapshot','Read host OS, Node, uptime, CPU and live RAM/GPU resource measurements. This does not start/stop software or change model configuration.',{}),
   spec('process_inspect','Read a bounded process inventory with PID/name/CPU/memory. Optional literal name filter or PID. Command lines and environment secrets are omitted.',{name:text,pid:integer(1,2147483647),limit:integer(1,200)}),
   spec('service_inspect','Read Windows service status/start type without changing services. Optional literal name filter. Reports unsupported platforms honestly.',{name:text,limit:integer(1,200)}),
-  spec('health_probe','Perform a bounded HTTP GET health check. Reports status, redirect chain, timing, response content type and a limited textual body. No credentials/headers can be supplied; redirects cannot introduce credentials.',{url:text,timeoutMs:integer(100,15000),maxBytes:integer(100,64000)},['url']),
+  spec('health_probe','Perform a bounded HTTP GET health check. Reports status, redirects, timing and a limited textual body. Network failures and probe timeouts return completed observations with ok:false; task cancellation still stops execution. A failed probe alone does not establish application health. No credentials/headers can be supplied; redirects cannot introduce credentials.',{url:text,timeoutMs:integer(100,15000),maxBytes:integer(100,64000)},['url']),
   spec('log_read','Read the tail of a local text log without loading the whole file. Optional literal contains filter. Reports byte offsets, truncation and line numbers relative to the tail.',{path:text,lines:integer(1,500),maxBytes:integer(1024,1048576),contains:text},['path']),
   spec('file_manifest','Inventory regular files with sizes, timestamps and optional SHA-256, bounded recursion/visited entries and explicit skipped-file reasons. Does not follow symlinks or alter files. Useful for migration/integrity evidence.',{path:text,recursive:{type:'boolean'},hash:{type:'boolean'},maxFiles:integer(1,1000),maxHashBytes:integer(1,67108864),maxEntries:integer(1,20000)},['path']),
   spec('artifact_inventory','Find this worker\'s saved artifacts, including paths, sizes and SHA-256 hashes. Keeps inspection within the worker workspace. No files are created or deleted.',{path:text,maxFiles:integer(1,500)}),
@@ -34,14 +34,38 @@ export const roleTools={
 };
 function bounded(value,fallback,min,max){const number=value===undefined?fallback:Number(value);if(!Number.isInteger(number)||number<min||number>max)throw new Error(`Expected an integer from ${min} to ${max}`);return number;}
 function local(ctx,file='.'){return path.resolve(ctx.workspace,file);}
-async function readLimited(response,maxBytes){
+async function readLimited(response,maxBytes,onProgress){
   if(!response.body)return{bytes:Buffer.alloc(0),truncated:false};
   const reader=response.body.getReader(),chunks=[];let size=0,truncated=false;
-  try{for(;;){const {done,value}=await reader.read();if(done)break;const remaining=maxBytes-size;if(value.length>remaining){chunks.push(value.subarray(0,remaining));size+=remaining;truncated=true;await reader.cancel();break;}chunks.push(value);size+=value.length;}}
+  try{for(;;){const {done,value}=await reader.read();if(done)break;const remaining=maxBytes-size;if(value.length>remaining){chunks.push(value.subarray(0,remaining));size+=remaining;onProgress?.(size);truncated=true;await reader.cancel();break;}chunks.push(value);size+=value.length;onProgress?.(size);}}
   finally{reader.releaseLock();}
   return{bytes:Buffer.concat(chunks,size),truncated};
 }
 function checkedURL(value){const url=new URL(value);if(!['http:','https:'].includes(url.protocol)||url.username||url.password)throw new Error('Use an HTTP(S) URL without embedded credentials');return url;}
+const probeCodes=new Map([
+  ['ECONNREFUSED','connection_refused'],['ENOTFOUND','dns_error'],['EAI_AGAIN','dns_error'],
+  ['ETIMEDOUT','timeout'],['UND_ERR_CONNECT_TIMEOUT','timeout'],['UND_ERR_HEADERS_TIMEOUT','timeout'],['UND_ERR_BODY_TIMEOUT','timeout'],
+  ['ECONNRESET','transport_error'],['EPIPE','transport_error'],['ENETUNREACH','transport_error'],['EHOSTUNREACH','transport_error'],['UND_ERR_SOCKET','transport_error'],
+  ['DEPTH_ZERO_SELF_SIGNED_CERT','tls_error'],['SELF_SIGNED_CERT_IN_CHAIN','tls_error'],['UNABLE_TO_VERIFY_LEAF_SIGNATURE','tls_error'],['UNABLE_TO_GET_ISSUER_CERT_LOCALLY','tls_error'],['CERT_HAS_EXPIRED','tls_error'],['ERR_TLS_CERT_ALTNAME_INVALID','tls_error'],
+]);
+function probeFailure(error,timeout){
+  // Fetch wraps platform errors in cause/AggregateError. Inspect only a bounded
+  // chain and return known codes/static explanations, never raw transport data.
+  const pending=[error],seen=new Set(),codes=[];
+  for(let visited=0;pending.length&&visited<16;visited++){
+    const current=pending.shift();if(!current||typeof current!=='object'||seen.has(current))continue;seen.add(current);
+    if(probeCodes.has(current.code))codes.push(current.code);
+    if(current.cause)pending.push(current.cause);
+    if(Array.isArray(current.errors))pending.push(...current.errors.slice(0,8));
+  }
+  const code=codes[0],kind=timeout.aborted||error?.name==='TimeoutError'?'timeout':probeCodes.get(code);
+  if(kind){
+    const messages={connection_refused:'The connection was refused.',dns_error:'The endpoint hostname could not be resolved.',timeout:'The health probe exceeded its time limit.',tls_error:'The endpoint TLS connection could not be verified.',transport_error:'The HTTP connection failed or ended before the response completed.'};
+    return{kind,code:timeout.aborted?'PROBE_TIMEOUT':code||'PROBE_TIMEOUT',message:messages[kind]};
+  }
+  if(error instanceof TypeError&&['fetch failed','terminated'].includes(error.message))return{kind:'transport_error',code:error.message==='terminated'?'RESPONSE_TERMINATED':'FETCH_FAILED',message:'The HTTP connection failed or ended before the response completed.'};
+  return null;
+}
 function manifest(target,{recursive=true,hash=true,maxFiles=250,maxHashBytes=16777216,maxEntries=10000,signal}={}){
   const root=path.resolve(target),files=[],skipped=[];let limited=false,totalBytes=0,hashedBytes=0,visitedEntries=0,visitedDirectories=0;
   const visit=(file,depth)=>{
@@ -89,16 +113,27 @@ export async function execute(name,args={},ctx={}){
   }
   if(name==='health_probe'){
     const begin=Date.now(),maxBytes=bounded(args.maxBytes,12000,100,64000),timeout=AbortSignal.timeout(bounded(args.timeoutMs,10000,100,15000)),signal=ctx.signal?AbortSignal.any([ctx.signal,timeout]):timeout;
-    let url=checkedURL(args.url);const redirects=[];
-    for(let hop=0;hop<=3;hop++){
-      const response=await fetch(url,{redirect:'manual',signal});
-      if([301,302,303,307,308].includes(response.status)&&response.headers.get('location')){
-        const next=checkedURL(new URL(response.headers.get('location'),url));redirects.push({from:url.href,to:next.href,status:response.status});await response.body?.cancel();if(hop===3)throw new Error('Health probe redirect limit reached');url=next;continue;
+    let url=checkedURL(args.url),response=null,bytesRead=0;const redirects=[],requestUrl=url.href;
+    const observation=()=>({requestUrl,url:url.href,elapsedMs:Date.now()-begin,redirects,readOnly:true,completed:true,uncertain:false,responseReceived:response!==null,status:response?.status??null,contentType:response?.headers.get('content-type')||'',bytesRead});
+    try{
+      for(let hop=0;hop<=3;hop++){
+        ctx.signal?.throwIfAborted();response=null;bytesRead=0;
+        response=await fetch(url,{redirect:'manual',signal});
+        if([301,302,303,307,308].includes(response.status)&&response.headers.get('location')){
+          const next=checkedURL(new URL(response.headers.get('location'),url));redirects.push({from:url.href,to:next.href,status:response.status});await response.body?.cancel();if(hop===3)throw new Error('Health probe redirect limit reached');url=next;continue;
+        }
+        const type=response.headers.get('content-type')||'',body=await readLimited(response,maxBytes,size=>{bytesRead=size;});
+        ctx.signal?.throwIfAborted();
+        const textual=/json|text|xml|javascript/.test(type),result={...observation(),ok:response.ok,outcome:response.ok?'http_ok':'http_error',bodyComplete:!body.truncated,truncated:body.truncated};
+        if(!response.ok)result.failure={kind:'http_error',code:'HTTP_'+response.status,message:'The endpoint returned HTTP status '+response.status+'.'};
+        if(textual){result.text=body.bytes.toString('utf8');if(/json/.test(type)&&!body.truncated){try{result.json=JSON.parse(result.text);}catch{result.invalidJson=true;}}}
+        return result;
       }
-      const type=response.headers.get('content-type')||'',body=await readLimited(response,maxBytes);
-      const textual=/json|text|xml|javascript/.test(type),result={url:url.href,ok:response.ok,status:response.status,elapsedMs:Date.now()-begin,redirects,contentType:type,bytesRead:body.bytes.length,truncated:body.truncated};
-      if(textual){result.text=body.bytes.toString('utf8');if(/json/.test(type)&&!body.truncated){try{result.json=JSON.parse(result.text);}catch{result.invalidJson=true;}}}
-      return result;
+    }catch(error){
+      // Caller/task aborts retain the existing stop/review boundary. Only this
+      // read-only probe's own expected transport failures become observations.
+      ctx.signal?.throwIfAborted();const failure=probeFailure(error,timeout);if(!failure)throw error;
+      return{...observation(),ok:false,outcome:'probe_failed',bodyComplete:false,truncated:bytesRead>0,failure,note:'This completed read-only probe did not obtain a complete HTTP response. A failed probe alone does not establish whether the application is healthy.'};
     }
   }
   if(name==='log_read'){
