@@ -1,0 +1,19 @@
+// Honest implementation inventory, not a claim of full Codex equivalence.
+export const capabilities = [
+  {id:'orchestration',state:'implemented',detail:'Dedicated top-level Orchestrator, live team_status inventory, specialist handoffs and result collection, stable idempotent Hermes/Lumos contact endpoints, and independently collapsible root/groups. The external Hermes/Lumos bridge remains unconfigured.'},
+  {id:'tool_development',state:'implemented',detail:'Workers can request genuinely missing native capabilities; durable origin-correlated jobs assign design/Builder/QA/Reviewer, park requesters, validate/apply exact source, probe the installed tool and safely resume. Disabled tools, denied approvals and missing credentials/dependencies/services remain explicit blockers.'},
+  {id:'specialist_tools',state:'implemented',detail:'Structured specialist tools across orchestration, engineering/Git, research/evidence, data/content/browser and host/automation. Every built-in role has a specialist assignment. tool_catalog lists each worker\'s actual native and discovered MCP tools.'},
+  {id:'coding',state:'implemented',detail:'Host files, exact-context patches, Git/build/test commands, piped terminal sessions, plans and user questions.'},
+  {id:'self_updates',state:'implemented',detail:'Source snapshots, syntax/tests, source-hash validation, supervised restart receipt and offline source recovery.'},
+  {id:'vision',state:'implemented',detail:'Local images and browser screenshots are sent as pixels to image-capable inference routes; image hashes protect retained evidence.'},
+  {id:'browsing',state:'partial',detail:'Owned Playwright browser groups, navigation, DOM snapshots and actions. Search uses browser search pages or separately configured MCP; no hosted search/citation engine is bundled.'},
+  {id:'skills',state:'partial',detail:'Nimbus SKILL.md discovery and instruction/resource execution through host tools. Codex plugin marketplace, packaging and automatic skill matching are not cloned.'},
+  {id:'workers',state:'partial',detail:'Independent persistent workers, bounded handoffs, child results and provider-neutral checkpoints. No Codex-equivalent arbitrary thread fork/steer API or automatic context compaction.'},
+  {id:'memory_schedules',state:'partial',detail:'Private/shared notes, evidence registers, knowledge search, task history and worker cron preview/create/enable/disable tools. No complete heartbeat/notification equivalent.'},
+  {id:'connectors',state:'requires_connection',detail:'MCP transport and configured connectors are available. Every external service needs its own Nimbus endpoint, credentials and permissions; Codex connections are not inherited.'},
+  {id:'documents',state:'partial',detail:'Structured CSV/TSV/JSON data operations, document checks, table/report export and office checklists. No bundled binary DOCX/XLSX/PDF extractor, live Word/Excel session or cloud canvas adapter.'},
+  {id:'git_projects',state:'partial',detail:'Structured read-only Git inspection/diffs/commit and sync plans/push preflight; gh CLI PR and Actions diagnostics; independently configured GitHub MCP. Managed worktree lifecycle, native diff review panels and PR attachments remain.'},
+  {id:'desktop',state:'missing',detail:'Browser groups do not control arbitrary Windows applications. A desktop automation backend and Nimbus adapter are required.'},
+  {id:'generated_media',state:'requires_service',detail:'No built-in image/video/audio generation provider, editing tool or pet service. These require separately supported providers and credentials.'},
+  {id:'codex_platform',state:'platform_specific',detail:'Codex sidebar/task management, ChatGPT Spaces/Sites, account usage resets, hosted connectors and native artifact sessions are platform services, not supplied by the model or CLI.'},
+];
