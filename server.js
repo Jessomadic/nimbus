@@ -4,13 +4,29 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, q, parseBot, botDir, writeBotBrief, DATA_DIR, getSetting, setSetting } from './db.js';
+import {defaultDisplayGroup,validateDisplayGroup} from './public/agent-groups.js';
 import https from 'node:https';
-import net from 'node:net';
 import os from 'node:os';
-import { redact } from './redact.js';
-import { addClient, broadcast } from './events.js';
+import { redact, encodeRedacted } from './redact.js';
+import { addClient, broadcast, revokeClients, revalidateClients } from './events.js';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { CLAUDE_BIN, computersOn, agentConfig, agent, runBot, stopRun, addMessage, updateMessage, botStatus, roomMembers, findMentions, markTraceWaiting, recoverRuns, HOOK_TOKEN } from './runner.js';
+import { runBot, stopRun, resumeRun, taskResult, runtimeQueues, drainRuntime, addMessage, updateMessage, botStatus, roomMembers, findMentions, markTraceWaiting, recoverRuns,startToolDevelopment } from './runner.js';
+import { config, saveConfig } from './runtime/config.js';
+import { cloudStatus, CodexClient } from './runtime/codex.js';
+import { localCatalog } from './runtime/local.js';
+import { resources } from './runtime/resources.js';
+import { browsers, connectors, migrateConnectorSecrets, coreTools, maintenance, terminals } from './runtime/tools.js';
+import { protect, unprotect } from './runtime/credentials.js';
+import { events as taskEvents, event as taskEvent } from './runtime/journal.js';
+import { registerRuntimeRoutes } from './runtime/http.js';
+import { startLocalService } from './runtime/local-service.js';
+import {validateParentLink} from './runtime/hierarchy.js';
+import {directLocal,secureRequest,requestIp,sameOriginRequest} from './runtime/network.js';
+import {SessionStore,LoginThrottle} from './runtime/auth.js';
+import {PasskeyStore} from './runtime/passkeys.js';
+import { answerQuestion } from './runtime/questions.js';
+import { capabilities } from './runtime/capabilities.js';
+import {roleToolCoverage} from './runtime/toolsets/index.js';
 import { TEMPLATES, PLUGINS, publicPlugin } from './catalog.js';
 import { startScheduler, nextRun, isValidCron } from './scheduler.js';
 import { getPlanUsage } from './planusage.js';
@@ -19,41 +35,30 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(HERE, 'public');
 const PORT = Number(process.env.PORT || 8787);
 process.env.PORT = String(PORT);
-const HOST = process.env.HOST || '0.0.0.0';
-const PASSWORD = process.env.NIMBUS_PASSWORD || '';
+const HOST = process.env.HOST || '127.0.0.1';
+const PASSWORD = process.env.NIMBUS_PASSWORD || (process.env.NIMBUS_PASSWORD_DPAPI ? await unprotect(fs.readFileSync(path.resolve(process.env.NIMBUS_PASSWORD_DPAPI),'utf8')) : '');
 const ALLOWED_EMAILS = (process.env.NIMBUS_ALLOWED_EMAILS || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+const OWNER_USERNAME=(process.env.NIMBUS_USERNAME||'').trim();
+const OWNER_MODE=Boolean(OWNER_USERNAME);
+const PASSKEY_ORIGIN=process.env.NIMBUS_PUBLIC_ORIGIN||'';
+if(OWNER_MODE&&(!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,63}$/.test(OWNER_USERNAME)||!PASSWORD||ALLOWED_EMAILS.length))throw new Error('Username mode requires a valid 3–64 character username, a password and no email-account mode');
 const WINDOW_BUDGET = Number(process.env.NIMBUS_WINDOW_BUDGET_USD || 0);
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const bootSourceHash = maintenance.inventory().hash;
+const startedAt = new Date().toISOString();
 
+await migrateConnectorSecrets();
+const localService=await startLocalService();
 recoverRuns();
 startScheduler();
 
 // ---------- approvals ----------
-function globToRe(glob) {
-  return new RegExp('^' + glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'is');
-}
-function toolArg(input = {}) {
-  return String(input.command ?? input.file_path ?? input.url ?? JSON.stringify(input));
-}
-function ruleMatches(rule, tool, input) {
-  const m = rule.match(/^([^(]+)\((.*)\)$/s);
-  if (m) return globToRe(m[1].trim()).test(tool) && globToRe(m[2]).test(toolArg(input));
-  return globToRe(rule.trim()).test(tool);
-}
-// "@self-email" in a bot's Always-allow rules lets it send email only to the Nimbus owner's own
-// addresses (NIMBUS_ALLOWED_EMAILS) without asking; mail to anyone else still waits for approval.
-function isSelfEmail(tool, input = {}) {
-  if (!/Gmail__(send_message|create_draft)$/i.test(tool)) return false;
-  const list = (v) => (Array.isArray(v) ? v : v ? String(v).split(',') : []).map((x) => String(x).replace(/^.*<|>.*$/g, '').trim().toLowerCase()).filter(Boolean);
-  const all = [...list(input.to), ...list(input.cc), ...list(input.bcc)];
-  return all.length > 0 && all.every((e) => ALLOWED_EMAILS.includes(e));
-}
 // The rule "Always allow" saves: the exact command, or a prefix pattern of its first words.
 function rememberRule(tool, input, kind) {
-  if (tool !== 'Bash') return tool;
+  if (tool !== 'shell') return tool;
   const cmd = String(input.command || '').trim();
-  if (kind !== 'pattern') return `Bash(${cmd})`;
-  return `Bash(${commandPrefix(cmd)}*)`;
+  if (kind !== 'pattern') return `shell(${cmd})`;
+  return `shell(${commandPrefix(cmd)}*)`;
 }
 function commandPrefix(cmd) {
   const words = cmd.split(/\s+/);
@@ -61,18 +66,12 @@ function commandPrefix(cmd) {
   for (const w of words) { if (keep.length >= 2 || /^[-'"$|;&><]/.test(w)) break; keep.push(w); }
   return (keep.join(' ') || words[0]) + ' ';
 }
-const waiters = new Map(); // approvalId -> Set(resolve)
-function notifyApproval(id) {
-  for (const fn of waiters.get(id) || []) fn();
-  waiters.delete(id);
-}
-
 // ---------- helpers ----------
-const json = (res, code, data) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(data)); };
+const json = (res, code, data) => { res.writeHead(code, { 'content-type': 'application/json','cache-control':'no-store','x-content-type-options':'nosniff' }); res.end(JSON.stringify(data)); };
 async function body(req, limit = 2e6) {
   let s = '';
-  for await (const c of req) { s += c; if (s.length > limit) throw new Error('too large'); }
-  return s ? JSON.parse(s) : {};
+  for await (const c of req) { s += c; if (Buffer.byteLength(s) > limit) throw Object.assign(new Error('Request body is too large'),{statusCode:413}); }
+  try{return s ? JSON.parse(s) : {};}catch{throw Object.assign(new Error('Invalid JSON request'),{statusCode:400});}
 }
 function tailMemory(botId, n = 3) {
   try {
@@ -96,9 +95,9 @@ function state(req) {
     .filter((r) => r.next).sort((a, b) => a.next - b.next).slice(0, 6);
   const learned = bots.flatMap((b) => tailMemory(b.id, 2).map((text) => ({ botId: b.id, text }))).slice(-5);
   const windowCost = q("SELECT COALESCE(SUM(cost_usd),0) AS c FROM runs WHERE started_at >= unixepoch() - 5*3600").get().c;
-  const running = q("SELECT COUNT(*) AS n FROM runs WHERE status='running'").get().n;
-  // Share of the last 7 days' usage per bot (Claude Code's reported cost, used as a relative measure).
-  const byBot = q("SELECT bot_id, COUNT(*) AS runs, COALESCE(SUM(cost_usd),0) AS cost FROM runs WHERE started_at >= unixepoch() - 7*86400 GROUP BY bot_id ORDER BY cost DESC").all();
+  const running = q("SELECT COUNT(*) AS n FROM runs WHERE status IN ('routing','running','waiting_local','waiting_cloud','waiting_approval')").get().n;
+  // Token usage and task counts; subscription use is not represented as API charges.
+  const byBot = q("SELECT bot_id, COUNT(*) AS runs, COALESCE(SUM(input_tokens+output_tokens),0) AS cost FROM runs WHERE started_at >= unixepoch() - 7*86400 GROUP BY bot_id ORDER BY cost DESC").all();
   const last = {};
   for (const m of q(`SELECT m.thread, m.author, m.kind, m.body, m.created_at FROM messages m
       JOIN (SELECT thread, MAX(id) AS id FROM messages WHERE kind IN ('text','error','approval') GROUP BY thread) x ON x.id = m.id`).all()) {
@@ -111,15 +110,15 @@ function state(req) {
   for (const b of bots) b.plugins = botPlugins[b.id] || [];
   const installed = q('SELECT id FROM plugins').all().map((r) => r.id);
   const sideOrder = JSON.parse(getSetting('side_order') || 'null'); // custom sidebar order, or null = most recent first
-  return { sideOrder, bots, rooms, approvals, routines, upNext, learned, last, installed, user: req?.user || null, computers: computersOn(), proxmox: !!pveConfig(), usage: { windowCost, budget: WINDOW_BUDGET, running, byBot } };
+  return { sideOrder, bots, rooms, approvals, routines, upNext, learned, last, installed, user: req?.user || null, computers: false, toolCatalog:coreTools.filter(tool=>tool.function.name!=='worker_result').map(tool=>({name:tool.function.name,description:tool.function.description})),queues: runtimeQueues(), usage: { windowCost, budget: WINDOW_BUDGET, running, byBot } };
 }
 
 function postToThread(thread, text, files = []) {
   const msg = addMessage(thread, 'user', 'text', text, null, files);
-  // Bots see attachments as file paths; Claude Code's Read tool opens images and PDFs too.
-  if (files.length) text = `${text || 'See the attached files.'}\n\nAttached files (open them with the Read tool):\n` + files.map((f) => `- ${uploadPath(f)} (${f.type || 'file'}, ${f.size} bytes)`).join('\n');
+  // Attachments are shared host paths available through Nimbus tools.
+  if (files.length) text = `${text || 'See the attached files.'}\n\nAttached files (use view_image for pixels; read_file or shell for other formats):\n` + files.map((f) => `- ${uploadPath(f)} (${f.type || 'file'}, ${f.size} bytes)`).join('\n');
   if (thread.startsWith('bot:')) {
-    runBot({ botId: Number(thread.slice(4)), thread, prompt: text });
+    runBot({ botId: Number(thread.slice(4)), thread, prompt: text,originMessageId:msg.id });
   } else if (thread.startsWith('room:')) {
     const roomId = Number(thread.slice(5));
     const room = q('SELECT * FROM rooms WHERE id=?').get(roomId);
@@ -127,7 +126,7 @@ function postToThread(thread, text, files = []) {
     let targets = findMentions(text, members);
     if (!targets.length) targets = members.filter((m) => m.id === room.lead_bot_id);
     if (!targets.length && members[0]) targets = [members[0]];
-    for (const t of targets) runBot({ botId: t.id, thread, prompt: text, source: 'the user' });
+    for (const t of targets) runBot({ botId: t.id, thread, prompt: text, source: 'the user',originMessageId:msg.id });
   }
   return msg;
 }
@@ -135,13 +134,31 @@ function postToThread(thread, text, files = []) {
 // ---------- routes ----------
 const routes = [];
 const route = (method, pattern, fn) => routes.push({ method, re: new RegExp('^' + pattern.replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$'), fn });
+registerRuntimeRoutes({route,body,json});
+route('GET','/health',(req,res)=>json(res,200,directLocal(req)?{ok:true,version:'0.2.0',pid:process.pid,startedAt,sourceHash:bootSourceHash,lumosConnected:false}:{ok:true}));
+route('GET','/api/updates',(req,res,p,url)=>json(res,200,maintenance.status(url.searchParams.get('snapshotId')||undefined)));
+route('GET','/api/capabilities',(req,res)=>json(res,200,{fullCodexParity:false,capabilities,roleTools:roleToolCoverage(TEMPLATES),tools:coreTools.map(t=>({name:t.function.name,description:t.function.description}))}));
+route('GET','/api/questions',(req,res)=>json(res,200,q("SELECT id,run_id,questions,status FROM task_questions WHERE status='pending' ORDER BY id").all().map(row=>({...row,questions:JSON.parse(row.questions)}))));
+route('POST','/api/questions/:id/answer',async(req,res,p)=>{const b=await body(req);const result=answerQuestion(p.id,b.answers);broadcast('state_changed',{});json(res,200,{id:result.id,status:result.status});});
+route('POST','/api/updates',async(req,res)=>{
+  const b=await body(req);
+  if(b.action==='snapshot')return json(res,200,maintenance.snapshot());
+  if(b.action==='validate')return json(res,200,await maintenance.validate(b.snapshotId));
+  if(b.action==='apply')return json(res,202,maintenance.apply(b.snapshotId));
+  return json(res,400,{error:'Choose snapshot, validate or apply'});
+});
+route('POST','/api/admin/shutdown',(req,res)=>{if(!adminAuth(req))return json(res,403,{error:'Local administration required'});json(res,200,{ok:true});setTimeout(()=>shutdown(),100);});
+const localTickets=new Map();
+route('POST','/api/admin/login-ticket',(req,res)=>{if(!adminAuth(req))return json(res,403,{error:'Local administration required'});if(ACCOUNTS||OWNER_MODE)return json(res,403,{error:'Sign in with the account credentials and required factors'});const ticket=crypto.randomBytes(32).toString('hex');localTickets.set(ticket,Date.now()+60000);json(res,200,{url:`http://127.0.0.1:${PORT}/local-login?ticket=${ticket}`});});
+route('GET','/local-login',(req,res,p,url)=>{if(!directLocal(req))return json(res,403,{error:'This sign-in method is local to the Nimbus PC'});const ticket=url.searchParams.get('ticket'),until=localTickets.get(ticket);localTickets.delete(ticket);if(!until||until<Date.now())return json(res,403,{error:'Local sign-in link expired'});res.writeHead(302,{'set-cookie':newSessionCookie(req),location:'/', 'cache-control':'no-store','referrer-policy':'no-referrer'});res.end();});
 
 route('GET', '/api/state', (req, res) => json(res, 200, state(req)));
 
 route('GET', '/api/events', (req, res) => {
-  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
   res.write('retry: 3000\n\n');
-  addClient(res);
+  const sessionToken=cookieToken(req);
+  addClient(res,{sessionToken,authorized:()=>adminAuth(req)||(!AUTH_ON&&directLocal(req))||Boolean(sessions.authenticate(sessionToken,{touch:false}))});
 });
 
 route('GET', '/api/threads/:thread/messages', (req, res, p, url) => {
@@ -151,10 +168,17 @@ route('GET', '/api/threads/:thread/messages', (req, res, p, url) => {
 });
 
 route('POST', '/api/threads/:thread/messages', async (req, res, p) => {
-  const { text = '', files: ids = [] } = await body(req);
+  const { text = '', files: ids = [],requestId } = await body(req);
   const files = (Array.isArray(ids) ? ids : []).slice(0, 10).map(readUpload).filter(Boolean);
   if (!String(text).trim() && !files.length) return json(res, 400, { error: 'empty' });
-  json(res, 200, postToThread(decodeURIComponent(p.thread), String(text).trim(), files));
+  const thread=decodeURIComponent(p.thread),key=requestId==null?null:String(requestId);
+  if(key&&key.length>200)return json(res,400,{error:'requestId is too long'});
+  const fingerprint=crypto.createHash('sha256').update(JSON.stringify({thread,text:String(text).trim(),files:files.map(f=>f.id)})).digest('hex');
+  const previous=key&&q('SELECT * FROM message_requests WHERE request_key=?').get(key);
+  if(previous){if(previous.fingerprint!==fingerprint)return json(res,409,{error:'requestId was used for different instructions'});return json(res,200,{...q('SELECT * FROM messages WHERE id=?').get(previous.message_id),replayed:true});}
+  db.exec('BEGIN IMMEDIATE');let message;
+  try{message=postToThread(thread,String(text).trim(),files);if(key)q('INSERT INTO message_requests VALUES (?,?,?)').run(key,fingerprint,message.id);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
+  json(res,200,message);
 });
 
 // ---------- uploads ----------
@@ -185,37 +209,64 @@ route('GET', '/api/files/:id/:name', (req, res, p) => {
   // Only safe types open in the browser; anything else (HTML, SVG…) downloads, so it can't run script here.
   const inline = INLINE.test(f.type);
   res.writeHead(200, { 'content-type': inline ? f.type : 'application/octet-stream', 'content-length': f.size, 'x-content-type-options': 'nosniff',
-    'content-security-policy': "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'", 'cache-control': 'private, max-age=31536000, immutable',
+    'content-security-policy': "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox", 'cache-control': 'no-store',
     'content-disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(f.name)}` });
   fs.createReadStream(uploadPath(f)).pipe(res);
 });
 
 // Restart the service once no bot is mid-run (a restart kills running bots, including one that asked for it).
-// Needs a sudoers rule letting this user run `systemctl restart nimbus`.
-let restartPending = false;
+// Windows supervisor restarts on exit code 75 after the worker queue drains.
+let restartWait;
+function requestRestart() {
+  if(!maintenance.supervised())throw new Error('Start Nimbus with Start-Nimbus.ps1 before requesting a restart');
+  if(restartWait)return;
+  restartWait = setInterval(() => {
+    // Per-worker promises can still be queued before acquiring a shared slot.
+    const outstanding=q("SELECT count(*) AS n FROM runs WHERE status IN ('queued','routing','running','waiting_local','waiting_cloud','waiting_approval','waiting_input')").get().n;
+    if (!outstanding && !runtimeQueues().workers.active && !runtimeQueues().workers.queued && !terminals.active().length) {
+      clearInterval(restartWait);restartWait=null;
+      try{maintenance.assertPendingSource();shutdown(75);}
+      catch(error){maintenance.failPending(error.message);console.error('Restart cancelled:',error.message);}
+    }
+  }, 500);
+}
+maintenance.requestRestart=requestRestart;
 route('POST', '/api/admin/restart', (req, res) => {
-  if (!restartPending) {
-    restartPending = true;
-    const tick = () => {
-      const busy = q("SELECT COUNT(*) AS n FROM runs WHERE status IN ('running','queued')").get().n;
-      if (busy) return setTimeout(tick, 3000);
-      execFile('sudo', ['-n', '/usr/bin/systemctl', 'restart', 'nimbus'], (err) => { if (err) { restartPending = false; console.error('restart failed:', err.message); } });
-    };
-    setTimeout(tick, 1000);
-  }
-  json(res, 200, { ok: true, note: 'Nimbus restarts as soon as no bot is running.' });
+  requestRestart();json(res, 202, { ok: true, note: 'Nimbus will restart after current tasks finish.' });
 });
 
 // Bots
 function cleanBot(b) {
   const out = {};
-  for (const k of ['name', 'role', 'instructions', 'color', 'model', 'shape']) if (b[k] !== undefined) out[k] = String(b[k]);
-  if (b.computer !== undefined) out.computer = b.computer ? 1 : 0;
+  if(Object.hasOwn(b,'display_group'))out.display_group=validateDisplayGroup(b.display_group);
+  for (const k of ['name', 'role', 'instructions', 'color', 'model', 'default_model', 'shape', 'runtime', 'template']) if (b[k] !== undefined) out[k] = String(b[k]);
+  if(b.default_model!==undefined&&!['','local','luna','terra','sol','astra'].includes(b.default_model))throw new Error('Invalid role model preference');
+  if(b.template!==undefined&&b.template!==''&&!TEMPLATES.some(t=>t.id===b.template))throw new Error('Unknown specialist profile');
+  if(b.parent_bot_id!==undefined){const parent=b.parent_bot_id==null||b.parent_bot_id===''?null:Number(b.parent_bot_id);if(parent!==null&&(!Number.isSafeInteger(parent)||parent<=0))throw new Error('Invalid parent worker');out.parent_bot_id=parent;}
+  if (b.model !== undefined && !['', 'auto', 'local', 'luna', 'terra', 'sol', 'astra'].includes(b.model)) throw new Error('Choose Auto, Local, Luna, Terra, Sol or Astra');
+  if (b.runtime !== undefined && !['auto', 'local', 'luna', 'terra', 'sol', 'astra'].includes(b.runtime)) throw new Error('Invalid worker runtime');
+  if (b.tools !== undefined) { if (!Array.isArray(b.tools) || b.tools.some(n => !coreTools.some(t => t.function.name === n))) throw new Error('Invalid tool selection'); out.tools = JSON.stringify(b.tools); }
   if (b.effort !== undefined) { if (!EFFORTS.includes(b.effort)) throw new Error('bad effort'); out.effort = b.effort; }
   for (const k of ['approval_rules', 'allow_rules']) if (b[k] !== undefined) out[k] = JSON.stringify((b[k] || []).map(String).filter(Boolean));
   return out;
 }
+function coordinatorParent(){
+  const roots=q("SELECT id FROM bots WHERE template='orchestrator' ORDER BY id LIMIT 2").all();
+  if(roots.length>1)throw Object.assign(new Error('Multiple Orchestrator agents require setup review; no parent was selected'),{statusCode:409});
+  return roots[0]?.id||null;
+}
+function validateCoordinatorFields(id,fields){
+  const current=id==null?null:q('SELECT id,template,parent_bot_id FROM bots WHERE id=?').get(Number(id));
+  const profile=fields.template??current?.template;
+  if(current?.template==='orchestrator'&&profile!=='orchestrator')throw Object.assign(new Error('The designated Orchestrator must retain its coordinator profile'),{statusCode:400});
+  if(profile!=='orchestrator')return;
+  const parent=Object.hasOwn(fields,'parent_bot_id')?fields.parent_bot_id:current?.parent_bot_id;
+  if(parent!=null)throw Object.assign(new Error('The Orchestrator is the top-level agent and cannot have a parent'),{statusCode:400});
+  if(q("SELECT id FROM bots WHERE template='orchestrator' AND id!=? LIMIT 1").get(Number(id)||-1))throw Object.assign(new Error('An Orchestrator already exists; use the existing coordinator'),{statusCode:409});
+}
 function saveBot(id, fields) {
+  validateCoordinatorFields(id,fields);
+  if(Object.hasOwn(fields,'parent_bot_id'))validateParentLink(Number(id),fields.parent_bot_id,q('SELECT id,parent_bot_id FROM bots').all());
   const keys = Object.keys(fields);
   if (keys.length) q(`UPDATE bots SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map((k) => fields[k]), id);
   const bot = parseBot(q('SELECT * FROM bots WHERE id=?').get(id));
@@ -226,14 +277,23 @@ function saveBot(id, fields) {
 route('POST', '/api/bots', async (req, res) => {
   const b = await body(req);
   if (!b.name?.trim()) return json(res, 400, { error: 'name required' });
-  const defaults = JSON.stringify(['Bash(git push*)', 'Bash(rm -rf*)', 'Bash(*gh pr merge*)', 'mcp__*send*', 'mcp__*delete*', 'mcp__*pay*', 'mcp__*create_event*']);
-  const r = q('INSERT INTO bots (name, approval_rules) VALUES (?,?)').run(b.name.trim(), defaults);
-  json(res, 200, saveBot(r.lastInsertRowid, cleanBot(b)));
+  const fields=cleanBot(b);if(!Object.hasOwn(fields,'display_group'))fields.display_group=defaultDisplayGroup(fields.template);if(!Object.hasOwn(fields,'parent_bot_id')&&fields.template!=='orchestrator')fields.parent_bot_id=coordinatorParent();validateCoordinatorFields(null,fields);if(Object.hasOwn(fields,'parent_bot_id'))validateParentLink(null,fields.parent_bot_id,q('SELECT id,parent_bot_id FROM bots').all());
+  const defaults = JSON.stringify(['shell(git push*)', 'shell(*Remove-Item*)', 'shell(*gh pr merge*)', 'mcp__*send*', 'mcp__*delete*', 'mcp__*pay*', 'mcp__*create_event*','automation_schedule(enable)']);
+  const r = q('INSERT INTO bots (name, approval_rules, tools,display_group) VALUES (?,?,?,?)').run(b.name.trim(), defaults,JSON.stringify(coreTools.map(t=>t.function.name).filter(n=>n!=='worker_result')),fields.display_group);
+  json(res, 200, saveBot(r.lastInsertRowid, fields));
 });
-route('PATCH', '/api/bots/:id', async (req, res, p) => json(res, 200, saveBot(Number(p.id), cleanBot(await body(req)))));
+route('PATCH', '/api/bots/:id', async (req, res, p) => {
+  const input=await body(req);
+  if(Object.hasOwn(input,'expected_parent_bot_id')){
+    const expected=input.expected_parent_bot_id,current=q('SELECT parent_bot_id FROM bots WHERE id=?').get(Number(p.id));
+    if(expected!==null&&(!Number.isSafeInteger(expected)||expected<1))return json(res,400,{error:'expected_parent_bot_id must be null or a positive integer'});
+    if(!current)return json(res,404,{error:'Worker not found'});
+    if(current.parent_bot_id!==expected)return json(res,409,{error:'Worker parent changed; refresh the roster before applying this assignment'});
+  }
+  return json(res,200,saveBot(Number(p.id),cleanBot(input)));
+});
 route('DELETE', '/api/bots/:id', (req, res, p) => {
-  const had = q('SELECT computer FROM bots WHERE id=?').get(p.id)?.computer;
-  if (had && computersOn()) agent(`/computers/${Number(p.id)}`, { method: 'DELETE' }).catch(() => {}); // its computer goes too
+  q('UPDATE bots SET parent_bot_id=NULL WHERE parent_bot_id=?').run(p.id);
   q('DELETE FROM bots WHERE id=?').run(p.id);
   q('DELETE FROM room_members WHERE bot_id=?').run(p.id);
   q('DELETE FROM routines WHERE bot_id=?').run(p.id);
@@ -242,70 +302,19 @@ route('DELETE', '/api/bots/:id', (req, res, p) => {
 });
 // ---------- bot computers ----------
 const viewerUrl = (port) => { const u = new URL(agentConfig().url); return `http://${u.hostname}:${port}/`; };
-async function computerRoute(res, fn) {
-  if (!computersOn()) return json(res, 400, { error: 'Bot computers aren’t set up. Add the computer VM in Server settings (see deploy/computer/README.md).' });
-  try { const c = await fn(); json(res, 200, c.port ? { ...c, url: viewerUrl(c.port) } : c); }
-  catch (e) { json(res, 502, { error: `Couldn’t reach the computer VM: ${e.message}` }); }
-}
-route('GET', '/api/bots/:id/computer', (req, res, p) => computerRoute(res, () => agent(`/computers/${Number(p.id)}`)));
-route('POST', '/api/bots/:id/computer', (req, res, p) => computerRoute(res, () => agent(`/computers/${Number(p.id)}`, { method: 'POST' })));
-route('DELETE', '/api/bots/:id/computer', (req, res, p) => computerRoute(res, async () => {
-  await agent(`/computers/${Number(p.id)}`, { method: 'DELETE' });
-  saveBot(Number(p.id), { computer: 0 });
-  return { ok: true };
-}));
-
-// Status of every bot computer plus the VM's memory, for the app (cached briefly; docker stats is slow).
-let compCache = null;
-route('GET', '/api/computers', async (req, res) => {
-  if (!computersOn()) return json(res, 200, { on: false });
-  if (compCache && Date.now() - compCache.at < 10_000) return json(res, 200, compCache.data);
-  try { compCache = { at: Date.now(), data: { on: true, ...(await agent('/computers')), sleepAfterMin: SLEEP_AFTER_MIN } }; json(res, 200, compCache.data); }
-  catch (e) { json(res, 200, { on: true, error: e.message }); }
-});
-// Browse and download files from a bot's home folder on its computer (~/Downloads, ~/work, …).
-route('GET', '/api/bots/:id/files', (req, res, p, url) => computerRoute(res, () => agent(`/computers/${Number(p.id)}/files?dir=${encodeURIComponent(url.searchParams.get('dir') || '')}`)));
-route('GET', '/api/bots/:id/file', async (req, res, p, url) => {
-  if (!computersOn()) return json(res, 400, { error: 'Bot computers aren’t set up' });
-  const rel = String(url.searchParams.get('path') || '');
-  try {
-    const { url: base, token } = agentConfig();
-    const r = await fetch(`${base}/computers/${Number(p.id)}/file?path=${encodeURIComponent(rel)}`, { headers: { authorization: `Bearer ${token}` } });
-    if (!r.ok) return json(res, r.status, { error: 'File not found' });
-    res.writeHead(200, { 'content-type': 'application/octet-stream', 'x-content-type-options': 'nosniff',
-      ...(r.headers.get('content-length') ? { 'content-length': r.headers.get('content-length') } : {}),
-      'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(rel.split('/').pop() || 'file')}` });
-    for await (const chunk of r.body) res.write(chunk);
-    res.end();
-  } catch (e) { if (!res.headersSent) json(res, 502, { error: e.message }); else res.destroy(); }
-});
-// Rebuild the computer image with the latest Claude Code and Chromium, then recreate the computers
-// (home folders, browser profiles and sign-ins are kept). Runs on the VM; poll GET for progress.
-route('POST', '/api/computers/update', (req, res) => computerRoute(res, () => agent('/update', { method: 'POST', body: JSON.stringify({
-  dockerfile: fs.readFileSync(path.join(HERE, 'deploy/computer/Dockerfile'), 'utf8'),
-  hook: fs.readFileSync(path.join(HERE, 'hooks/approval-hook.js'), 'utf8') }) })));
-route('GET', '/api/computers/update', (req, res) => computerRoute(res, () => agent('/update')));
-
-// Auto-sleep: stop a computer that hasn't run a task or been watched for a while. Its next task (or
-// opening its screen) starts it again; files, the browser profile and sign-ins live on its volume.
-const SLEEP_AFTER_MIN = Number(process.env.NIMBUS_COMPUTER_SLEEP_MIN ?? 120);
-const deskSeen = new Map(); // botId -> last time someone was watching its screen
-setInterval(async () => {
-  if (!SLEEP_AFTER_MIN || !computersOn()) return;
-  try {
-    const { computers } = await agent('/computers');
-    for (const c of computers.filter((x) => x.running)) {
-      const last = q("SELECT MAX(COALESCE(ended_at, started_at, unixepoch())) AS t FROM runs WHERE bot_id=?").get(c.bot).t || 0;
-      const busy = q("SELECT COUNT(*) AS n FROM runs WHERE bot_id=? AND status IN ('queued','running')").get(c.bot).n;
-      const idleMs = Date.now() - Math.max(last * 1000, deskSeen.get(c.bot) || 0);
-      if (!busy && idleMs > SLEEP_AFTER_MIN * 60_000) {
-        await agent(`/computers/${c.bot}/stop`, { method: 'POST' });
-        deskCache.delete(c.bot); compCache = null;
-        console.log(`Computer for bot ${c.bot} went to sleep after ${Math.round(idleMs / 60000)} min idle`);
-      }
+route('GET', '/api/bots/:id/files', (req,res,p) => {
+  const root = botDir(p.id), files=[];
+  function walk(dir) { for(const entry of fs.readdirSync(dir,{withFileTypes:true})) {
+    const file=path.join(dir,entry.name); if(entry.isDirectory()) walk(file); else if(entry.isFile()) {
+      const stat=fs.statSync(file); files.push({name:entry.name,path:path.relative(root,file),size:stat.size,mtime:stat.mtimeMs/1000});
     }
-  } catch {}
-}, 5 * 60_000).unref();
+  }} walk(root); json(res,200,{files});
+});
+route('GET','/api/bots/:id/file',(req,res,p,url)=>{
+  const root=botDir(p.id), file=path.resolve(root,url.searchParams.get('path')||'');
+  if(!file.startsWith(root+path.sep)||!fs.existsSync(file)||!fs.statSync(file).isFile())return json(res,404,{error:'File not found'});
+  res.writeHead(200,{'content-type':'application/octet-stream','content-disposition':'attachment; filename="'+path.basename(file).replace(/["\\]/g,'_')+'"'});fs.createReadStream(file).pipe(res);
+});
 
 route('GET', '/api/bots/:id/memory', (req, res, p) => json(res, 200, { text: fs.readFileSync(path.join(botDir(p.id), 'MEMORY.md'), 'utf8') }));
 route('PUT', '/api/bots/:id/memory', async (req, res, p) => {
@@ -315,62 +324,33 @@ route('PUT', '/api/bots/:id/memory', async (req, res, p) => {
 });
 route('POST', '/api/bots/:id/reset', (req, res, p) => {
   q('DELETE FROM sessions WHERE bot_id=?').run(p.id);
+  q('DELETE FROM worker_history WHERE bot_id=?').run(p.id);
   addMessage('bot:' + p.id, 'system', 'note', 'Started a fresh conversation. Memory is kept.');
   json(res, 200, { ok: true });
 });
 
 // Routines
 // ---------- marketplace ----------
-// Connectors on the user's claude.ai account reach every bot through Claude Code's login.
-// `claude mcp list` health-checks each one, so it's slow: cache it and refresh in the background.
-let connCache = { at: 0, list: [], loading: null };
-function loadConnectors() {
-  if (connCache.loading) return connCache.loading;
-  connCache.loading = new Promise((resolve) => {
-    execFile(CLAUDE_BIN, ['mcp', 'list'], { timeout: 90_000, cwd: DATA_DIR }, (err, out = '') => {
-      const list = [];
-      for (const line of String(out).split('\n')) {
-        const m = line.match(/^claude\.ai (.+?): .* - (.+)$/);
-        if (m) list.push({ name: m[1].trim(), status: /connected/i.test(m[2]) && !/not|fail/i.test(m[2]) ? 'connected' : m[2].replace(/^[^A-Za-z]+/, '').trim() });
-      }
-      if (!err || list.length) connCache = { at: Date.now(), list, loading: null };
-      else connCache.loading = null;
-      resolve(connCache.list);
-    });
-  });
-  return connCache.loading;
-}
-loadConnectors();
-async function claudeConnectors(fresh) {
-  if (fresh || !connCache.at) await loadConnectors();
-  else if (Date.now() - connCache.at > 5 * 60_000) loadConnectors();
-  return connCache.list;
-}
-const sameName = (a, b) => a.toLowerCase().replace(/[^a-z0-9]/g, '') === b.toLowerCase().replace(/[^a-z0-9]/g, '');
-route('GET', '/api/marketplace', async (req, res, _p, url) => {
-  const installed = new Set(q('SELECT id FROM plugins').all().map((r) => r.id));
-  const added = new Set(q("SELECT template FROM bots WHERE template != ''").all().map((r) => r.template));
-  const connectors = await claudeConnectors(url.searchParams.get('fresh') === '1');
-  json(res, 200, {
-    templates: TEMPLATES.map((t) => ({ ...t, added: added.has(t.id) })),
-    plugins: PLUGINS.map((p) => {
-      const c = p.kind === 'claude' && connectors.find((x) => sameName(x.name, p.name));
-      return { ...publicPlugin(p), installed: p.kind === 'claude' ? c?.status === 'connected' : installed.has(p.id), connector: c || null };
-    }),
-    connectors
-  });
+// Nimbus connectors are explicitly configured and available to either model route.
+route('GET', '/api/marketplace', (req,res) => {
+  const installed=new Set(q('SELECT id FROM plugins').all().map(p=>p.id));
+  const added=new Set(q("SELECT template FROM bots WHERE template != ''").all().map(p=>p.template));
+  json(res,200,{templates:TEMPLATES.map(t=>({...t,display_group:defaultDisplayGroup(t.id),added:added.has(t.id)})),
+    plugins:PLUGINS.map(p=>({...publicPlugin(p),installed:p.kind==='builtin'||installed.has(p.id)})),connectors:[]});
 });
 route('POST', '/api/templates/:id/add', (req, res, p) => {
   const t = TEMPLATES.find((x) => x.id === p.id);
   if (!t) return json(res, 404, { error: 'not found' });
-  const r = q('INSERT INTO bots (name, role, instructions, color, effort, shape, template, approval_rules) VALUES (?,?,?,?,?,?,?,?)')
-    .run(t.name, t.role, t.instructions, t.color, t.effort, t.shape, t.id, JSON.stringify(t.approval_rules));
+  const parent=t.parent_profile==='orchestrator'?{id:coordinatorParent()}:t.parent_profile?q('SELECT id FROM bots WHERE template=? ORDER BY id LIMIT 1').get(t.parent_profile):null;
+  validateCoordinatorFields(null,{template:t.id,parent_bot_id:parent?.id||null});
+  const r = q('INSERT INTO bots (name, role, instructions, color, effort, shape, template, approval_rules, model, default_model, tools,parent_bot_id,display_group) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(t.name, t.role, t.instructions, t.color, t.effort, t.shape, t.id, JSON.stringify(t.approval_rules),t.model||'auto',t.default_model||'',JSON.stringify(t.tools),parent?.id||null,defaultDisplayGroup(t.id));
   const id = Number(r.lastInsertRowid);
   for (const rt of t.routines || []) q('INSERT INTO routines (bot_id, cron, prompt) VALUES (?,?,?)').run(id, rt.cron, rt.prompt);
   const installed = new Set(q('SELECT id FROM plugins').all().map((x) => x.id));
   for (const pid of t.plugins || []) {
     const pl = PLUGINS.find((x) => x.id === pid);
-    if (pl && (pl.kind === 'claude' || installed.has(pid))) q('INSERT OR IGNORE INTO bot_plugins VALUES (?,?)').run(id, pid);
+    if (pl && (pl.kind === 'builtin' || installed.has(pid))) q('INSERT OR IGNORE INTO bot_plugins VALUES (?,?)').run(id, pid);
   }
   json(res, 200, saveBot(id, {}));
 });
@@ -384,7 +364,7 @@ route('POST', '/api/plugins/:id', async (req, res, p) => {
     if (!v) return json(res, 400, { error: `${f.label} is required` });
     clean[f.key] = v;
   }
-  q('INSERT INTO plugins (id, secrets) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET secrets=excluded.secrets').run(pl.id, JSON.stringify(clean));
+  q('INSERT INTO plugins (id, secrets) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET secrets=excluded.secrets').run(pl.id, await protect(JSON.stringify(clean)));
   broadcast('state_changed', {}); json(res, 200, { ok: true });
 });
 route('DELETE', '/api/plugins/:id', (req, res, p) => {
@@ -409,6 +389,7 @@ route('PATCH', '/api/routines/:id', async (req, res, p) => {
   const r = await body(req);
   if (r.cron !== undefined && !isValidCron(r.cron)) return json(res, 400, { error: 'Invalid schedule' });
   const cur = q('SELECT * FROM routines WHERE id=?').get(p.id);
+  if (r.cron !== undefined && !isValidCron(r.cron)) return json(res,400,{error:'Invalid cron schedule'});
   q('UPDATE routines SET cron=?, prompt=?, enabled=?, quiet=? WHERE id=?').run(r.cron ?? cur.cron, r.prompt ?? cur.prompt, r.enabled ?? cur.enabled, r.quiet === undefined ? cur.quiet : r.quiet ? 1 : 0, p.id);
   broadcast('state_changed', {}); json(res, 200, { ok: true });
 });
@@ -462,14 +443,15 @@ route('POST', '/api/approvals/:id', async (req, res, p) => {
   const msg = q("SELECT * FROM messages WHERE kind='approval' AND run_id=? AND body LIKE ?").get(a.run_id, `%"approvalId":${a.id},%`);
   if (msg) updateMessage(msg.id, { ...JSON.parse(msg.body), status, note: note || null });
   markTraceWaiting(a.run_id, a.tool, false);
-  notifyApproval(a.id);
+
   broadcast('approvals_changed', {});
   json(res, 200, { ok: true });
 });
 
 // Redact a message, or just a selected part of it. The text is replaced with [REDACTED] in the chat,
 // and the same text is scrubbed from saved prompts, approval requests, other messages and the bots'
-// Claude Code transcripts (~/.claude/projects), so it isn't kept anywhere on this server.
+// Nimbus checkpoints and action journals. Current native inference sessions are ephemeral;
+// historical sessions from before that isolation fix remain recoverable in Codex's archive.
 route('POST', '/api/messages/:id/redact', async (req, res, p) => {
   const m = q('SELECT * FROM messages WHERE id=?').get(Number(p.id));
   if (!m) return json(res, 404, { error: 'not found' });
@@ -492,19 +474,11 @@ route('POST', '/api/messages/:id/redact', async (req, res, p) => {
     }
   }
   let files = 0;
-  const projects = path.join(os.homedir(), '.claude', 'projects');
-  const forms = [secret, JSON.stringify(secret).slice(1, -1)];
-  try {
-    for (const dir of fs.readdirSync(projects).filter((d) => d.includes('nimbus-data-bots-'))) {
-      for (const f of fs.readdirSync(path.join(projects, dir)).filter((f) => f.endsWith('.jsonl'))) {
-        const fp = path.join(projects, dir, f), t = fs.readFileSync(fp, 'utf8');
-        if (!forms.some((x) => t.includes(x))) continue;
-        let nt = t; for (const x of forms) nt = nt.split(x).join(MASK);
-        fs.writeFileSync(fp, nt); files++;
-      }
-    }
-  } catch {}
-  db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); // don't leave the old text in the write-ahead log
+  for(const [table,column,idColumn] of [['runs','checkpoint','id'],['task_events','body','id'],['tool_calls','args','id'],['tool_calls','result','id']]) {
+    for(const row of q(`SELECT ${idColumn} AS id,${column} AS value FROM ${table} WHERE ${column} LIKE ? ESCAPE '\\'`).all(like))
+      q(`UPDATE ${table} SET ${column}=? WHERE ${idColumn}=?`).run(row.value.split(secret).join(MASK).split(JSON.stringify(secret).slice(1,-1)).join(MASK),row.id);
+  }
+  for(const row of q('SELECT bot_id,thread,messages FROM worker_history').all()) q('UPDATE worker_history SET messages=? WHERE bot_id=? AND thread=?').run(row.messages.split(secret).join(MASK).split(JSON.stringify(secret).slice(1,-1)).join(MASK),row.bot_id,row.thread);
   json(res, 200, { ok: true, messages: changed, transcripts: files });
 });
 
@@ -516,67 +490,14 @@ route('PUT', '/api/side-order', async (req, res) => {
   json(res, 200, { ok: true });
 });
 
-// ---------- server settings (bot computers, Proxmox) ----------
-// Secrets are write-only: the app sees whether one is saved, never its value.
-const SETTINGS = [
-  { key: 'agent_url', env: 'NIMBUS_AGENT_URL' }, { key: 'agent_token', env: 'NIMBUS_AGENT_TOKEN', secret: true }, { key: 'callback_url', env: 'NIMBUS_CALLBACK_URL' },
-  { key: 'pve_host' }, { key: 'pve_token_id' }, { key: 'pve_token_secret', secret: true },
-  { key: 'backup_target' }, { key: 'auto_compact_pct', env: 'NIMBUS_AUTO_COMPACT_PCT' }
-];
-route('GET', '/api/settings', (req, res) => {
-  const out = {};
-  for (const s of SETTINGS) { const v = getSetting(s.key, s.env); out[s.key] = s.secret ? (v ? '__saved__' : '') : v; }
-  json(res, 200, out);
+// ---------- portable server settings ----------
+const SETTINGS=[{key:'backup_target'}];
+route('GET','/api/settings',(req,res)=>json(res,200,Object.fromEntries(SETTINGS.map(s=>[s.key,getSetting(s.key,s.env)]))));
+route('PUT','/api/settings',async(req,res)=>{
+  const b=await body(req);for(const s of SETTINGS)if(b[s.key]!==undefined)setSetting(s.key,String(b[s.key]));
+  broadcast('state_changed',{});json(res,200,{ok:true});
 });
-route('PUT', '/api/settings', async (req, res) => {
-  const b = await body(req);
-  for (const s of SETTINGS) {
-    if (b[s.key] === undefined || (s.secret && b[s.key] === '__saved__')) continue;
-    const v = String(b[s.key]).trim();
-    if (s.key === 'auto_compact_pct' && v && !(Number(v) >= 0 && Number(v) <= 95)) return json(res, 400, { error: 'Auto-compact must be 0 (off) to 95' });
-    if (s.key === 'backup_target' && v && !/^[\w.-]+@[\w.-]+:\/[^\s]*$/.test(v)) return json(res, 400, { error: 'Backup target should look like user@host:/path' });
-    if (/_url$/.test(s.key) && v && !/^https?:\/\/[^\s]+$/.test(v)) return json(res, 400, { error: `${s.key.replace('_', ' ')} must start with http:// or https://` });
-    setSetting(s.key, v);
-  }
-  pveCache = null;
-  broadcast('state_changed', {});
-  json(res, 200, { ok: true, computers: computersOn(), proxmox: !!pveConfig() });
-});
-route('POST', '/api/settings/test-agent', (req, res) => computerRoute(res, () => agent('/health')));
-
-function pveConfig() {
-  const host = getSetting('pve_host'), id = getSetting('pve_token_id'), secret = getSetting('pve_token_secret');
-  return host && id && secret ? { host, id, secret } : null;
-}
-// Proxmox uses a self-signed certificate by default, so certificate checks are off for this LAN call only.
-function pveGet(cfg, p) {
-  return new Promise((resolve, reject) => {
-    const r = https.get({ host: cfg.host, port: 8006, path: '/api2/json' + p, rejectUnauthorized: false, timeout: 5000,
-      headers: { authorization: `PVEAPIToken=${cfg.id}=${cfg.secret}` } }, (resp) => {
-      let s = ''; resp.on('data', (c) => (s += c));
-      resp.on('end', () => resp.statusCode === 200 ? resolve(JSON.parse(s).data) : reject(new Error(`Proxmox said ${resp.statusCode}`)));
-    });
-    r.on('timeout', () => r.destroy(new Error('Proxmox didn’t answer')));
-    r.on('error', reject);
-  });
-}
-let pveCache = null; // { at, data }
-route('GET', '/api/proxmox', async (req, res) => {
-  const cfg = pveConfig();
-  if (!cfg) return json(res, 200, { configured: false });
-  if (pveCache && Date.now() - pveCache.at < 15000) return json(res, 200, pveCache.data);
-  try {
-    const [nodes, guests] = await Promise.all([pveGet(cfg, '/nodes'), pveGet(cfg, '/cluster/resources?type=vm')]);
-    const data = { configured: true,
-      nodes: nodes.map((n) => ({ name: n.node, status: n.status, cpu: n.cpu, mem: n.mem, maxmem: n.maxmem, disk: n.disk, maxdisk: n.maxdisk, uptime: n.uptime })),
-      guests: guests.filter((g) => !g.template).map((g) => ({ id: g.vmid, name: g.name, type: g.type, status: g.status, node: g.node })).sort((a, b) => a.id - b.id) };
-    pveCache = { at: Date.now(), data };
-    json(res, 200, data);
-  } catch (e) { json(res, 200, { configured: true, error: e.message }); }
-});
-
-// ---------- Claude plan usage (planusage.js) ----------
-route('GET', '/api/plan-usage', async (req, res) => json(res, 200, await getPlanUsage()));
+route('GET','/api/plan-usage',async(req,res)=>json(res,200,await getPlanUsage()));
 
 // ---------- read aloud (Piper, local text-to-speech) ----------
 // Turns a bot reply into speech on this server; nothing leaves the network.
@@ -592,7 +513,7 @@ route('POST', '/api/speak', async (req, res) => {
   const src = messageId ? q('SELECT body FROM messages WHERE id=?').get(Number(messageId))?.body : text;
   const say = speakable(src);
   if (!say) return json(res, 400, { error: 'Nothing to read' });
-  const p = spawn(PIPER_BIN, ['--model', PIPER_VOICE, '--output_file', '-'], { stdio: ['pipe', 'pipe', 'ignore'] });
+  const p = spawn(PIPER_BIN, ['--model', PIPER_VOICE, '--output_file', '-'], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
   const chunks = [];
   p.stdout.on('data', (c) => chunks.push(c));
   p.on('error', (e) => { if (!res.headersSent) json(res, 500, { error: e.message }); });
@@ -612,7 +533,7 @@ let backupRunning = false;
 function runBackup() {
   if (backupRunning) return Promise.resolve(JSON.parse(getSetting('backup_last') || '{}'));
   backupRunning = true;
-  return new Promise((resolve) => execFile(process.execPath, ['--no-warnings', path.join(HERE, 'bin/backup.mjs')], { timeout: 30 * 60_000 }, (err, out) => {
+  return new Promise((resolve) => execFile(process.execPath, ['--no-warnings', path.join(HERE, 'bin/backup.mjs')], { timeout: 30 * 60_000, windowsHide:true }, (err, out) => {
     backupRunning = false;
     let r; try { r = JSON.parse(String(out).trim().split('\n').pop()); } catch { r = { ok: false, error: err?.message || 'backup failed', at: Date.now() }; }
     setSetting('backup_last', JSON.stringify(r));
@@ -644,7 +565,7 @@ route('GET', '/api/search', (req, res, _p, url) => {
 route('GET', '/api/activity', (req, res, _p, url) => {
   const days = Math.min(90, Number(url.searchParams.get('days') || 7));
   const since = Math.floor(Date.now() / 1000) - days * 86400;
-  const runs = q(`SELECT id, bot_id, thread, status, started_at, ended_at, cost_usd, effort, parent_run, substr(prompt, 1, 160) AS prompt
+  const runs = q(`SELECT id, bot_id, thread, status, started_at, ended_at, cost_usd, effort, parent_run, actual_model, requested_model, route_reason, fallback_reason, backend, input_tokens, output_tokens, last_error, substr(prompt, 1, 160) AS prompt
     FROM runs WHERE started_at >= ? ORDER BY id DESC LIMIT 400`).all(since);
   const approvals = q(`SELECT id, run_id, bot_id, tool, status, note, created_at, decided_at, substr(input, 1, 300) AS input
     FROM approvals WHERE created_at >= ? ORDER BY id DESC LIMIT 400`).all(since);
@@ -660,7 +581,7 @@ const WHISPER_PORT = Number(process.env.NIMBUS_WHISPER_PORT || 8178);
 let whisperProc = null, whisperFails = 0;
 function startWhisper() {
   if (!fs.existsSync(WHISPER_BIN) || !fs.existsSync(WHISPER_MODEL)) return;
-  whisperProc = spawn(WHISPER_BIN, ['-m', WHISPER_MODEL, '--host', '127.0.0.1', '--port', String(WHISPER_PORT), '-t', String(Math.max(2, os.cpus().length - 2))], { stdio: 'ignore' });
+  whisperProc = spawn(WHISPER_BIN, ['-m', WHISPER_MODEL, '--host', '127.0.0.1', '--port', String(WHISPER_PORT), '-t', String(Math.max(2, os.cpus().length - 2))], { stdio: 'ignore', windowsHide: true });
   whisperProc.on('exit', () => {
     whisperProc = null;
     if (++whisperFails <= 5) setTimeout(startWhisper, 5000 * whisperFails); // crashed: retry with backoff
@@ -689,106 +610,6 @@ route('POST', '/api/transcribe', async (req, res) => {
   } catch (e) { json(res, 502, { error: 'Transcription failed: ' + e.message }); }
 });
 
-// Approvals (hook side: localhost, or the computer VM)
-// Bots run here (localhost) or in a container on the computer VM, whose hook calls come from the VM's address.
-function hookAuth(req) {
-  const t = String(req.headers['x-nimbus-hook'] || '');
-  if (t.length !== HOOK_TOKEN.length || !crypto.timingSafeEqual(Buffer.from(t), Buffer.from(HOOK_TOKEN))) return false;
-  const from = String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
-  if (['127.0.0.1', '::1'].includes(from)) return true;
-  try { return computersOn() && from === new URL(agentConfig().url).hostname; } catch { return false; }
-}
-route('POST', '/api/hook/pretool', async (req, res) => {
-  if (!hookAuth(req)) return json(res, 403, { error: 'forbidden' });
-  const { runId, tool, input } = await body(req);
-  const run = q('SELECT * FROM runs WHERE id=?').get(runId);
-  if (!run) return json(res, 200, { decision: 'allow' });
-  const bot = parseBot(q('SELECT * FROM bots WHERE id=?').get(run.bot_id));
-  const gated = bot.approval_rules.some((r) => ruleMatches(r, tool, input)) && !bot.allow_rules.some((r) => ruleMatches(r, tool, input))
-    && !(bot.allow_rules.includes('@self-email') && isSelfEmail(tool, input));
-  if (!gated) return json(res, 200, { decision: 'allow' });
-  const ins = q('INSERT INTO approvals (run_id, bot_id, thread, tool, input) VALUES (?,?,?,?,?)').run(run.id, bot.id, run.thread, tool, redact(JSON.stringify(input || {})));
-  const approvalId = Number(ins.lastInsertRowid);
-  const pattern = tool === 'Bash' ? commandPrefix(String(input?.command || '')).trim() + ' …' : null;
-  addMessage(run.thread, bot.id, 'approval', { approvalId, tool, input, status: 'pending', pattern }, run.id);
-  markTraceWaiting(run.id, tool, true);
-  broadcast('approvals_changed', {});
-  json(res, 200, { decision: 'ask', approvalId });
-});
-// Bot-to-bot messages (bin/ask-bot.mjs). The asking bot's run id gives who is asking and the
-// chain of bots already waiting, so a bot can't message one that is waiting on it (that would deadlock).
-// Answers wait at most 4 minutes: Node's fetch gives up on a response with no headers after 5, so
-// longer jobs return a run id to collect with --result.
-const MAX_ASK_DEPTH = 4;
-function askChain(runId) {
-  const bots = [];
-  for (let id = runId, n = 0; id && n < 20; n++) {
-    const r = q('SELECT bot_id, parent_run FROM runs WHERE id=?').get(id);
-    if (!r) break;
-    bots.push(r.bot_id); id = r.parent_run;
-  }
-  return bots;
-}
-function findBot(ref) {
-  const all = q('SELECT * FROM bots').all();
-  const s = String(ref || '').trim().replace(/^@/, '');
-  const byId = s.match(/^#?(\d+)$/);
-  if (byId) return all.find((b) => b.id === Number(byId[1]));
-  const low = s.toLowerCase();
-  const exact = all.filter((b) => b.name.toLowerCase() === low);
-  if (exact.length === 1) return exact[0];
-  const part = all.filter((b) => b.name.toLowerCase().includes(low));
-  return part.length === 1 ? part[0] : null;
-}
-async function askResult(runId, waitMs) {
-  const until = Date.now() + waitMs;
-  while (Date.now() < until) {
-    const r = q('SELECT status FROM runs WHERE id=?').get(runId);
-    if (!r) return { error: 'No such run' };
-    if (!['queued', 'running'].includes(r.status)) {
-      const m = q("SELECT body, kind FROM messages WHERE run_id=? AND kind IN ('text','error') ORDER BY id DESC LIMIT 1").get(runId);
-      return { status: r.status, reply: m?.body || '(no reply)', error: m?.kind === 'error' || undefined };
-    }
-    await new Promise((res) => setTimeout(res, 1500));
-  }
-  return { status: 'running', runId, note: `Still working. Fetch the answer later with --result ${runId}.` };
-}
-route('POST', '/api/hook/ask', async (req, res) => {
-  if (!hookAuth(req)) return json(res, 403, { error: 'forbidden' });
-  const { fromRun, to, text, wait = true } = await body(req);
-  const from = q('SELECT b.* FROM runs r JOIN bots b ON b.id = r.bot_id WHERE r.id=?').get(Number(fromRun));
-  if (!from) return json(res, 400, { error: 'Unknown asking run' });
-  const target = findBot(to);
-  if (!target) return json(res, 404, { error: `No single bot matches "${to}". Bots: ${q('SELECT id, name FROM bots ORDER BY id').all().map((b) => `${b.name} (#${b.id})`).join(', ')}` });
-  if (target.id === from.id) return json(res, 400, { error: 'That is you.' });
-  if (!String(text || '').trim()) return json(res, 400, { error: 'Empty message' });
-  const chain = askChain(Number(fromRun));
-  if (chain.includes(target.id)) return json(res, 409, { error: `${target.name} is waiting on your answer, so it can't take a message now. Put what you want to tell it in your reply.` });
-  if (chain.length > MAX_ASK_DEPTH) return json(res, 429, { error: 'Too many bots are already waiting on each other. Answer with what you have.' });
-  const thread = 'bot:' + target.id;
-  addMessage(thread, 'system', 'note', `📨 ${from.name}: ${String(text).trim()}`);
-  const runId = runBot({ botId: target.id, thread, source: from.name, parentRun: Number(fromRun), depth: chain.length,
-    prompt: `Message from ${from.name}, another Nimbus bot (not the user):\n\n${String(text).trim()}\n\n${wait ? `Your reply is sent back to ${from.name}, so answer what it needs.` : `${from.name} isn't waiting for a reply; act on this if it's in your area.`}` });
-  if (!wait) return json(res, 200, { queued: true, runId, to: target.name });
-  json(res, 200, { to: target.name, ...(await askResult(runId, 4 * 60_000)) });
-});
-route('GET', '/api/hook/ask/:runId', async (req, res, p) => {
-  if (!hookAuth(req)) return json(res, 403, { error: 'forbidden' });
-  json(res, 200, await askResult(Number(p.runId), 4 * 60_000));
-});
-route('GET', '/api/hook/approval/:id', (req, res, p) => {
-  if (!hookAuth(req)) return json(res, 403, { error: 'forbidden' });
-  const id = Number(p.id);
-  const reply = () => { const a = q('SELECT status, note FROM approvals WHERE id=?').get(id); json(res, 200, a || { status: 'expired' }); };
-  const a = q('SELECT status FROM approvals WHERE id=?').get(id);
-  if (!a || a.status !== 'pending') return reply();
-  const timer = setTimeout(done, 50000);
-  function done() { clearTimeout(timer); waiters.get(id)?.delete(done); if (!res.writableEnded) reply(); }
-  if (!waiters.has(id)) waiters.set(id, new Set());
-  waiters.get(id).add(done);
-  req.on('close', () => waiters.get(id)?.delete(done));
-});
-
 // ---------- server ----------
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.webp': 'image/webp' };
 
@@ -798,95 +619,212 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.
 const ACCOUNTS = ALLOWED_EMAILS.length > 0;
 const AUTH_ON = !!(PASSWORD || ACCOUNTS);
 if (!AUTH_ON && process.env.NIMBUS_ALLOW_NO_PASSWORD !== '1') {
-  console.error('Set up a login before starting Nimbus (anyone who can reach this server could otherwise control your bots): NIMBUS_ALLOWED_EMAILS (for email sign-up), or NIMBUS_PASSWORD. See README.');
+  console.error('Set up a login before starting Nimbus: NIMBUS_PASSWORD, or NIMBUS_ALLOWED_EMAILS with locally provisioned accounts. See README.');
   process.exit(1);
 }
 db.exec('CREATE TABLE IF NOT EXISTS auth_sessions (token TEXT PRIMARY KEY, created_at INTEGER DEFAULT (unixepoch()))');
 if (!q('PRAGMA table_info(auth_sessions)').all().some((c) => c.name === 'email')) db.exec("ALTER TABLE auth_sessions ADD COLUMN email TEXT DEFAULT ''");
 db.exec('CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, salt TEXT NOT NULL, pw_hash TEXT NOT NULL, created_at INTEGER DEFAULT (unixepoch()))');
-const SESSION_DAYS = 90;
 const hashPassword = (pw, salt) => crypto.scryptSync(String(pw), salt, 64).toString('hex');
 const hash = (s) => crypto.createHash('sha256').update(String(s)).digest();
-const failures = new Map(); // ip -> { n, until }
-function clientIp(req) {
-  const direct = req.socket.remoteAddress || '';
-  const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(direct);
-  return local && req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : direct;
+const authKeyFile=path.join(DATA_DIR,'auth-key.dpapi');
+if(!fs.existsSync(authKeyFile))fs.writeFileSync(authKeyFile,await protect(crypto.randomBytes(32).toString('hex')),{mode:0o600});
+const authKey=Buffer.from(await unprotect(fs.readFileSync(authKeyFile,'utf8')),'hex');
+if(authKey.length!==32)throw new Error('Invalid local authentication key');
+function credentialBinding(email=''){
+  let material;
+  if(email){const user=q('SELECT * FROM users WHERE email=?').get(email);if(!ACCOUNTS||!ALLOWED_EMAILS.includes(email)||!user)return null;material=['account',email,user.salt,user.pw_hash,user.totp_enabled||0,user.totp_enabled?user.totp_secret||'':''];}
+  else{if(!PASSWORD||ACCOUNTS)return null;material=OWNER_MODE?['username-password-passkey',OWNER_USERNAME.toLowerCase(),PASSWORD,passkeys.version()]:['shared-password',PASSWORD];}
+  return crypto.createHmac('sha256',authKey).update(JSON.stringify(material)).digest('hex');
 }
+const passkeys=OWNER_MODE?new PasskeyStore({db,rpOrigin:PASSKEY_ORIGIN,username:OWNER_USERNAME,binding:()=>credentialBinding('')}):null;
+const sessions=new SessionStore({db,binding:credentialBinding});
+const throttle=new LoginThrottle({db});
+const clientIp=requestIp;
 function cookie(req, name) {
   const m = (req.headers.cookie || '').match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
   return m ? m[1] : null;
 }
 function cookieToken(req) {
-  const t = cookie(req, 'nimbus_session');
+  const t = cookie(req, isHttps(req)?'__Host-nimbus_session':'nimbus_session');
   return t && /^[a-f0-9]{64}$/.test(t) ? t : null;
 }
 function loggedIn(req) {
-  if (!AUTH_ON) return true;
+  if (!AUTH_ON) return directLocal(req);
   const t = cookieToken(req);
-  const row = t && q('SELECT email FROM auth_sessions WHERE token=? AND created_at > unixepoch() - ?').get(t, SESSION_DAYS * 86400);
-  if (row) req.user = { email: row.email };
+  const row = t && sessions.authenticate(t);
+  if (row) {req.user = { email: row.email,...(OWNER_MODE?{username:OWNER_USERNAME}:{}) };req.sessionCreatedAt=row.createdAt;}
   return !!row;
 }
 function isHttps(req) {
-  return !!req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https' || process.env.NIMBUS_SECURE_COOKIE === '1';
+  return secureRequest(req)||process.env.NIMBUS_SECURE_COOKIE==='1';
 }
 function newSessionCookie(req, email = '') {
-  const token = crypto.randomBytes(32).toString('hex');
-  q('INSERT INTO auth_sessions (token, email) VALUES (?,?)').run(token, email);
-  return `nimbus_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}${isHttps(req) ? '; Secure' : ''}`;
+  if(!AUTH_ON)return'nimbus_session=; Path=/; Max-Age=0';
+  const token = sessions.issue(email),secure=isHttps(req);
+  return `${secure?'__Host-nimbus_session':'nimbus_session'}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${sessions.absoluteSeconds}${secure?'; Secure':''}`;
+}
+function authLimitsAllowed(res,reservations,message){
+  // A globally rejected request never reaches password/factor validation, so
+  // it must not consume those smaller budgets and cause a second lockout.
+  for(const reserve of reservations){
+    const decision=reserve();if(decision.allowed)continue;
+    res.setHeader('Retry-After',String(decision.retryAfter));json(res,429,{error:message});return false;
+  }
+  return true;
+}
+function reserveSignIn(req,res){
+  return authLimitsAllowed(res,[()=>throttle.reserve('global-login',{limit:60,windowSeconds:60}),()=>throttle.reserve('ip:'+clientIp(req))],'Too many sign-in attempts. Try again later.');
+}
+function reserveFactorRequest(req,res,factor,verify=false){
+  const checks=[()=>throttle.reserve('global-login',{limit:60,windowSeconds:60}),()=>throttle.reserve('ip:'+factor+'-requests:'+clientIp(req),{limit:60,windowSeconds:60})];
+  // Options retrieval and cancelled native prompts are not password guesses.
+  // Actual verification retains its own durable, pre-body eight-attempt limit.
+  if(verify)checks.push(()=>throttle.reserve('ip:'+factor+'-factor:'+clientIp(req)));
+  return authLimitsAllowed(res,checks,verify?'Too many verification attempts. Try again later.':'Too many authentication requests. Try again later.');
+}
+function completePassword(req,email){throttle.clear('ip:'+clientIp(req));throttle.clear('identity:'+(OWNER_MODE?OWNER_USERNAME.toLowerCase():email||'shared'));}
+function completeSignIn(req,email){
+  completePassword(req,email);
+  for(const factor of ['passkey','mfa'])throttle.clear('ip:'+factor+'-factor:'+clientIp(req));
+  if(email)throttle.clear('mfa:'+email);
 }
 const LOGIN_PAGE = fs.readFileSync(path.join(PUBLIC, 'login.html'));
 
 route('POST', '/api/login', async (req, res) => {
-  const ip = clientIp(req);
-  const f = failures.get(ip);
-  if (f && f.n >= 8 && f.until > Date.now()) return json(res, 429, { error: 'Too many tries. Wait 15 minutes.' });
-  const { email: rawEmail, password } = await body(req);
+  if(!reserveSignIn(req,res))return;
+  const input=await body(req,16384);
+  if(!input||typeof input!=='object'||Array.isArray(input)||typeof input.password!=='string'||input.password.length>1024||input.email!=null&&typeof input.email!=='string'||input.username!=null&&typeof input.username!=='string'||input.enrollmentToken!=null&&typeof input.enrollmentToken!=='string')return json(res,400,{error:'Invalid sign-in request'});
+  const { email: rawEmail, password } = input;
   const email = String(rawEmail || '').trim().toLowerCase();
+  if(email.length>320)return json(res,400,{error:'Invalid sign-in request'});
+  const username=String(input.username||'').trim().toLowerCase();if(username.length>64||String(input.enrollmentToken||'').length>128)return json(res,400,{error:'Invalid sign-in request'});
+  const identity=throttle.reserve('identity:'+(OWNER_MODE?OWNER_USERNAME.toLowerCase():email||'shared'));if(!identity.allowed){res.setHeader('Retry-After',String(identity.retryAfter));return json(res,429,{error:'Too many sign-in attempts. Try again later.'});}
   let ok = false;
-  if (email) {
+  if (ACCOUNTS&&email) {
     const u = q('SELECT * FROM users WHERE email=?').get(email);
     // Hash even for unknown emails so response time doesn't reveal which accounts exist.
     const got = Buffer.from(hashPassword(password || '', u?.salt || 'x'), 'hex');
     ok = !!u && ALLOWED_EMAILS.includes(email) && crypto.timingSafeEqual(got, Buffer.from(u.pw_hash, 'hex'));
-  } else if (PASSWORD && password) {
-    ok = crypto.timingSafeEqual(hash(password), hash(PASSWORD));
+  } else if (!ACCOUNTS&&PASSWORD && password) {
+    const passwordMatches=crypto.timingSafeEqual(hash(password),hash(PASSWORD));
+    ok=passwordMatches&&(!OWNER_MODE||crypto.timingSafeEqual(hash(username),hash(OWNER_USERNAME.toLowerCase())));
   }
   if (!ok) {
-    const cur = f && f.until > Date.now() ? f : { n: 0 };
-    failures.set(ip, { n: cur.n + 1, until: Date.now() + 15 * 60_000 });
     await new Promise((r) => setTimeout(r, 600));
-    return json(res, 401, { error: email ? 'Wrong email or password' : 'Wrong password' });
+    return json(res, 401, { error: 'Incorrect sign-in details' });
   }
-  failures.delete(ip);
-  const acct = email && q('SELECT totp_enabled FROM users WHERE email=?').get(email);
+  if(OWNER_MODE&&!passkeyOriginAllowed(req))return json(res,403,{error:'Use '+PASSKEY_ORIGIN+' to sign in with a passkey'});
+  // A correct password resets only password counters. It never clears the
+  // independent passkey/MFA verification budget or grants an app session.
+  completePassword(req,email);
+  if(OWNER_MODE){
+    let kind='authenticate';
+    // Only a never-enrolled owner may create its first key after the password.
+    // The durable version closes this path permanently after first enrollment;
+    // losing/removing credentials later never reopens password-only enrollment.
+    if(passkeys.version()===0&&!passkeys.count())kind='register';
+    else if(input.enrollmentToken){if(!passkeys.consumeBootstrap(input.enrollmentToken))return json(res,401,{error:'The owner recovery link expired or was already used. Create a new link on the Nimbus PC.'});kind='register';}
+    else if(!passkeys.count())return json(res,403,{error:'Passkey recovery is required. Use an owner recovery link.'});
+    const browserToken=crypto.randomBytes(32).toString('hex'),ticket=passkeys.begin({kind,browserToken});
+    res.setHeader('set-cookie',preauthCookie(req,browserToken));
+    return json(res,200,{passkeyRequired:true,ticket,enrollmentRequired:kind==='register'});
+  }
+  const acct = email && q('SELECT * FROM users WHERE email=?').get(email);
   if (acct?.totp_enabled) {
+    if(!acct.totp_secret)return json(res,401,{error:'Account authentication requires local administrator repair'});
     // Password was right; the session is only issued after the authenticator code.
     const ticket = crypto.randomBytes(24).toString('hex');
-    mfaTickets.set(ticket, { email, until: Date.now() + 5 * 60_000, tries: 0 });
+    for(const [id,t] of mfaTickets)if(t.until<Date.now())mfaTickets.delete(id);
+    mfaTickets.set(ticket, { email, binding:credentialBinding(email),until: Date.now() + 5 * 60_000, tries: 0 });
     return json(res, 200, { mfa: true, ticket });
   }
+  completeSignIn(req,email);
   res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': newSessionCookie(req, email) });
   res.end('{"ok":true}');
 });
-route('GET', '/api/auth-methods', (req, res) => json(res, 200, { password: !!PASSWORD, accounts: ACCOUNTS }));
+route('GET', '/api/auth-methods', (req, res) => json(res, 200, { password: !!PASSWORD&&!ACCOUNTS, accounts: ACCOUNTS,signup:false,username:OWNER_MODE,passkeyRequired:OWNER_MODE,passkeyOrigin:OWNER_MODE?PASSKEY_ORIGIN:null }));
 route('GET', '/api/https-port', (req, res) => json(res, 200, { port: HTTPS_PORT }));
 
-// Email sign-up. Nimbus can't send email to verify an address, so only emails on the
-// NIMBUS_ALLOWED_EMAILS list can make an account, and each email can sign up once.
+// Passkeys are the required second factor for the named owner. A password
+// success grants only a short-lived ceremony ticket, never an app session.
+function passkeyOriginAllowed(req){return OWNER_MODE&&secureRequest(req)&&req.headers.origin===PASSKEY_ORIGIN;}
+function preauthName(req){return isHttps(req)?'__Host-nimbus_preauth':'nimbus_preauth';}
+function preauthCookie(req,token=''){
+  return `${preauthName(req)}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${token?'300':'0'}${isHttps(req)?'; Secure':''}`;
+}
+function passkeyBodyValid(input){return input&&typeof input==='object'&&!Array.isArray(input)&&typeof input.ticket==='string'&&/^[a-f0-9]{64}$/.test(input.ticket);}
+function passkeyCeremony(req,res,phase='options'){
+  if(!passkeys){json(res,404,{error:'Passkeys are not configured'});return false;}
+  if(!passkeyOriginAllowed(req)){json(res,403,{error:'Use '+PASSKEY_ORIGIN+' for passkeys'});return false;}
+  return phase==='password'?reserveSignIn(req,res):reserveFactorRequest(req,res,'passkey',phase==='verify');
+}
+function passkeySignedIn(req,res){
+  if(!passkeys){json(res,404,{error:'Passkeys are not configured'});return false;}
+  if(!loggedIn(req)||Math.floor(Date.now()/1000)-(req.sessionCreatedAt||0)>300){json(res,401,{error:'Sign in again with your password and passkey before managing passkeys'});return false;}
+  return true;
+}
+function passkeyPasswordValid(input){return input&&typeof input.password==='string'&&input.password.length<=1024&&crypto.timingSafeEqual(hash(input.password),hash(PASSWORD));}
+route('POST','/api/admin/passkeys/enrollment-ticket',(req,res)=>{
+  if(!adminAuth(req))return json(res,403,{error:'Local administration required'});
+  if(!passkeys)return json(res,404,{error:'Username and passkey mode is not configured'});
+  const token=passkeys.createBootstrap();
+  json(res,200,{url:PASSKEY_ORIGIN+'/login?enroll='+token,expiresIn:900,requiresUsernameAndPassword:true});
+});
+route('GET','/api/passkeys',(req,res)=>json(res,200,passkeys?{available:true,required:true,username:OWNER_USERNAME,origin:PASSKEY_ORIGIN,passkeys:passkeys.list()}:{available:false,required:false,passkeys:[]}));
+route('POST','/api/passkeys/enrollment/start',async(req,res)=>{
+  if(!passkeyCeremony(req,res,'password'))return;
+  const input=await body(req,16384);
+  if(!passkeySignedIn(req,res))return;
+  if(!passkeyPasswordValid(input))return json(res,401,{error:'Incorrect sign-in details'});
+  completePassword(req,'');
+  if(input.label!=null&&(typeof input.label!=='string'||input.label.length>80))return json(res,400,{error:'Passkey name must be at most 80 characters'});
+  const browserToken=crypto.randomBytes(32).toString('hex'),sessionToken=cookieToken(req);
+  const ticket=passkeys.begin({kind:'register',browserToken,label:input.label||'',authorized:()=>Boolean(sessions.authenticate(sessionToken,{touch:false}))});
+  res.setHeader('set-cookie',preauthCookie(req,browserToken));json(res,200,{ticket});
+});
+for(const [kind,name] of [['authenticate','authentication'],['register','registration']]){
+  route('POST',`/api/passkeys/${name}/options`,async(req,res)=>{
+    if(!passkeyCeremony(req,res))return;
+    const input=await body(req,16384);
+    if(!passkeyBodyValid(input))return json(res,400,{error:'Invalid passkey request'});
+    const browserToken=cookie(req,preauthName(req));
+    const options=await (kind==='authenticate'?passkeys.authenticationOptions(input.ticket,browserToken):passkeys.registrationOptions(input.ticket,browserToken));
+    json(res,200,options);
+  });
+  route('POST',`/api/passkeys/${name}/verify`,async(req,res)=>{
+    if(!passkeyCeremony(req,res,'verify'))return;
+    const input=await body(req,65536);
+    if(!passkeyBodyValid(input)||!input.response||typeof input.response!=='object')return json(res,400,{error:'Invalid passkey response'});
+    const browserToken=cookie(req,preauthName(req));
+    const beforeVersion=passkeys.version();
+    const result=await (kind==='authenticate'?passkeys.verifyAuthentication(input.ticket,browserToken,input.response):passkeys.verifyRegistration(input.ticket,browserToken,input.response,{label:input.label}));
+    if(!result?.verified)return json(res,401,{error:'Passkey verification failed'});
+    if(passkeys.version()!==beforeVersion+(kind==='register'?1:0))return json(res,401,{error:'Passkeys changed during sign-in. Start again.'});
+    revalidateClients();completeSignIn(req,'');
+    res.setHeader('set-cookie',[newSessionCookie(req,''),preauthCookie(req)]);json(res,200,{ok:true});
+  });
+}
+route('DELETE','/api/passkeys/:id',async(req,res,p)=>{
+  if(!passkeyCeremony(req,res,'password'))return;
+  const input=await body(req,16384);
+  if(!passkeySignedIn(req,res))return;
+  if(!passkeyPasswordValid(input))return json(res,401,{error:'Incorrect sign-in details'});
+  completePassword(req,'');
+  passkeys.remove(p.id);revalidateClients();
+  res.setHeader('set-cookie',newSessionCookie(req,''));json(res,200,{ok:true});
+});
+
+// Provisioning is restricted to the protected local administrator interface;
+// knowing an allowlisted email is never sufficient to claim that identity.
 route('POST', '/api/signup', async (req, res) => {
+  if(!adminAuth(req))return json(res,403,{error:'Account provisioning is local administration only'});
   if (!ACCOUNTS) return json(res, 404, { error: 'Sign-up is not enabled' });
-  const ip = clientIp(req);
-  const f = failures.get(ip);
-  if (f && f.n >= 8 && f.until > Date.now()) return json(res, 429, { error: 'Too many tries. Wait 15 minutes.' });
-  const { email: rawEmail, password } = await body(req);
+  const { email: rawEmail, password } = await body(req,16384);
   const email = String(rawEmail || '').trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res, 400, { error: 'Enter a valid email' });
-  if (String(password || '').length < 8) return json(res, 400, { error: 'Password must be at least 8 characters' });
+  if (typeof password!=='string'||password.length<12||password.length>1024)return json(res,400,{error:'Account password must be 12–1024 characters'});
   if (!ALLOWED_EMAILS.includes(email)) {
-    const cur = f && f.until > Date.now() ? f : { n: 0 };
-    failures.set(ip, { n: cur.n + 1, until: Date.now() + 15 * 60_000 });
     return json(res, 403, { error: "This email isn't allowed to use this Nimbus. Ask the owner to add it to NIMBUS_ALLOWED_EMAILS." });
   }
   if (q('SELECT 1 FROM users WHERE email=?').get(email)) return json(res, 409, { error: 'That email already has an account. Sign in instead.' });
@@ -923,6 +861,7 @@ function totp(secret, step) {
 }
 // Accepts the current 30-second code or its neighbours, to allow for clock drift.
 function checkTotp(secret, code) {
+  if(typeof secret!=='string'||!/^[A-Z2-7]{16,}$/.test(secret))return false;
   code = String(code || '').replace(/\s/g, '');
   if (!/^\d{6}$/.test(code)) return false;
   const now = Math.floor(Date.now() / 30000);
@@ -940,10 +879,14 @@ const mfaTickets = new Map(); // ticket -> { email, until, tries }
 function currentUser(req) { return req.user?.email ? q('SELECT * FROM users WHERE email=?').get(req.user.email) : null; }
 
 route('POST', '/api/login/mfa', async (req, res) => {
-  const { ticket, code } = await body(req);
+  if(!reserveFactorRequest(req,res,'mfa',true))return;
+  const input=await body(req,16384);if(!input||typeof input.ticket!=='string'||typeof input.code!=='string')return json(res,400,{error:'Invalid verification request'});
+  const { ticket, code } = input;
   const t = mfaTickets.get(String(ticket || ''));
   if (!t || t.until < Date.now()) { mfaTickets.delete(ticket); return json(res, 401, { error: 'Sign-in expired. Start again.', restart: true }); }
   const user = q('SELECT * FROM users WHERE email=?').get(t.email);
+  if(!user?.totp_enabled||!user.totp_secret||!ALLOWED_EMAILS.includes(t.email)||t.binding!==credentialBinding(t.email)){mfaTickets.delete(ticket);return json(res,401,{error:'Sign-in details changed. Start again.',restart:true});}
+  const factorLimit=throttle.reserve('mfa:'+t.email);if(!factorLimit.allowed){res.setHeader('Retry-After',String(factorLimit.retryAfter));return json(res,429,{error:'Too many verification attempts. Try again later.'});}
   const ok = user && (checkTotp(user.totp_secret, code) || useRecoveryCode(user, code));
   if (!ok) {
     if (++t.tries >= 5) { mfaTickets.delete(ticket); return json(res, 401, { error: 'Too many wrong codes. Start again.', restart: true }); }
@@ -951,6 +894,7 @@ route('POST', '/api/login/mfa', async (req, res) => {
     return json(res, 401, { error: 'Wrong code' });
   }
   mfaTickets.delete(ticket);
+  completeSignIn(req,t.email);
   res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': newSessionCookie(req, t.email) });
   res.end('{"ok":true}');
 });
@@ -961,6 +905,7 @@ route('GET', '/api/mfa', (req, res) => {
 route('POST', '/api/mfa/setup', (req, res) => {
   const u = currentUser(req);
   if (!u) return json(res, 400, { error: 'Two-factor is for email + password accounts.' });
+  if(Math.floor(Date.now()/1000)-(req.sessionCreatedAt||0)>300)return json(res,401,{error:'Sign in again before changing authentication'});
   if (u.totp_enabled) return json(res, 400, { error: 'Two-factor is already on' });
   const secret = base32(crypto.randomBytes(20));
   q('UPDATE users SET totp_secret=? WHERE email=?').run(secret, u.email);
@@ -968,26 +913,37 @@ route('POST', '/api/mfa/setup', (req, res) => {
   json(res, 200, { secret, uri });
 });
 route('POST', '/api/mfa/enable', async (req, res) => {
+  const input=await body(req,16384);
+  // Recheck after the asynchronous body read: logout or a credential change
+  // must not let an in-flight request resurrect an invalidated session.
+  if(!loggedIn(req))return json(res,401,{error:'Sign in again before changing authentication'});
   const u = currentUser(req);
   if (!u?.totp_secret) return json(res, 400, { error: 'Start setup first' });
-  if (!checkTotp(u.totp_secret, (await body(req)).code)) return json(res, 400, { error: 'That code didn’t match. Check your phone’s time is correct and try the newest code.' });
+  if(u.totp_enabled)return json(res,400,{error:'Two-factor is already on'});
+  if(Math.floor(Date.now()/1000)-(req.sessionCreatedAt||0)>300)return json(res,401,{error:'Sign in again before changing authentication'});
+  if (!checkTotp(u.totp_secret, input?.code)) return json(res, 400, { error: 'That code didn’t match. Check your phone’s time is correct and try the newest code.' });
   const codes = Array.from({ length: 8 }, () => crypto.randomBytes(5).toString('hex'));
   q('UPDATE users SET totp_enabled=1, recovery=? WHERE email=?').run(JSON.stringify(codes.map((c) => hash(c).toString('hex'))), u.email);
+  revalidateClients();res.setHeader('set-cookie',newSessionCookie(req,u.email));
   json(res, 200, { recovery: codes.map((c) => c.slice(0, 5) + '-' + c.slice(5)) });
 });
 route('POST', '/api/mfa/disable', async (req, res) => {
+  const input=await body(req,16384);
+  if(!loggedIn(req))return json(res,401,{error:'Sign in again before changing authentication'});
   const u = currentUser(req);
   if (!u?.totp_enabled) return json(res, 400, { error: 'Two-factor is not on' });
-  const { password, code } = await body(req);
+  if(!input||typeof input.password!=='string'||input.password.length>1024||typeof input.code!=='string')return json(res,400,{error:'Wrong password or code'});
+  const { password, code } = input;
   const pwOk = crypto.timingSafeEqual(Buffer.from(hashPassword(password || '', u.salt), 'hex'), Buffer.from(u.pw_hash, 'hex'));
   if (!pwOk || !(checkTotp(u.totp_secret, code) || useRecoveryCode(u, code))) return json(res, 400, { error: 'Wrong password or code' });
   q("UPDATE users SET totp_enabled=0, totp_secret='', recovery='[]' WHERE email=?").run(u.email);
+  revalidateClients();res.setHeader('set-cookie',newSessionCookie(req,u.email));
   json(res, 200, { ok: true });
 });
 route('POST', '/api/logout', (req, res) => {
   const t = cookieToken(req);
-  if (t) q('DELETE FROM auth_sessions WHERE token=?').run(t);
-  res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': 'nimbus_session=; Path=/; Max-Age=0' });
+  if (t) {sessions.revoke(t);revokeClients(t);}
+  res.writeHead(200, { 'content-type': 'application/json', 'clear-site-data':'"cache"', 'set-cookie': ['nimbus_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',...(isHttps(req)?['__Host-nimbus_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0']:[]),...(OWNER_MODE?[preauthCookie(req)]:[])] });
   res.end('{"ok":true}');
 });
 
@@ -999,12 +955,15 @@ const ADMIN_TOKEN = fs.readFileSync(ADMIN_TOKEN_FILE, 'utf8').trim();
 function adminAuth(req) {
   const t = String(req.headers['x-nimbus-admin'] || '');
   return t.length === ADMIN_TOKEN.length && crypto.timingSafeEqual(Buffer.from(t), Buffer.from(ADMIN_TOKEN))
-    && ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress) && !req.headers['x-forwarded-for'];
+    && directLocal(req);
 }
 
-const OPEN_PATHS = new Set(['/nimbus.webp', '/login', '/api/login', '/api/login/mfa', '/api/signup', '/api/auth-methods', '/icon.svg', '/manifest.webmanifest', '/styles.css']);
+const OPEN_PATHS = new Set(['/health', '/local-login', '/nimbus.webp', '/login', '/api/login', '/api/login/mfa', '/api/auth-methods', '/api/passkeys/authentication/options','/api/passkeys/authentication/verify','/api/passkeys/registration/options','/api/passkeys/registration/verify','/vendor/simplewebauthn-browser.js','/passkeys.js','/icon.svg', '/icon-192.png','/icon-512.png','/apple-touch-icon.png','/offline.html','/sw.js','/pwa.js','/manifest.webmanifest', '/styles.css']);
 function checkAuth(req, res, url) {
-  if (url.pathname.startsWith('/api/hook/') || OPEN_PATHS.has(url.pathname) || adminAuth(req) || loggedIn(req)) {
+  if(!AUTH_ON&&!directLocal(req)){json(res,503,{error:'Authentication must be configured before remote access'});return false;}
+  if(!directLocal(req)&&!secureRequest(req)){json(res,403,{error:'HTTPS is required'});return false;}
+  if(!['GET','HEAD','OPTIONS'].includes(req.method)&&!sameOriginRequest(req)){json(res,403,{error:'Cross-origin request rejected'});return false;}
+  if (OPEN_PATHS.has(url.pathname) || adminAuth(req) || loggedIn(req)) {
     // Mutating API calls must be JSON: blocks form-based cross-site requests.
     if (req.method !== 'GET' && url.pathname.startsWith('/api/') && !String(req.headers['content-type']).includes('application/json')) {
       json(res, 415, { error: 'JSON required' }); return false;
@@ -1020,63 +979,17 @@ function checkAuth(req, res, url) {
 // The desktop on the computer VM uses HTTP basic auth, which browsers won't prompt for inside a
 // cross-origin iframe. Nimbus serves it at /computer/<botId>/ instead and adds the credentials itself,
 // so only someone logged in to Nimbus can see a bot's screen. WebSockets (the live screen) go through too.
-const deskCache = new Map(); // botId -> { at, info }
-async function deskInfo(id) {
-  const c = deskCache.get(id);
-  if (c && Date.now() - c.at < 60_000) return c.info;
-  let info = await agent(`/computers/${id}`);
-  if (info.exists && !info.running) info = await agent(`/computers/${id}`, { method: 'POST' }); // asleep: wake it
-  if (!info.exists || !info.port) throw new Error('This bot’s computer isn’t running');
-  const r = { host: new URL(agentConfig().url).hostname, port: info.port, auth: 'Basic ' + Buffer.from(`${info.user}:${info.password}`).toString('base64') };
-  deskCache.set(id, { at: Date.now(), info: r });
-  return r;
-}
-const DESK_RE = /^\/computer\/(\d+)(\/.*)?$/;
-const HOP = new Set(['connection', 'keep-alive', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'cookie', 'authorization']);
-async function proxyDesktop(req, res, m, url) {
-  deskSeen.set(Number(m[1]), Date.now());
-  if (!m[2]) { res.writeHead(302, { location: `/computer/${m[1]}/` }); return res.end(); }
-  let d;
-  try { d = await deskInfo(Number(m[1])); } catch (e) { res.writeHead(502, { 'content-type': 'text/plain' }); return res.end(e.message); }
-  const headers = Object.fromEntries(Object.entries(req.headers).filter(([k]) => !HOP.has(k)));
-  const up = http.request({ host: d.host, port: d.port, method: req.method, path: m[2] + url.search, headers: { ...headers, host: `${d.host}:${d.port}`, authorization: d.auth } }, (r) => {
-    const h = { ...r.headers }; delete h['x-frame-options']; delete h['www-authenticate'];
-    if (r.statusCode === 401) deskCache.delete(Number(m[1])); // password changed, e.g. computer recreated
-    res.writeHead(r.statusCode, h); r.pipe(res);
-  });
-  up.on('error', (e) => { if (!res.headersSent) { res.writeHead(502, { 'content-type': 'text/plain' }); res.end('Couldn’t reach the bot’s computer: ' + e.message); } else res.destroy(); });
-  req.pipe(up);
-}
-async function proxyDesktopUpgrade(req, socket, head) {
-  const url = new URL(req.url, 'http://x');
-  const m = url.pathname.match(DESK_RE);
-  if (!m || !loggedIn(req)) { socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n'); return; }
-  deskSeen.set(Number(m[1]), Date.now());
-  let d;
-  try { d = await deskInfo(Number(m[1])); } catch { socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'); return; }
-  const up = net.connect(d.port, d.host, () => {
-    const lines = [`${req.method} ${(m[2] || '/') + url.search} HTTP/1.1`, `Host: ${d.host}:${d.port}`, `Authorization: ${d.auth}`];
-    for (let i = 0; i < req.rawHeaders.length; i += 2) {
-      const k = req.rawHeaders[i];
-      if (!['host', 'cookie', 'authorization', 'origin'].includes(k.toLowerCase())) lines.push(`${k}: ${req.rawHeaders[i + 1]}`);
-    }
-    lines.push(`Origin: http://${d.host}:${d.port}`);
-    up.write(lines.join('\r\n') + '\r\n\r\n');
-    if (head?.length) up.write(head);
-    up.pipe(socket); socket.pipe(up);
-  });
-  const watching = setInterval(() => deskSeen.set(Number(m[1]), Date.now()), 60_000); // screen open = not idle
-  const close = () => { clearInterval(watching); up.destroy(); socket.destroy(); };
-  up.on('error', close); socket.on('error', close); socket.on('close', close);
-}
-
 async function handle(req, res) {
   try {
+    const nonce=crypto.randomBytes(18).toString('base64');
+    res.setHeader('x-frame-options','DENY');res.setHeader('x-content-type-options','nosniff');res.setHeader('referrer-policy','same-origin');
+    res.setHeader('permissions-policy','camera=(), geolocation=(), microphone=(self)');
+    res.setHeader('cache-control','no-store');
+    res.setHeader('content-security-policy',`default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; media-src 'self' blob:; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`);
+    if(secureRequest(req))res.setHeader('strict-transport-security','max-age=31536000');
     const url = new URL(req.url, 'http://x');
     if (!checkAuth(req, res, url)) return;
-    const desk = url.pathname.match(DESK_RE);
-    if (desk) return await proxyDesktop(req, res, desk, url);
-    if (url.pathname === '/login') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(LOGIN_PAGE); }
+    if (url.pathname === '/login') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(LOGIN_PAGE.toString('utf8').replaceAll('<script>',`<script nonce="${nonce}">`)); }
     for (const r of routes) {
       const m = r.method === req.method && url.pathname.match(r.re);
       if (m) return await r.fn(req, res, m.groups || {}, url);
@@ -1084,20 +997,19 @@ async function handle(req, res) {
     if (req.method !== 'GET' || url.pathname.startsWith('/api/')) return json(res, 404, { error: 'not found' });
     let file = path.join(PUBLIC, path.normalize(url.pathname).replace(/^(\.\.[/\\])+/, ''));
     if (!file.startsWith(PUBLIC) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(PUBLIC, 'index.html');
-    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream', 'x-frame-options': 'DENY', 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin', 'cache-control': 'no-cache' });
+    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream', 'x-frame-options': 'DENY', 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin', 'cache-control': 'no-store' });
     fs.createReadStream(file).pipe(res);
   } catch (e) {
-    if (!res.headersSent) json(res, 500, { error: e.message });
+    if (!res.headersSent) json(res, e.statusCode||500, { error: e.statusCode?e.message:'Request could not be completed' });
   }
 }
-const onUpgrade = (req, socket, head) => { proxyDesktopUpgrade(req, socket, head).catch(() => socket.destroy()); };
 const server = http.createServer(handle);
-server.on('upgrade', onUpgrade);
+server.requestTimeout=30000;server.headersTimeout=15000;server.keepAliveTimeout=5000;server.maxRequestsPerSocket=100;
 
 // HTTPS on a second port with a self-signed certificate made on first start (data/tls). Browsers only
 // allow some features on secure pages: bot desktops (video decoding) and phone notifications need it.
 // The certificate covers this server's IPs and hostname, and is remade when they change.
-const HTTPS_PORT = Number(process.env.NIMBUS_HTTPS_PORT ?? 8443);
+const HTTPS_PORT = Number(process.env.NIMBUS_HTTPS_PORT ?? 0);
 function tlsFiles() {
   const dir = path.join(DATA_DIR, 'tls'); fs.mkdirSync(dir, { recursive: true });
   const key = path.join(dir, 'key.pem'), cert = path.join(dir, 'cert.pem'), names = path.join(dir, 'names.txt');
@@ -1105,7 +1017,7 @@ function tlsFiles() {
   const san = ['DNS:localhost', `DNS:${os.hostname()}`, 'IP:127.0.0.1', ...ips.map((ip) => `IP:${ip}`)].join(',');
   if (!fs.existsSync(cert) || !fs.existsSync(names) || fs.readFileSync(names, 'utf8') !== san) {
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-sha256', '-days', '3650', '-keyout', key, '-out', cert,
-      '-subj', '/CN=Nimbus', '-addext', `subjectAltName=${san}`], { stdio: 'ignore' });
+      '-subj', '/CN=Nimbus', '-addext', `subjectAltName=${san}`], { stdio: 'ignore', windowsHide: true });
     fs.chmodSync(key, 0o600); fs.writeFileSync(names, san);
   }
   return { key: fs.readFileSync(key), cert: fs.readFileSync(cert) };
@@ -1113,14 +1025,19 @@ function tlsFiles() {
 if (HTTPS_PORT) {
   try {
     const secure = https.createServer(tlsFiles(), handle);
-    secure.on('upgrade', onUpgrade);
+    secure.requestTimeout=30000;secure.headersTimeout=15000;secure.keepAliveTimeout=5000;secure.maxRequestsPerSocket=100;
     secure.on('error', (e) => console.error(`HTTPS not started: ${e.message}`));
     secure.listen(HTTPS_PORT, HOST, () => console.log(`Nimbus HTTPS at https://<this server>:${HTTPS_PORT} (self-signed certificate)`));
   } catch (e) { console.error(`HTTPS not started: ${e.message}`); }
 }
 server.listen(PORT, HOST, () => {
+  maintenance.confirmBoot(bootSourceHash);
+  startToolDevelopment(bootSourceHash);
   const shown = ['0.0.0.0', '::'].includes(HOST) ? 'localhost' : HOST;
   console.log(`Nimbus running at http://${shown}:${PORT}${shown !== HOST ? ` (listening on all interfaces, ${HOST})` : ''}`);
 });
 
-process.on('SIGTERM', () => { db.close(); process.exit(0); });
+let closing=false;
+async function shutdown(code=0) { if(closing)return;closing=true;server.close();await drainRuntime();await terminals.close();localService?.closeAllConnections();localService?.close();await connectors.close();await browsers.close();db.close();process.exit(code); }
+process.on('SIGTERM',()=>shutdown());
+process.on('SIGINT',()=>shutdown());

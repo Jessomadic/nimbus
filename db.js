@@ -1,6 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
+import {buildWorkerBrief} from './runtime/prompts.js';
+import {defaultDisplayGroup} from './public/agent-groups.js';
 
 export const DATA_DIR = path.resolve(process.env.NIMBUS_DATA || './data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -8,6 +10,7 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 export const db = new DatabaseSync(path.join(DATA_DIR, 'nimbus.db'));
 db.exec(`
 PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS bots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -71,6 +74,11 @@ for (const [col, type] of [['shape', "TEXT DEFAULT 'blob'"], ['template', "TEXT 
 }
 
 export const q = (sql) => db.prepare(sql);
+db.exec(`CREATE TABLE IF NOT EXISTS task_questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
+  questions TEXT NOT NULL, answers TEXT, status TEXT DEFAULT 'pending',
+  created_at INTEGER DEFAULT (unixepoch())
+)`);
 
 export function parseBot(b) {
   if (!b) return b;
@@ -83,66 +91,15 @@ export function botDir(id) {
   return dir;
 }
 
-// Every bot can message every other bot with bin/ask-bot.mjs (see /api/hook/ask in server.js).
-const ASK_BOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), 'bin', 'ask-bot.mjs');
-function teamSection(bot, remote) {
-  // Bots on their own computer get a copy of the script in their work folder (see remoteRun in runner.js).
-  const ask = remote ? '/config/work/ask-bot.mjs' : ASK_BOT;
-  const others = db.prepare('SELECT id, name, role FROM bots WHERE id != ? ORDER BY id').all(bot.id);
-  if (!others.length) return 'You are the only bot right now.';
-  return `Other Nimbus bots you can message (they are bots, not the user):
-${others.map((o) => `- ${o.name} (#${o.id})${o.role ? `: ${o.role}` : ''}`).join('\n')}
-
-To ask a bot something and get its answer back, run (Bash tool, timeout 600000):
-  node ${ask} "<bot name or #id>" "<message>"
-To just send it information or a task without waiting: add --no-wait before the name.
-If an answer takes longer than ~4 minutes you get a run id; fetch it later with: node ${ask} --result <run id>
-- Write messages that stand on their own: the other bot can't see this chat. Include the facts, files (full paths) and what you need back.
-- Ask a teammate when the work is in its area (e.g. calendar, firewall, Proxmox) instead of doing it yourself.
-- Don't message the bot that is asking you something; put your answer in your reply instead.${remote ? `
-- You run on your own computer, where the Claude connectors (Gmail, Google Calendar, Drive, Docs) are not
-  available. For anything in those, ask a teammate that runs on the Nimbus server (e.g. a calendar bot).
-- Files you save under ~/Downloads or ~/work show up in Nimbus (computer dialog → Files), so the user can download them.` : ''}`;
-}
-
-// One shared, current description of the homelab (data/shared/HOMELAB.md) goes into every brief,
-// so bots don't each keep their own copy that drifts out of date.
-function homelabSection() {
-  try {
-    const facts = fs.readFileSync(path.join(DATA_DIR, 'shared', 'HOMELAB.md'), 'utf8').trim();
-    return facts ? `\n## Homelab facts (shared by all bots; trust this over your own notes)\n${facts}\n` : '';
-  } catch { return ''; }
-}
-
-// Each bot gets a workspace folder. CLAUDE.md there is its standing brief;
+// Each bot gets a workspace folder. AGENTS.md is its standing brief;
 // MEMORY.md is what it has learned, which it edits itself.
-export { ASK_BOT };
-export function writeBotBrief(bot, remote = false) {
+export function writeBotBrief(bot) {
   const dir = botDir(bot.id);
   const mem = path.join(dir, 'MEMORY.md');
   if (!fs.existsSync(mem)) fs.writeFileSync(mem, `# What ${bot.name} has learned\n\n`);
-  fs.writeFileSync(path.join(dir, 'CLAUDE.md'), `# You are ${bot.name}
-${bot.role ? `Role: ${bot.role}\n` : ''}
-You are one bot on the user's personal team in an app called Nimbus. You run headless:
-the user is not watching the terminal. They read your final reply in a chat thread.
-
-## Standing instructions
-${bot.instructions || '(none yet)'}
-
-## How to work
-- Do the work, then reply briefly: what you did, what needs the user, what's next.
-- Risky actions (sending, paying, deleting, pushing, merging) may be paused for the user's
-  approval automatically. If one is rejected, read the reason and adjust.
-- When the user tells you a preference or rule, add one line to MEMORY.md in this folder.
-- This folder is your workspace. Keep notes and files here.
-
-## Your team
-${teamSection(bot, remote)}
-${homelabSection()}
-
-## Memory
-@MEMORY.md
-`);
+  const team=q('SELECT id,name,role,parent_bot_id FROM bots WHERE id != ? ORDER BY id').all(bot.id);
+  let sharedFacts='';try{sharedFacts=fs.readFileSync(path.join(DATA_DIR,'shared','HOMELAB.md'),'utf8').trim();}catch{}
+  fs.writeFileSync(path.join(dir,'AGENTS.md'),buildWorkerBrief({bot,team,sharedFacts,workspace:dir}));
   return dir;
 }
 
@@ -160,3 +117,44 @@ export function setSetting(key, value) {
 if (!db.prepare('PRAGMA table_info(messages)').all().some((c) => c.name === 'files')) db.exec("ALTER TABLE messages ADD COLUMN files TEXT DEFAULT '[]'");
 if (!db.prepare('PRAGMA table_info(runs)').all().some((c) => c.name === 'parent_run')) db.exec('ALTER TABLE runs ADD COLUMN parent_run INTEGER');
 if (!db.prepare('PRAGMA table_info(routines)').all().some((c) => c.name === 'quiet')) db.exec('ALTER TABLE routines ADD COLUMN quiet INTEGER DEFAULT 0');
+
+function addColumns(table, columns) {
+  const present = new Set(q(`PRAGMA table_info(${table})`).all().map(c => c.name));
+  for (const [name, type] of columns) if (!present.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+}
+addColumns('bots', [['runtime', "TEXT DEFAULT 'auto'"], ['default_model',"TEXT DEFAULT ''"], ['parent_bot_id','INTEGER'], ['tools', "TEXT DEFAULT '[\"shell\",\"read_file\",\"write_file\",\"list_files\",\"browser\",\"shared_note\",\"ask_worker\",\"self_update\"]'"]]);
+// Seed visual defaults exactly once, atomically with the column addition.
+// Later startups must retain explicit groups, including an intentionally empty
+// Other-agents selection. Organizational/runtime columns are untouched.
+if(!q('PRAGMA table_info(bots)').all().some(column=>column.name==='display_group')){
+  db.exec('SAVEPOINT add_display_group');
+  try{
+    db.exec("ALTER TABLE bots ADD COLUMN display_group TEXT DEFAULT ''");
+    const assign=q('UPDATE bots SET display_group=? WHERE id=?');
+    for(const bot of q('SELECT id,template FROM bots').all())assign.run(defaultDisplayGroup(bot.template),bot.id);
+    db.exec('RELEASE add_display_group');
+  }catch(error){db.exec('ROLLBACK TO add_display_group');db.exec('RELEASE add_display_group');throw error;}
+}
+addColumns('runs', [['requested_model', 'TEXT'], ['actual_model', 'TEXT'], ['route_reason', 'TEXT'], ['fallback_reason', 'TEXT'],
+  ['backend', 'TEXT'], ['input_tokens', 'INTEGER DEFAULT 0'], ['output_tokens', 'INTEGER DEFAULT 0'], ['checkpoint', 'TEXT'],
+  ['last_error', 'TEXT'], ['source', "TEXT DEFAULT 'user'"], ['quiet', 'INTEGER DEFAULT 0'], ['depth', 'INTEGER DEFAULT 0']]);
+addColumns('runs',[['origin_message_id','INTEGER'],['origin_request_id','TEXT']]);
+db.exec(`
+CREATE TABLE IF NOT EXISTS task_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, type TEXT NOT NULL, body TEXT NOT NULL,
+  created_at INTEGER DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS task_events_run ON task_events(run_id,id);
+CREATE TABLE IF NOT EXISTS tool_calls (
+  id TEXT PRIMARY KEY, run_id INTEGER NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL,
+  state TEXT NOT NULL, result TEXT, started_at INTEGER DEFAULT (unixepoch()), ended_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS worker_history (
+  bot_id INTEGER NOT NULL, thread TEXT NOT NULL, messages TEXT NOT NULL, updated_at INTEGER DEFAULT (unixepoch()),
+  PRIMARY KEY(bot_id,thread)
+);
+CREATE TABLE IF NOT EXISTS task_requests (
+  request_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, run_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS message_requests (request_key TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,message_id INTEGER NOT NULL);
+`);

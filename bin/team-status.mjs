@@ -34,7 +34,7 @@ for (const b of state.bots) {
 }
 if (checks.length) out.push('', 'Scheduled checks:', ...checks);
 out.push('', `Approvals waiting: ${state.approvals.length}${state.approvals.length ? ' (' + state.approvals.map((a) => `${name(a.bot_id)}: ${a.tool}`).join('; ') + ')' : ''}`);
-if (plan.ok) out.push(`Claude plan: ${plan.windows.map((w) => `${w.label} ${Math.round(w.used)}% used`).join(', ')}`);
+if (plan.ok) out.push(`OpenAI subscription: ${plan.windows.map((w) => `${w.label} ${Math.round(w.used)}% used`).join(', ')}`);
 const bk = backup.last;
 out.push(`Last backup: ${!bk ? 'none yet' : bk.ok ? `${new Date(bk.at).toLocaleString()}, ${(bk.size / 1e6).toFixed(0)} MB${bk.remote ? ', copied off-server' : ', on the Nimbus server only'}` : 'FAILED: ' + bk.error}`);
 console.log(out.join('\n'));

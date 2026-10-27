@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DATA = path.resolve(HERE, '..', process.env.NIMBUS_DATA || 'data');
-const [method = 'GET', apiPath = '/api/state', body] = process.argv.slice(2);
+let [method = 'GET', apiPath = '/api/state', body] = process.argv.slice(2);
+if(method==='OPEN'){method='POST';apiPath='/api/admin/login-ticket';body='{}';}
 const token = fs.readFileSync(path.join(DATA, 'admin.token'), 'utf8').trim();
 const res = await fetch(`http://127.0.0.1:${process.env.PORT || 8787}${apiPath}`, {
   method: method.toUpperCase(),
