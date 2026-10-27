@@ -2,6 +2,8 @@
 import { createRuntimeUI } from './runtime.js';
 import {hierarchyRows} from './team-tree.js';
 import {DISPLAY_GROUPS,defaultDisplayGroup} from './agent-groups.js';
+import {SIDEBAR_GROUPS,normalizeSidebarLayout,sidebarGroupAncestors} from './sidebar-layout.js';
+import {installSidebarDrag} from './sidebar-drag.js';
 import { attachAutocorrect } from './autocorrect.js';
 import { THEMES, resolveTheme, applyThemeVars } from './themes.js';
 import { startRecording, stopRecording, cancelRecording, isRecording, browserDictation } from './dictation.js';
@@ -254,6 +256,9 @@ function connectionStatus(text){connectionState=text;const el=$('#connection-sta
 let sidebarPrefsKey='',sidebarPrefs={collapsed:{},seen:{},seeded:false,rootCollapsed:false};
 const revealedDisplayGroups=new Set();
 let revealedOrchestratorBranch=false;
+let sidebarDrag=null;
+const sidebarLayout=()=>normalizeSidebarLayout(S.data?.sidebarLayout);
+function revealDisplayGroup(id){revealedOrchestratorBranch=true;revealedDisplayGroups.add(id);for(const parent of sidebarGroupAncestors(sidebarLayout(),id))revealedDisplayGroups.add(parent);}
 const knownDisplayGroups=new Set(DISPLAY_GROUPS.map(group=>group.id));
 function displayGroup(bot){return Object.hasOwn(bot,'display_group')?(knownDisplayGroups.has(bot.display_group)?bot.display_group:''):defaultDisplayGroup(bot.template);}
 function sidebarPreferences(){
@@ -293,19 +298,18 @@ function sidebarItems(){
   if(Array.isArray(d.sideOrder)){const pos=new Map(d.sideOrder.map((key,index)=>[key,index]));items.sort((a,b)=>(pos.has(a.key)?pos.get(a.key):-1)-(pos.has(b.key)?pos.get(b.key):-1));}
   return items;
 }
-function sidebarGroup(group,members){
-  if(!members.length)return '';
+function sidebarGroup(group,members,children='',allMembers=members){
   const key=threadKey(),known=new Map(members.map(item=>[item.key,item])),matches=members.filter(item=>!sideQuery||item.name.toLowerCase().includes(sideQuery)),visible=new Set(matches.map(item=>item.key));
-  if(sideQuery){for(const match of matches){let parent=match.parent;const visited=new Set();while(parent&&known.has(parent)&&!visited.has(parent)){visited.add(parent);visible.add(parent);parent=known.get(parent).parent;}}if(!matches.length)return '';}
+  if(sideQuery){for(const match of matches){let parent=match.parent;const visited=new Set();while(parent&&known.has(parent)&&!visited.has(parent)){visited.add(parent);visible.add(parent);parent=known.get(parent).parent;}}if(!matches.length&&!children)return '';}
   const expanded=!!sideQuery||revealedDisplayGroups.has(group.id)||sidebarPrefs.collapsed[group.id]!==true,bodyId='side-display-'+(group.id||'other');
-  const current=members.find(item=>item.key===key),working=members.filter(item=>['working','running','routing'].includes(item.state)).length,waiting=members.filter(item=>/^waiting(?:_|$)|^(?:paused|needs_review)$/.test(item.state)).length,queued=members.filter(item=>item.state==='queued').length,unread=members.filter(item=>unreadThread(item.key)).length;
-  const ids=new Set(members.map(item=>item.key)),approvals=S.data.approvals.filter(approval=>group.id==='rooms'?ids.has(approval.thread):ids.has('bot:'+approval.bot_id)).length;
+  const current=allMembers.find(item=>item.key===key),working=allMembers.filter(item=>['working','running','routing'].includes(item.state)).length,waiting=allMembers.filter(item=>/^waiting(?:_|$)|^(?:paused|needs_review)$/.test(item.state)).length,queued=allMembers.filter(item=>item.state==='queued').length,unread=allMembers.filter(item=>unreadThread(item.key)).length;
+  const ids=new Set(allMembers.map(item=>item.key)),approvals=S.data.approvals.filter(approval=>ids.has(approval.thread)||ids.has('bot:'+approval.bot_id)).length;
   const badges=[current?{kind:'current',text:'Current',label:'Current chat: '+current.name}:null,working?{kind:'working',text:working+' working'}:null,waiting?{kind:'waiting',text:waiting+' waiting'}:null,queued?{kind:'queued',text:queued+' queued'}:null,approvals?{kind:'approval',text:approvals+(approvals===1?' approval':' approvals')}:null,unread?{kind:'unread',text:unread+' unread',label:unread+' unread '+(unread===1?'thread':'threads')}:null].filter(Boolean);
-  const unit=group.id==='rooms'?'group chats':'agents',label=group.label+', '+members.length+' '+unit+(badges.length?', '+badges.map(badge=>badge.label||badge.text).join(', '):'');
+  const unit=allMembers.every(item=>item.key.startsWith('room:'))&&group.id==='rooms'?'group chats':allMembers.some(item=>item.key.startsWith('room:'))?'items':'agents',label=group.label+', '+allMembers.length+' '+unit+(badges.length?', '+badges.map(badge=>badge.label||badge.text).join(', '):'');
   const rows=hierarchyRows(members).filter(item=>!sideQuery||visible.has(item.key));
-  return `<section class="side-display-group ${expanded?'expanded':'collapsed'}" data-display-section="${esc(group.id)}">
-    <button type="button" class="side-group-heading" data-display-group="${esc(group.id)}" aria-expanded="${expanded}" aria-controls="${bodyId}" aria-label="${esc(label)}" ${sideQuery?'aria-disabled="true" title="Search results stay expanded until search is cleared"':''}>
-      <span class="side-group-label">${ICON.chevron}<span>${esc(group.label)}</span><span class="side-group-count" aria-hidden="true">${members.length}</span>${sideQuery?`<small>${matches.length} ${matches.length===1?'match':'matches'}</small>`:''}</span>
+  return `<section class="side-display-group ${expanded?'expanded':'collapsed'} ${allMembers.length?'':'empty'}" data-display-section="${esc(group.id)}">
+    <button type="button" class="side-group-heading" data-display-group="${esc(group.id)}" aria-expanded="${expanded}" aria-controls="${bodyId}" aria-label="${esc(label)}" ${sideQuery?'aria-disabled="true" title="Search results stay expanded until search is cleared"':'title="Drag to move. Drop on another heading to nest. Alt + arrow keys also move groups."'}>
+      <span class="side-group-label">${ICON.chevron}<span>${esc(group.label)}</span><span class="side-group-count" aria-hidden="true">${allMembers.length}</span>${sideQuery?`<small>${allMembers.filter(item=>item.name.toLowerCase().includes(sideQuery)).length} matches</small>`:''}</span>
       ${badges.length?`<span class="side-group-badges" aria-hidden="true">${badges.map(badge=>`<span class="side-group-badge side-badge-${badge.kind}" data-group-badge="${badge.kind}">${esc(badge.text)}</span>`).join('')}</span>`:''}
     </button>
     <div class="side-group-members" id="${bodyId}" data-display-group-body="${esc(group.id)}" ${expanded?'':'hidden'}>${rows.map(item=>{
@@ -314,7 +318,7 @@ function sidebarGroup(group,members){
         <span class="av-wrap">${item.av}${item.state!=='idle'?`<span class="dot ${esc(item.state)}"></span>`:''}</span>
         <span class="meta"><span class="row1"><span class="name">${esc(item.name)}</span>${unread?'<span class="side-unread-dot" aria-hidden="true"></span>':''}<span class="time">${item.last?stamp(item.last.at):''}</span></span><span class="sub">${esc(item.last?(item.last.author==='user'?'You: ':'')+item.last.text:item.fallback||'Say hi')}</span>${externalParent?`<span class="side-parent-context">Subagent of ${esc(externalParent.name)}</span>`:''}</span>
       </button>`;
-    }).join('')}</div>
+    }).join('')}${children?`<div class="side-group-children">${children}</div>`:''}</div>
   </section>`;
 }
 function orchestratorRow(item,{ambiguous=false}={}){
@@ -334,8 +338,11 @@ function sidebarOrchestrator(rootItem,items,sections){
 function renderSide() {
   const d=S.data;syncSidebarSeen();
   const items=sidebarItems(),pending=d.approvals.length,scroll=$('.side-list')?.scrollTop||0,focused=document.activeElement,focusGroup=focused?.hasAttribute?.('data-display-group')?focused.getAttribute('data-display-group'):null,focusRoot=focused?.hasAttribute?.('data-orchestrator-toggle'),focusKey=focused?.dataset?.key||null,roots=items.filter(item=>item.rootCandidate);
-  const sections=[...DISPLAY_GROUPS,{id:'rooms',label:'Group chats'}].map(group=>sidebarGroup(group,items.filter(item=>item.group===group.id))).join('');
-  const ordering=sideQuery?'':d.sideOrder?'<button class="side-reset" data-act="side-recent">↺ Sort by recent activity</button>':items.length>1?'<div class="side-hint">Drag peers within a group to arrange them</div>':'';
+  const layout=sidebarLayout(),groupItems=id=>items.filter(item=>item.group===id||sidebarGroupAncestors(layout,item.group).includes(id));
+  const section=id=>{const group=SIDEBAR_GROUPS.find(group=>group.id===id),children=layout.groups.filter(child=>child.parent===id).map(child=>section(child.id)).join('');return sidebarGroup(group,items.filter(item=>item.group===id),children,groupItems(id));};
+  const renderedSections=layout.groups.filter(group=>group.parent===null).map(group=>section(group.id)).join('');
+  const sections=sideQuery&&!renderedSections?'':'<div class="side-group-root-drop" data-sidebar-root-drop>Move group to top level</div>'+renderedSections+(!sideQuery&&!items.some(item=>!item.rootCandidate)?'<div class="side-empty">No subordinate agents or group chats yet.</div>':'');
+  const ordering=sideQuery?'':(d.sideOrder?'<button class="side-reset" data-act="side-recent">↺ Sort agents by recent activity</button>':'')+'<div class="side-hint">Drag agents between groups. Drag headings to reorder; drop on a heading’s middle to nest.</div>';
   const grouped=sections?sections+ordering:sideQuery?'<div class="side-empty">No agents or group chats match</div>':`<div class="side-empty">No bots yet.<br><button class="link" data-act="market">Browse the Marketplace</button> or <button class="link" data-act="new-bot">make one</button>.</div>`;
   const sidebarBody=roots.length===1?sidebarOrchestrator(roots[0],items,sections+ordering):roots.length>1?`<section class="side-orchestrator-warning" role="note"><b>Orchestrator setup needs attention</b><p>${roots.length} agents use the Orchestrator profile. Choose the intended root in setup; no root has been selected automatically.</p>${roots.map(item=>orchestratorRow(item,{ambiguous:true})).join('')}</section>${grouped}`:grouped;
   $('#side').innerHTML = `
@@ -344,7 +351,7 @@ function renderSide() {
       <button class="icon-btn" data-act="new-menu" aria-label="New">${ICON.plus}</button>
     </div>
     <div class="side-list">
-      ${sidebarBody}
+      ${sidebarBody}<div class="sr" id="sidebar-move-status" role="status" aria-live="polite"></div>
     </div>
     ${sideQuery.length >= 2 ? `<div class="side-hits" id="side-hits"><div class="side-empty">Searching messages…</div></div>` : ''}
     <div class="side-foot"><button class="foot-item" data-act="team">${ICON.monitor}<span>Team overview</span></button>
@@ -361,101 +368,12 @@ function renderSide() {
 
 const _renderSide = renderSide;
 renderSide = function () {
-  if (drag?.started) return; // don't rebuild the list under your finger mid-drag
+  if (sidebarDrag?.active) return; // don't rebuild the list under your finger mid-drag
   _renderSide(); if (sideQuery.length >= 2) searchMessages(); // keep message hits after re-renders
 };
 
-// ---------- drag to reorder the sidebar ----------
-// Mouse: press and move. Touch: hold for a moment, then drag (a quick swipe still scrolls the list).
-// The order is saved on the server, so it's the same on every device.
-let drag = null; // { item, list, startY, grabDy, ty, started, timer, touch }
-let suppressClickUntil = 0;
-document.addEventListener('click', (e) => { if (Date.now() < suppressClickUntil) { e.stopPropagation(); e.preventDefault(); } }, true);
-function dragBegin(item, y, touch) {
-  if (sideQuery||item.classList.contains('fixed-root')) return; // root is fixed; filtered rows cannot be reordered
-  const list=item.closest('.side-group-members');if(!list||list.hidden)return;
-  drag = { item,list,scrollList:item.closest('.side-list'),startY:y,started:false,touch,parent:item.dataset.orderParent||'' };
-  if (touch) drag.timer = setTimeout(() => dragStart(y), 320);
-}
-function sidebarSubtree(item){const block=[item],depth=Number(item.dataset.depth)||0;for(let next=item.nextElementSibling;next?.classList.contains('side-item')&&Number(next.dataset.depth)>depth;next=next.nextElementSibling)block.push(next);return block;}
-function dragStart(y) {
-  if (!drag) return;
-  drag.started = true;
-  const r = drag.item.getBoundingClientRect();
-  drag.grabDy = y - r.top;
-  drag.block=sidebarSubtree(drag.item);
-  drag.item.classList.add('dragging');
-  for(const child of drag.block.slice(1))child.classList.add('drag-follow');
-  document.body.classList.add('reordering');
-  buzz(12);
-}
-function dragMove(y) {
-  if (!drag) return;
-  if (!drag.started) {
-    if (Math.abs(y - drag.startY) < 6) return;
-    if (drag.touch) { clearTimeout(drag.timer); drag = null; return; } // moved before the hold: it's a scroll
-    dragStart(drag.startY);
-  }
-  const { item,list,block,parent }=drag;
-  const bounds=list.getBoundingClientRect(),blockHeight=block.at(-1).offsetTop+block.at(-1).offsetHeight-item.offsetTop,minPointer=bounds.top+drag.grabDy,maxPointer=Math.max(minPointer,bounds.bottom-blockHeight+drag.grabDy);y=Math.max(minPointer,Math.min(maxPointer,y));
-  // Follow the pointer, then swap with a neighbour once the pointer passes its middle.
-  // Only actual peers may trade places. A parent and all its displayed children
-  // move together; display headers never become delegation parents.
-  const siblings=[...list.children].filter(el=>el.classList.contains('side-item')&&!block.includes(el)&&(el.dataset.orderParent||'')===parent);
-  const target = siblings.find((el) => { const r = el.getBoundingClientRect(); return y < r.top + r.height / 2; });
-  const before=[...list.children].filter(el=>el.classList.contains('side-item')&&!block.includes(el)).map(el=>[el,el.getBoundingClientRect().top]);
-  const peers=[...list.children].filter(el=>el.classList.contains('side-item')&&(el.dataset.orderParent||'')===parent),next=peers[peers.indexOf(item)+1]||null;
-  if ((target || null) !== next) {
-    const anchor=target||(siblings.length?sidebarSubtree(siblings.at(-1)).at(-1).nextSibling:null);
-    if(!block.includes(anchor))for(const row of block)list.insertBefore(row,anchor);
-    // Slide the others into their new places (FLIP).
-    for (const [el, top] of before) {
-      const dy = top - el.getBoundingClientRect().top;
-      if (dy) el.animate([{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { duration: 160, easing: 'cubic-bezier(.22,1,.36,1)' });
-    }
-  }
-  const natural = item.getBoundingClientRect().top - (drag.ty || 0); // where it sits without the offset
-  drag.ty = y - drag.grabDy - natural;
-  for(const row of block)row.style.transform=`translateY(${drag.ty}px) scale(1.03)`;
-  // Scroll the list when dragging near its edges.
-  const scroller=drag.scrollList||list,lr=scroller.getBoundingClientRect();
-  if(y<lr.top+40)scroller.scrollTop-=8;else if(y>lr.bottom-40)scroller.scrollTop+=8;
-}
-async function dragEnd() {
-  if (!drag) return;
-  clearTimeout(drag.timer);
-  const was = drag; drag = null;
-  if (!was.started) return;
-  for(const row of was.block||[was.item]){row.classList.remove('dragging','drag-follow');row.style.transform='';}
-  document.body.classList.remove('reordering');
-  suppressClickUntil = Date.now() + 400; // the click that follows a drag shouldn't open the chat
-  const visibleOrder=[...was.list.children].filter(el=>el.classList.contains('side-item')).map(el=>el.dataset.key),reordered=new Set(visibleOrder);
-  // Merge the changed group's slots into the complete order. Collapsed groups,
-  // hidden rooms, and entries arriving during a drag retain their positions.
-  const currentKeys=sidebarItems().map(item=>item.key),fullOrder=[...new Set([...currentKeys,...(Array.isArray(S.data.sideOrder)?S.data.sideOrder:[])])];let index=0;
-  const order=fullOrder.map(key=>reordered.has(key)?visibleOrder[index++]:key);
-  for(const key of visibleOrder)if(!order.includes(key))order.push(key);
-  S.data.sideOrder = order;
-  renderSide();
-  try { await api('/api/side-order', { method: 'PUT', body: { order } }); } catch (err) { toast(err.message); }
-}
-document.addEventListener('pointerdown', (e) => {
-  if (e.pointerType !== 'mouse' || e.button !== 0) return;
-  const item = e.target.closest('.side-list .side-item'); if (item) dragBegin(item, e.clientY, false);
-});
-document.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse' && drag) { dragMove(e.clientY); if (drag?.started) e.preventDefault(); } });
-document.addEventListener('pointerup', (e) => { if (e.pointerType === 'mouse') dragEnd(); });
-document.addEventListener('touchstart', (e) => {
-  const item = e.target.closest('.side-list .side-item'); if (item && e.touches.length === 1) dragBegin(item, e.touches[0].clientY, true);
-}, { passive: true });
-document.addEventListener('touchmove', (e) => {
-  if (!drag) return;
-  dragMove(e.touches[0].clientY);
-  if (drag?.started) e.preventDefault(); // holding a chat: move it instead of scrolling
-}, { passive: false });
-document.addEventListener('touchend', dragEnd);
-document.addEventListener('touchcancel', dragEnd);
-document.addEventListener('contextmenu', (e) => { if (drag?.touch) e.preventDefault(); }); // no long-press menu while holding
+// ---------- sidebar display moves ----------
+sidebarDrag=installSidebarDrag({state:()=>S.data,items:sidebarItems,filtered:()=>!!sideQuery,api,toast,buzz,refresh:refreshState,render:()=>renderSide(),reveal:revealDisplayGroup});
 
 // ---------- activity drawer ----------
 function renderAside() {
@@ -907,7 +825,7 @@ async function openThread(key) {
   const prev = threadKey();
   if (prev) sessionDraft.set(prev, $('#msg')?.value || '');
   S.current = { type, id: Number(id) };
-  sidebarPreferences();sideQuery='';const target=type==='bot'?bot(id):null;if(target?.template!=='orchestrator'){revealedOrchestratorBranch=true;revealedDisplayGroups.add(type==='room'?'rooms':displayGroup(target||{}));}syncSidebarSeen();
+  sidebarPreferences();sideQuery='';const target=type==='bot'?bot(id):null;if(target?.template!=='orchestrator')revealDisplayGroup(type==='room'?'rooms':displayGroup(target||{}));syncSidebarSeen();
   history.replaceState(null, '', '#' + key);
   S.loadingThread = true; S.messages = [];
   $('#side').classList.remove('open'); $('#aside').classList.remove('open');

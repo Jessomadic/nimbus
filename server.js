@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, q, parseBot, botDir, writeBotBrief, DATA_DIR, getSetting, setSetting } from './db.js';
 import {defaultDisplayGroup,validateDisplayGroup} from './public/agent-groups.js';
+import {normalizeSidebarLayout,moveSidebarGroup,normalizeSidebarOrder,moveSidebarKeys} from './public/sidebar-layout.js';
 import https from 'node:https';
 import os from 'node:os';
 import { redact, encodeRedacted } from './redact.js';
@@ -110,7 +111,7 @@ function state(req) {
   for (const b of bots) b.plugins = botPlugins[b.id] || [];
   const installed = q('SELECT id FROM plugins').all().map((r) => r.id);
   const sideOrder = JSON.parse(getSetting('side_order') || 'null'); // custom sidebar order, or null = most recent first
-  return { sideOrder, bots, rooms, approvals, routines, upNext, learned, last, installed, user: req?.user || null, computers: false, toolCatalog:coreTools.filter(tool=>tool.function.name!=='worker_result').map(tool=>({name:tool.function.name,description:tool.function.description})),queues: runtimeQueues(), usage: { windowCost, budget: WINDOW_BUDGET, running, byBot } };
+  return { sideOrder, sidebarLayout:readSidebarLayout(), bots, rooms, approvals, routines, upNext, learned, last, installed, user: req?.user || null, computers: false, toolCatalog:coreTools.filter(tool=>tool.function.name!=='worker_result').map(tool=>({name:tool.function.name,description:tool.function.description})),queues: runtimeQueues(), usage: { windowCost, budget: WINDOW_BUDGET, running, byBot } };
 }
 
 function postToThread(thread, text, files = []) {
@@ -483,6 +484,42 @@ route('POST', '/api/messages/:id/redact', async (req, res, p) => {
 });
 
 // Sidebar order the user arranged by dragging (shared by all their devices). null = sort by recent activity.
+function readSidebarLayout(){try{return normalizeSidebarLayout(JSON.parse(getSetting('sidebar_layout')||'null'));}catch{return normalizeSidebarLayout(null);}}
+route('POST','/api/sidebar/move',async(req,res)=>{
+  const input=await body(req);
+  try{
+    if(input.kind==='group'){
+      const current=readSidebarLayout(),group=current.groups.find(group=>group.id===input.id);
+      if(!group)throw new Error('Sidebar group not found');
+      if(Object.hasOwn(input,'expectedParent')&&input.expectedParent!==group.parent)return json(res,409,{error:'The group moved on another device; refresh and try again'});
+      const layout=moveSidebarGroup(current,{id:input.id,parent:input.parent,before:input.before});
+      setSetting('sidebar_layout',JSON.stringify(layout));broadcast('state_changed',{});return json(res,200,{sidebarLayout:layout});
+    }
+    if(input.kind!=='agents')throw new Error('Choose a group or agents to move');
+    const ids=input.ids;
+    if(!Array.isArray(ids)||!ids.length||ids.length>100||ids.some(id=>!Number.isSafeInteger(id)||id<1)||new Set(ids).size!==ids.length)throw new Error('Choose valid, unique agent IDs');
+    const destination=validateDisplayGroup(input.group),rows=q(`SELECT id,template,display_group FROM bots WHERE id IN (${ids.map(()=>'?').join(',')})`).all(...ids);
+    if(rows.length!==ids.length)throw new Error('An agent was removed; refresh and try again');
+    if(rows.some(row=>row.template==='orchestrator'))throw new Error('The root Orchestrator stays above the display groups');
+    if(Object.hasOwn(input,'expectedGroup')){
+      validateDisplayGroup(input.expectedGroup);
+      if(rows.some(row=>row.display_group!==input.expectedGroup))return json(res,409,{error:'An agent moved on another device; refresh and try again'});
+    }
+    const before=input.before??null,moving=ids.map(id=>'bot:'+id);
+    if(before!==null){
+      if(typeof before!=='string'||!/^bot:[1-9]\d*$/.test(before)||moving.includes(before))throw new Error('Choose another agent as the insertion point');
+      const anchor=q('SELECT display_group,template FROM bots WHERE id=?').get(Number(before.slice(4)));
+      if(!anchor||anchor.display_group!==destination||anchor.template==='orchestrator')throw new Error('The insertion point is no longer in that group');
+    }
+    const known=[...q('SELECT id FROM bots ORDER BY id').all().map(row=>'bot:'+row.id),...q('SELECT id FROM rooms ORDER BY id').all().map(row=>'room:'+row.id)];
+    const allowed=new Set(known),stored=normalizeSidebarOrder(JSON.parse(getSetting('side_order')||'null'));
+    const order=moveSidebarKeys([...new Set([...normalizeSidebarOrder(input.order),...stored,...known])].filter(key=>allowed.has(key)),moving,before);
+    db.exec('SAVEPOINT sidebar_move');
+    try{const update=q('UPDATE bots SET display_group=? WHERE id=?');for(const id of ids)update.run(destination,id);setSetting('side_order',JSON.stringify(order));db.exec('RELEASE sidebar_move');}
+    catch(error){db.exec('ROLLBACK TO sidebar_move');db.exec('RELEASE sidebar_move');throw error;}
+    broadcast('state_changed',{});return json(res,200,{bots:rows.map(row=>({id:row.id,display_group:destination})),sideOrder:order});
+  }catch(error){return json(res,400,{error:error.message});}
+});
 route('PUT', '/api/side-order', async (req, res) => {
   const { order } = await body(req);
   setSetting('side_order', Array.isArray(order) ? JSON.stringify(order.filter((k) => /^(bot|room):\d+$/.test(k)).slice(0, 500)) : '');
