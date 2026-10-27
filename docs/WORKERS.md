@@ -38,6 +38,16 @@ The coordinator delegates using `ask_worker`, retains each task ID, and collects
 
 Incoming API, Hermes and Lumos jobs likewise use their own supplied context and checkpoints. A new request does not import an earlier request's completed assignments as its checkpoint, and it does not replace an agent's human conversation. Ordinary human chat retains its conversational continuity. Integration callers keep the accepted request/run IDs for status, idempotent retrieval and explicit checkpoint resume.
 
+## Sidebar organization
+
+Display groups organize navigation independently of the worker delegation graph. Drag an agent onto another group's heading or between its agents to move it. A displayed parent moves with its visible subagents, while children displayed elsewhere stay in their existing groups. The move changes only display placement and sidebar order; parent links, tools, instructions, private notes, task evidence and conversations are retained. A single agent can also move through **Settings → Display group**.
+
+Drag a group heading near the top or bottom edge of another heading to reorder it among those siblings. Drop in the middle of a heading to nest the group, including its existing subgroups. The **Move group to top level** target appears during group dragging. Empty groups are also shown as drop targets while dragging. Cycles and moving the root Orchestrator are rejected. Group chats are displayable/reorderable as a category; moving an agent into that category does not change chat membership and is refused.
+
+Mouse users can press and drag. Touch users hold briefly before dragging; an immediate swipe continues to scroll. Group headings support **Alt + Up/Down** for sibling order, **Alt + Right** to nest beneath the previous sibling, and **Alt + Left** to move out one level. Escape and touch cancellation discard a move. Search results cannot be dragged.
+
+Group order and nesting are persisted through the authenticated sidebar API in the `sidebar_layout` setting. Agent moves update display metadata and `side_order` in one SQLite transaction; stale group/agent origins are rejected, and a failed multi-agent update rolls back entirely. Collapse preferences remain browser-local. Badges on collapsed parent groups aggregate nested activity, approvals and unread threads.
+
 ## Tool budgets and recovery
 
 `workers.maxSteps` bounds action calls in each continuation. Collection/status tools (`worker_result`, `tool_request_status`) use a separate finite attempt allowance instead of consuming action slots; disabled-tool requests and cached calls remain attempt-bounded. The model receives a remaining-budget notice near exhaustion. A held call records its name and non-execution in `tool.budget_exhausted`; the host does not start it. Parent collection releases model/worker capacity and waits up to one minute per call.

@@ -14,6 +14,14 @@ The live model, public-network and deployment records below are historical evide
 
 ## Results
 
+### Cross-group dragging and nested sidebar groups
+
+The focused sidebar suite passed **28/28 checks**. Real Chromium browser fixtures exercised mouse moves between collapsed and empty groups, parent/subagent display moves, heading reorder/nesting/unnesting, cycle refusal, keyboard shortcuts, persisted layout in another browser session, and a long-press touch move in a 390 × 844 viewport. Nested parent headings retained approval indicators, filtered rows could not be dragged, and cancelled or invalid drops performed no write.
+
+Real isolated HTTP/SQLite fixtures verified stale-origin rejection, root/room restrictions, anonymous denial and rollback of a partially attempted multi-agent update. Source/permissions, delegation edges, standing briefs, private history and retained task evidence were compared before and after the moves. The browser tests use synthetic workers and do not rearrange the owner's live team. Local evidence is retained in `.dev/sidebar-focused-tests.txt` and `.dev/sidebar-verification/nested-groups-desktop.png`.
+
+Deployment uses the normal source snapshot, exact-source validation and supervised restart receipt under `data/updates/`.
+
 ### Public access security hardening
 
 The hardened server was deployed through the existing Windows supervisor without interrupting active work (none was running). The existing dashboard password was retained; old 90-day sessions were revoked once. The complete suite passed **130/130 tests**, including **19 session/rate-limit/stream tests** and **9 isolated real-HTTP security tests**. The HTTP fixtures exercised concurrent delayed-body guesses, shared/account-mode separation, forwarded admin rejection, safe upload downloads, credential revocation and MFA mutation races. `npm audit` reported zero known vulnerabilities, including development dependencies.
