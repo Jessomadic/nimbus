@@ -1,0 +1,38 @@
+/* Keep Nimbus tokens, hierarchy and desktop density; adapt the device shell. */
+.app { height: var(--app-height, 100dvh); position: relative; top: var(--app-top, 0px);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left); }
+.main, .thread, .side-list { min-height: 0; }
+.scrim { top: var(--app-top, 0px); bottom: auto; height: var(--app-height, 100dvh); }
+/* Reserve an action row so identity is not squeezed at 320px. */
+@media (max-width: 360px) {
+  .head { flex-wrap: wrap; padding-top: 4px; padding-bottom: 4px; }
+  .head .title { flex: 1 1 calc(100% - 60px); }
+  .head .actions { margin-left: auto; }
+}
+.composer { padding-bottom: max(18px, env(safe-area-inset-bottom)); }
+.composer textarea { min-width: 0; }
+.side-foot { padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+.aside { top: var(--app-top, 0px); bottom: auto; height: var(--app-height, 100dvh);
+  padding-top: env(safe-area-inset-top); padding-right: max(16px, env(safe-area-inset-right));
+  padding-bottom: max(20px, env(safe-area-inset-bottom)); }
+.mobile-backdrop[hidden] { display: none; }
+.mobile-backdrop { position: fixed; inset: 0; z-index: 39; background: rgb(0 0 0 / .5); }
+body:has([data-nimbus-login]) { height: auto; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+@media (max-width: 760px), (max-width: 960px) and (max-height: 500px) and (orientation: landscape) {
+  .side { top: var(--app-top, 0px); bottom: auto; height: var(--app-height, 100dvh);
+    padding-top: env(safe-area-inset-top); padding-left: env(safe-area-inset-left); }
+  .composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+  .composer textarea, .field input, .field select, .field textarea, input, select, textarea { font-size: 16px; }
+  .head .icon-btn, .composer .plus, .composer .send { min-width: 44px; min-height: 44px; }
+  .head .actions { gap: 0; }
+  .head { min-height: 52px; height: auto; }
+  .modal { max-height: calc(var(--app-height, 100dvh) - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+}
+@media (pointer: coarse) {
+  input, select, textarea, .composer textarea { font-size: 16px; }
+}
+@media (max-height: 600px) {
+  body:has([data-nimbus-login]) { place-items: start center; }
+  [data-nimbus-login] > img { width: 80px !important; height: 80px !important; }
+}
+@media (prefers-reduced-motion: reduce) { .side, .aside { transition: none; } }
