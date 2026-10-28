@@ -19,11 +19,12 @@ test('cross-process lease protects live validation and recovers killed validator
  const citations={validate:async()=>{},prepare:async()=>{throw Error('fixture stops before links');}};
  const s=createPublicationService({db,documents,adapter,citations}),i=input(s,d,[{record_id:'target',fingerprint:'b'.repeat(64),quote:'Exact target evidence'}]);s.publish(d.id,i,'alice');
  const source=`import {DatabaseSync} from 'node:sqlite';import {createDocumentStore} from './runtime/documents.js';import {createPublicationService} from './runtime/document-publications.js';const db=new DatabaseSync(process.argv[1]);const s=createPublicationService({db,documents:createDocumentStore(db),adapter:{},citations:{validate:()=>new Promise(()=>{})}});s.run(process.argv[2],process.argv[3],'alice');setInterval(()=>{},1000);`;
- const child=spawn(process.execPath,['--no-warnings','--input-type=module','-e',source,file,d.id,i.requestId],{cwd:process.cwd(),windowsHide:true,stdio:'ignore'});
+ const child=spawn(process.execPath,['--no-warnings','--input-type=module','-e',source,file,d.id,i.requestId],{cwd:new URL('..',import.meta.url),windowsHide:true,stdio:['ignore','ignore','pipe']});
+ let childError='';child.stderr.setEncoding('utf8');child.stderr.on('data',chunk=>{childError=(childError+chunk).slice(-8000);});
  const closed=new Promise(r=>child.on('exit',r));
  t.after(async()=>{child.kill();await closed;db.close();fs.rmSync(dir,{recursive:true,force:true});});
  for(let n=0;n<100&&s.read(d.id,i.requestId,'alice').state!=='validating';n++)await new Promise(r=>setTimeout(r,20));
- assert.equal(s.read(d.id,i.requestId,'alice').state,'validating');
+ assert.equal(s.read(d.id,i.requestId,'alice').state,'validating',`validator exit=${child.exitCode}: ${childError}`);
  await s.reconcile(d.id,i.requestId,'alice');assert.equal(calls,0);
  child.kill();await closed;
  assert.equal((await s.reconcile(d.id,i.requestId,'alice')).state,'indexed_links_pending');assert.equal(calls,1);
