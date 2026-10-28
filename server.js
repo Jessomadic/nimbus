@@ -136,6 +136,19 @@ function postToThread(thread, text, files = []) {
 const routes = [];
 const route = (method, pattern, fn) => routes.push({ method, re: new RegExp('^' + pattern.replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$'), fn });
 registerRuntimeRoutes({route,body,json});
+const {registerDocumentRoutes}=await import('./runtime/documents.js');
+const {workspaceDownload}=await import('./runtime/download-path.js');
+registerDocumentRoutes({route,body,json,db});
+route('GET','/api/bots/:id/download',(req,res,p,url)=>{
+  if(!/^\d+$/.test(p.id)||!q('SELECT id FROM bots WHERE id=?').get(p.id))return json(res,404,{error:'not found'});
+  const file=workspaceDownload(botDir(Number(p.id)),url.searchParams.get('path')||'');
+  if(!file)return json(res,404,{error:'not found'});
+  const name=path.basename(file).replace(/[\x00-\x1f\x7f]/g,'')||'download';
+  res.writeHead(200,{'content-type':'application/octet-stream','content-length':fs.statSync(file).size,
+    'content-disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(name),
+    'cache-control':'no-store','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; sandbox"});
+  const stream=fs.createReadStream(file);stream.on('error',()=>res.destroy());stream.pipe(res);
+});
 route('GET','/health',(req,res)=>json(res,200,directLocal(req)?{ok:true,version:'0.2.0',pid:process.pid,startedAt,sourceHash:bootSourceHash,lumosConnected:false}:{ok:true}));
 route('GET','/api/updates',(req,res,p,url)=>json(res,200,maintenance.status(url.searchParams.get('snapshotId')||undefined)));
 route('GET','/api/capabilities',(req,res)=>json(res,200,{fullCodexParity:false,capabilities,roleTools:roleToolCoverage(TEMPLATES),tools:coreTools.map(t=>({name:t.function.name,description:t.function.description}))}));

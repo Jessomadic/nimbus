@@ -1,5 +1,7 @@
 // Nimbus web app. Plain JS, no build step.
 import { createRuntimeUI } from './runtime.js';
+import {installDownloads} from './downloads.js';
+installDownloads({report:message=>toast(message)});
 import {hierarchyRows} from './team-tree.js';
 import {DISPLAY_GROUPS,defaultDisplayGroup} from './agent-groups.js';
 import {SIDEBAR_GROUPS,normalizeSidebarLayout,sidebarGroupAncestors} from './sidebar-layout.js';
@@ -229,6 +231,7 @@ function md(src) {
     if (i % 2) return `<pre><code>${esc(part.replace(/^\w*\n/, ''))}</code></pre>`;
     return part.trim().split(/\n{2,}/).map((para) => {
       let h = esc(para)
+        .replace(/\[([^\]]+)\]\((\/api\/(?:bots\/\d+\/download|documents\/[a-f0-9-]+\/export)(?:\?[^\s"'<>)]*)?)\)/g, '<a href="$2" download>$1</a>')
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
         .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
@@ -531,7 +534,7 @@ function renderFiles(m) {
   if (!files.length) return '';
   return `<div class="files">${files.map((f) => isImage(f)
     ? `<a class="file-img" href="${fileUrl(f)}" target="_blank" rel="noopener"><img src="${fileUrl(f)}" alt="${esc(f.name)}" loading="lazy"></a>`
-    : `<a class="file-chip" href="${fileUrl(f)}" target="_blank" rel="noopener">${ICON.clip}<span>${esc(f.name)}</span><small>${fmtSize(f.size)}</small></a>`).join('')}</div>`;
+    : `<a class="file-chip" href="${fileUrl(f)}" download="${esc(f.name)}">${ICON.clip}<span>${esc(f.name)}</span><small>${fmtSize(f.size)}</small></a>`).join('')}</div>`;
 }
 function fmtSize(n) { return n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB'; }
 
