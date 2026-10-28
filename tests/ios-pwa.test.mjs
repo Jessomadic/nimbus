@@ -32,10 +32,17 @@ test('isolated PWA shell: phone, landscape, keyboard geometry, navigation and de
       await page.setViewportSize({width,height});
       await page.goto('http://nimbus.test/#bot:1');
       await page.waitForSelector('#msg');
+      // Wait for the shell's resize signal, not for composer visibility to pass.
+      await page.waitForFunction(()=>parseFloat(document.documentElement.style.getPropertyValue('--app-height'))===visualViewport.height);
       assert.deepEqual(errors,[]);
       assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth), 'document overflow');
       const box=await page.locator('.composer').boundingBox();
-      assert.ok(box.y+box.height<=height+1,'composer visible');
+      const geometry=await page.evaluate(()=>({viewport:{width:innerWidth,height:innerHeight,visualHeight:visualViewport.height,top:visualViewport.offsetTop},appHeight:getComputedStyle(document.documentElement).getPropertyValue('--app-height'),ready:document.readyState,styles:[...document.styleSheets].map(s=>s.href)}));
+      console.log('PWA geometry',JSON.stringify({width,height,box,...geometry}));
+      if(artifacts) await page.screenshot({path:artifacts+'/'+width+'x'+height+'-geometry.png'});
+      assert.ok(box.y+box.height<=height+1,'composer visible '+JSON.stringify({width,height,box,...geometry}));
+      assert.ok(box.y>=0 && Math.abs(box.y+box.height-height)<=1,'composer anchored to current viewport');
+      assert.equal(Math.round((await page.locator('.app').boundingBox()).height),height,'shell fits current viewport');
       const mobile = width<=760 || (width<=960 && height<=500 && width>height);
       assert.equal(await page.locator('#msg').evaluate(el=>parseFloat(getComputedStyle(el).fontSize)),mobile?16:14);
       if(width===320) {
@@ -67,6 +74,9 @@ test('isolated PWA shell: phone, landscape, keyboard geometry, navigation and de
       Object.defineProperty(visualViewport,'height',{configurable:true,value:400});
       visualViewport.dispatchEvent(new Event('resize'));
     });
+    await page.waitForFunction(()=>document.documentElement.style.getPropertyValue('--app-height')==='400px');
+    if(artifacts) await page.screenshot({path:artifacts+'/keyboard-390x400.png'});
+    console.log('PWA keyboard geometry',JSON.stringify(await page.locator('.composer').boundingBox()));
     assert.equal(Math.round((await page.locator('.app').boundingBox()).height),400);
     assert.ok(await page.locator('.composer').evaluate(el=>el.getBoundingClientRect().bottom<=401));
     await page.goto('http://nimbus.test/login.html');
