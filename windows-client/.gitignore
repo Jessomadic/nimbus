@@ -1,0 +1,11 @@
+# Local builds, SDK dependencies and installer artifacts
+/dist/
+/bin/
+/obj/
+/node_modules/
+*.exe
+*.dll
+*.pdb
+*.msi
+*.msix
+*.zip
