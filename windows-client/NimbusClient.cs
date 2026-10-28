@@ -27,7 +27,14 @@ internal sealed class Client : Window {
     readonly TextBlock status = new TextBlock { Text = "Select the existing Nimbus backend. No server is started.", Margin = new Thickness(8) };
     readonly WebView2 view = new WebView2();
     Uri origin;
-    readonly string state = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NimbusWindows");
+    internal const string RuntimeHelp = "Microsoft Edge WebView2 Runtime is missing. Install the Evergreen Runtime from Microsoft's official page in your browser, then reopen Nimbus:\nhttps://developer.microsoft.com/en-us/microsoft-edge/webview2/\nNimbus will not download or install it automatically.";
+    readonly string state = StatePath();
+    static string StatePath() {
+        string fixture = Environment.GetEnvironmentVariable("NIMBUS_TEST_ROOT");
+        if (String.IsNullOrEmpty(fixture)) return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NimbusWindows");
+        if (!Path.IsPathRooted(fixture) || !File.Exists(Path.Combine(fixture, ".nimbus-test-fixture"))) throw new InvalidOperationException("Invalid test fixture root.");
+        return Path.Combine(fixture, "NimbusWindows");
+    }
     internal Client() {
         Title = "Nimbus"; Width = 1180; Height = 820; MinWidth = 650; MinHeight = 450;
         var panel = new DockPanel(); var bar = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8) };
@@ -44,6 +51,7 @@ internal sealed class Client : Window {
             connect.IsEnabled = false;
             try {
                 if (view.CoreWebView2 == null) {
+                    CoreWebView2Environment.GetAvailableBrowserVersionString();
                     origin = selected;
                     var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(state, "WebView2"));
                     await view.EnsureCoreWebView2Async(env);
@@ -64,6 +72,9 @@ internal sealed class Client : Window {
                 }
                 Directory.CreateDirectory(state); File.WriteAllText(Path.Combine(state, "backend-url.txt"), selected.AbsoluteUri);
                 view.CoreWebView2.Navigate(selected.AbsoluteUri);
+            } catch (WebView2RuntimeNotFoundException) {
+                status.Text = "WebView2 Runtime missing. See the installation guidance dialog.";
+                MessageBox.Show(this, RuntimeHelp, "Nimbus - WebView2 Runtime required", MessageBoxButton.OK, MessageBoxImage.Information);
             } catch (Exception ex) { status.Text = "WebView2 unavailable: " + ex.Message; }
             finally { connect.IsEnabled = true; }
         };
@@ -77,6 +88,7 @@ internal sealed class Client : Window {
             foreach (var s in no) if (UrlPolicy.Try(s, out u)) return 2;
             u = new Uri(yes[0]);
             if (!UrlPolicy.SameOrigin(u, yes[0] + "/login") || UrlPolicy.SameOrigin(u, "https://evil.test") || UrlPolicy.SameOrigin(u, "https://nimbus.jessecopas.com:444")) return 3;
+            if (!RuntimeHelp.Contains("https://developer.microsoft.com/en-us/microsoft-edge/webview2/") || !RuntimeHelp.Contains("Evergreen") || !RuntimeHelp.Contains("not download or install")) return 4;
             return 0;
         }
         new Application().Run(new Client()); return 0;

@@ -25,8 +25,8 @@ TargetName=$out\NimbusSetup.exe
 FriendlyName=Nimbus Windows Client
 AppLaunched=powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1
 PostInstallCmd=<None>
-AdminQuietInstCmd=
-UserQuietInstCmd=
+AdminQuietInstCmd=powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1
+UserQuietInstCmd=powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1
 SourceFiles=SourceFiles
 [Strings]
 $($strings -join "`r`n")
