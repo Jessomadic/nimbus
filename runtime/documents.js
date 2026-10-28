@@ -1,5 +1,6 @@
 // Safe API-only subset of upstream 9ea4785; no application DB import or provider hooks.
 import {randomUUID,createHash} from 'node:crypto';
+import {registerPublicationRoutes} from './document-publications.js';
 export class DocumentError extends Error {
   constructor(code,message){super(message);this.code=code;this.statusCode=({not_found:404,guard_mismatch:409,unavailable:503})[code]||400;}
 }
@@ -73,8 +74,9 @@ export function createDocumentStore(db){
 }
 // server.js checks authentication, HTTPS and same origin before dispatching these routes.
 // Deliberately no /api/hook endpoints, agent calls or permission bypasses.
-export function registerDocumentRoutes({route,body,json,db}){
+export function registerDocumentRoutes({route,body,json,db,publicationAdapter=null,publicationCitations=null}){
   const store=createDocumentStore(db),owner=req=>req.user?.email ? 'email:'+req.user.email.trim().toLowerCase() : req.user?.username ? 'username:'+req.user.username : 'local-admin';
+  registerPublicationRoutes({route,body,json,db,documents:store,owner,adapter:publicationAdapter,citations:publicationCitations});
   route('POST','/api/documents',async(req,res)=>json(res,200,store.create(await body(req),owner(req))));
   route('GET','/api/documents/:id',(req,res,p)=>json(res,200,store.get(p.id,owner(req))));
   route('POST','/api/documents/:id/ops',async(req,res,p)=>json(res,200,store.apply(p.id,await body(req),owner(req))));

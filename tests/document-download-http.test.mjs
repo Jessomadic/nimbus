@@ -37,6 +37,13 @@ test('real server documents and workspace downloads: authentication, isolation, 
  assert.equal((await request('/api/documents',{method:'POST',body:{}})).status,401);
  const created=await request('/api/documents',{method:'POST',cookie:alice,body:{title:'CON\r\n/Report',markdown:'original'}});
  assert.equal(created.status,200,created.text);const d=created.json,base='/api/documents/'+d.id;
+ assert.equal((await request(base+'/publication-preview')).status,401);
+ assert.equal((await request(base+'/publication-preview',{cookie:bob})).status,404);
+ assert.equal((await request(base+'/publish',{method:'POST',body:{}})).status,401);
+ assert.equal((await request(base+'/publish',{method:'POST',cookie:bob,body:{}})).status,404);
+ const preview=await request(base+'/publication-preview',{cookie:alice});assert.equal(preview.status,200);assert.equal(preview.json.enabled,false);
+ assert.equal((await request(base+'/publish',{method:'POST',cookie:alice,body:{requestId:'123e4567-e89b-42d3-a456-426614174000',ifRev:1,expectedPublishedRev:null,sha256:preview.json.sha256,audience:preview.json.audience,citations:[]}})).status,503);
+ assert.equal((await request(base+'/publications/123e4567-e89b-42d3-a456-426614174000',{cookie:bob})).status,404);
  for(const route of [base,base+'/versions',base+'/export'])assert.equal((await request(route,{cookie:bob})).status,404);
  assert.equal((await request(base+'/ops',{method:'POST',cookie:bob,body:{ifRev:1,ops:[]}})).status,404);
  const b=d.blocks[0],op={op:'replace',id:b.id,ifHash:b.hash,markdown:'updated'};
