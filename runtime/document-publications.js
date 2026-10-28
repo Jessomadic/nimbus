@@ -115,7 +115,7 @@ export function createPublicationService({db,documents,adapter=null,citations=nu
        link.relationship!=='explicitly cites'||link.confidence!==1||
        typeof link.explanation!=='string'||link.explanation.length<12||link.explanation.length>2000||
        !evidence(link.source_evidence)||!evidence(link.target_evidence)||
-       link.target_evidence.quote!==c.quote||link.target_evidence.locator!==c.locator)throw Error('Invalid semantic link plan');
+       link.target_evidence.quote!==c.quote||(link.target_evidence.locator??'')!==(c.locator??''))throw Error('Invalid semantic link plan');
     });
     p.links=links.map(payload=>({payload,requestId:'np-'+sha(p.requestId+canonical(payload)),state:'prepared'}));save(p);
    }
