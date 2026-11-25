@@ -12,6 +12,7 @@ const sha=f=>createHash('sha256').update(fs.readFileSync(f)).digest('hex');
 
 test('Lumos import copies a consistent generation, renders the persona, maps schedules and leaves Hermes unchanged',()=>{
   const base=fs.mkdtempSync(path.join(os.tmpdir(),'lumos-import-')),home=path.join(base,'HermesPilot','home'),data=path.join(base,'nimbus-data');
+  fs.mkdirSync(path.join(base,'HermesPilot','integrations','knowledge_tools'),{recursive:true});
   for(const d of ['memories','cron','scripts','skills/productivity/demo','data/weather_runs'])fs.mkdirSync(path.join(home,d),{recursive:true});
   fs.writeFileSync(path.join(home,'SOUL.md'),'You are Hermes Agent, built by Nous Research. Be direct.\n\nAccuracy matters.');
   fs.writeFileSync(path.join(base,'HermesPilot','AGENTS.md'),'# Lumos integration contract\n\nGemma, Luna routing details.\n\nOwner execution policy (2026-09-30): approvals off.\n\nKeep OpenBubbles/Apple activation unchanged. Test messages only to the owner.');
@@ -38,4 +39,9 @@ test('Lumos import copies a consistent generation, renders the persona, maps sch
   const manifest=JSON.parse(fs.readFileSync(path.join(gen,'manifest.json'),'utf8'));
   assert.ok(manifest.files.every(f=>f.kind==='sqlite'||f.sourceSha256===f.copySha256));
   assert.equal(sha(path.join(home,'memories','MEMORY.md')),before,'Hermes original unchanged');
+  // Skill scripts resolve <home root>/integrations like HermesPilot/integrations.
+  assert.ok(fs.existsSync(path.join(data,'lumos','home','integrations','knowledge_tools')),'integrations link');
+  const review=JSON.parse(fs.readFileSync(path.join(gen,'skills-review.json'),'utf8'));
+  assert.equal(review.skills.length,80);assert.ok(review.toolMap.image_generate);
+  assert.match(persona,/design_render/);assert.match(persona,/Never call python3/);
 });

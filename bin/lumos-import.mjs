@@ -11,6 +11,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {DatabaseSync,backup} from 'node:sqlite';
 import {DATA_DIR} from '../runtime/data-dir.js';
+import {fileURLToPath} from 'node:url';
 
 const argv=process.argv.slice(2),opt=f=>{const i=argv.indexOf(f);return i>=0?argv[i+1]:null;};
 const hermes=path.resolve(opt('--hermes-home')||'F:/Projects/Lumos/HermesPilot/home');
@@ -27,11 +28,6 @@ const TREES=['skills','scripts','data/weather_runs'];
 const EXTRA=['data/tracker_feedback.json'];
 
 function walk(dir){const out=[];if(!fs.existsSync(dir))return out;for(const e of fs.readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,e.name);if(e.isSymbolicLink())continue;if(e.isDirectory()){if(['__pycache__','.hub'].includes(e.name))continue;out.push(...walk(p));}else if(e.isFile())out.push(p);}return out;}
-const plan=[];
-for(const rel of [...FILES,...EXTRA])if(fs.existsSync(path.join(hermes,rel)))plan.push({rel,kind:'file'});
-for(const rel of DBS)if(fs.existsSync(path.join(hermes,rel)))plan.push({rel,kind:'sqlite'});
-for(const tree of TREES)for(const file of walk(path.join(hermes,tree)))plan.push({rel:path.relative(hermes,file).replaceAll('\\','/'),kind:'file'});
-
 // The Lumos persona for Nimbus: SOUL.md without the Hermes identity line, plus
 // the owner rules from AGENTS.md that still apply. Hermes-only routing, source
 // and gateway notes are left out.
@@ -53,17 +49,33 @@ ${body.trim()}
 - Web: research_search and research_fetch replace web_search and web_extract; code_search replaces search_files.
 - Desktop control (Hermes computer_use) is the lumos-computer connector: list_windows / get_window_state / zoom to look, then click, type_text, press_key, hotkey, scroll or drag. Prefer the browser tool for websites. Look again after acting to confirm the effect.
 - Voice: lumos_speak sends a spoken reply as audio when a local voice server is configured; otherwise answer in text.
-- Service-manual work runs on Claude Opus (owner decision 2026-11-25; Astra is not on the current plan). Follow the field-service-manuals skill for sources, crops, blue markup and PDF output with Nimbus tools. Generative image recreation (gpt-image-2) is not available on Nimbus yet: use original photos, PDF vectors or video frames, and say so if a recreated image would have been needed.
+- Service-manual work runs on Claude Opus (owner decision 2026-11-25; Astra is not on the current plan). Follow the field-service-manuals skill for sources, crops, blue markup and PDF output with Nimbus tools. Use design_render (Nimbus's Claude Design loop) for visual work: blue circles, boxes, arrows and labels on a photo (baseImage + marks), clean redrawn step illustrations and diagrams as SVG, label cards and full manual pages as HTML rendered to PNG or PDF; look at each render and revise until it is right. Photorealistic generative recreation (gpt-image-2) is not available: redraw as a clean vector illustration with design_render, or use original photos, PDF vectors or video frames.
+- design_render is also for any other visual Jesse asks for (flyers, cards, charts, mockups, slides): design it, check the render, then send the PNG or PDF with openbubbles_operation.
 - You may create or improve your own skills by editing files under the skills folder in your Lumos home with write_file or apply_patch, as skill_manage did in Hermes. Keep each skill's SKILL.md frontmatter.
 - Long work can be handed to Nimbus workers with ask_worker; keep Jesse informed in your reply.
 - Your long-term memory tools are memory, fact_store and fact_feedback (the lumos-memory connector). Save durable facts and preferences there.
-- Your Hermes skills are listed by the skills tool; skills-review.json in your Lumos home classifies each one. "ready": follow it. "adapt" or "review": follow its guidance with Nimbus tools after checking that the tools or commands it names exist here, translating Hermes tool names (terminal→shell, skill_view→read_file, web_extract→browser, vision→view_image); never run its scripts unchanged when they assume Hermes paths or tools. "unavailable": needs a Mac; do not use it.
+- Your Hermes skills are listed by the skills tool. skills-review.json in your Lumos home has an audited verdict and notes for each one (2026-11-25): "ready": follow it, applying its notes. "needs-setup": tell Jesse what is missing (listed there) instead of improvising around it. "unavailable" or "hermes-internal": do not use it. Translate Hermes tool names with its toolMap (terminal→shell, skill_view→read_file, patch→apply_patch, vision→view_image, web_extract→research_fetch, cronjob→lumos_reminder, image_generate→design_render, delegate_task→ask_worker).
+- Python: run skill scripts with F:/Nimbus/data/lumos/venv/Scripts/python.exe (PDF, Word, PowerPoint, Excel, transcript and code-count packages), or with the interpreter a skill's own run.py picks. Never call python3 on this PC (it is a Windows Store stub). Skill scripts are on Windows: run bash-only snippets through Git Bash or rewrite them for PowerShell.
 
 ## Owner rules kept from the Hermes integration contract
 ${keep.map(p=>'- '+p).join('\n')}
 `;
 }
 
+export function ensureIntegrationsLink(root,target){
+  const link=path.join(root,'integrations');
+  if(!fs.existsSync(target))return {linked:false,reason:'missing '+target};
+  try{const st=fs.lstatSync(link);if(st.isSymbolicLink()&&path.resolve(fs.readlinkSync(link))===path.resolve(target))return {linked:true,existing:true};throw new Error(link+' exists and is not the expected link');}
+  catch(e){if(e.code!=='ENOENT')throw e;}
+  fs.mkdirSync(root,{recursive:true});fs.symlinkSync(target,link,'junction');return {linked:true};
+}
+// Run only as a command, never when another module imports these helpers.
+const isMain=process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url);
+if(isMain){
+const plan=[];
+for(const rel of [...FILES,...EXTRA])if(fs.existsSync(path.join(hermes,rel)))plan.push({rel,kind:'file'});
+for(const rel of DBS)if(fs.existsSync(path.join(hermes,rel)))plan.push({rel,kind:'sqlite'});
+for(const tree of TREES)for(const file of walk(path.join(hermes,tree)))plan.push({rel:path.relative(hermes,file).replaceAll('\\','/'),kind:'file'});
 if(dry){console.log(JSON.stringify({hermes,destination:gen,items:plan.length,sqlite:plan.filter(p=>p.kind==='sqlite').map(p=>p.rel)},null,2));process.exit(0);}
 if(!fs.existsSync(path.join(hermes,'SOUL.md')))throw new Error('Not a Hermes home: '+hermes);
 const before=Object.fromEntries(plan.map(p=>[p.rel,sha(path.join(hermes,p.rel))]));
@@ -91,7 +103,15 @@ let jobs=[];try{const raw=JSON.parse(fs.readFileSync(path.join(gen,'cron','jobs.
 fs.writeFileSync(path.join(gen,'schedules.json'),JSON.stringify(jobs,null,2));
 manifest.schedules=jobs.map(j=>j.id);
 fs.writeFileSync(path.join(gen,'manifest.json'),JSON.stringify(manifest,null,2));
+// Skill scripts (field-service-manuals, comprehensive-file-analysis, ...) find
+// their private runtime at <two levels above the Lumos home>/integrations, which is
+// HermesPilot/integrations under Hermes. Give the Nimbus home root the same link.
+ensureIntegrationsLink(root,path.join(path.dirname(hermes),'integrations'));
+// The audited skill review (bin/lumos-skills-review.json) travels with every generation.
+const review=path.join(path.dirname(fileURLToPath(import.meta.url)),'lumos-skills-review.json');
+if(fs.existsSync(review))fs.copyFileSync(review,path.join(gen,'skills-review.json'));
 fs.writeFileSync(path.join(root,'current.json.part'),JSON.stringify({generation:path.basename(gen),path:gen,at:manifest.createdAt},null,2));
 fs.renameSync(path.join(root,'current.json.part'),path.join(root,'current.json'));
 console.log(JSON.stringify({generation:gen,files:manifest.files.length,sourceUnchanged:manifest.sourceUnchanged,changedDuringCopy:after,schedules:manifest.schedules},null,2));
 if(!manifest.sourceUnchanged)process.exitCode=2;
+}
