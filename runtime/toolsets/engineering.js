@@ -142,7 +142,7 @@ export function policyCommand(name, args = {}, ctx = {}) {
     return `npm run ${String(args.script||'')} --\nConfigured automatic lifecycle (execution order):\n${lifecycle.length?lifecycle.map(script=>`${script.name}: ${typeof script.body==='string'?script.body:'(invalid non-string script)'}`).join('\n'):'(missing)'}`;
   }
   if(args.runner==='python_unittest')return `python -m unittest discover -s ${path.resolve(root,args.testDirectory||'.')} -v`;
-  return `node --test --test-concurrency=1 ${(Array.isArray(args.files)?args.files:[]).slice(0,100).map(file=>path.resolve(root,String(file))).join(' ')}`;
+  return `node --test --test-reporter=tap --test-concurrency=1 ${(Array.isArray(args.files)?args.files:[]).slice(0,100).map(file=>path.resolve(root,String(file))).join(' ')}`;
 }
 function environment() {
   const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_PAGER: 'cat', PAGER: 'cat', GH_PROMPT_DISABLED: '1' };
@@ -363,7 +363,7 @@ export async function execute(name, args = {}, ctx = {}) {
       const files=args.files?.length?scopedPaths(root,args.files).map(f=>path.join(root,f)):discover(root).tests.filter(f=>/\.test\.[cm]?js$/.test(f.path)).map(f=>f.path);
       if(!files.length)throw new Error('No Node test files found; provide explicit files or use a configured npm script');
       if(files.some(file=>!fs.existsSync(file)))throw new Error('A selected test file does not exist');
-      executable=process.execPath;argv=['--no-warnings','--test','--test-concurrency=1',...files];
+      executable=process.execPath;argv=['--no-warnings','--test','--test-reporter=tap','--test-concurrency=1',...files];
     }else if(args.runner==='npm_script'){
       const pkg=packageInfo(root,{rawScripts:true});if(!pkg?.scripts||typeof args.script!=='string'||!Object.hasOwn(pkg.scripts,args.script))throw new Error('Select a script that exists in this package.json');
       validateCheckScript(args.script,npmLifecycle(pkg,args.script));

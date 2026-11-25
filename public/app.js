@@ -1115,6 +1115,15 @@ function botModal(b) {
       <button class="btn" data-close>Cancel</button>
       <button class="btn primary" id="f-save">${isNew ? 'Create bot' : 'Save'}</button>
     </div>`, { wide: true });
+  // Mark models the connected plans do not include, so a worker is never pinned
+  // to one (the server enforces this too and falls back to the next best).
+  api('/api/runtime').then(r=>{
+    const allowed=new Set(['auto','','local',...(r.cloud?.tiers||[]),...(r.claude?.allowedTiers||[])]);
+    for(const id of ['#f-model','#f-default-model'])for(const option of el.querySelector(id)?.options||[]){
+      if(allowed.has(option.value))continue;
+      option.disabled=!option.selected;option.textContent=option.textContent.replace(/ — not in your plan$/,'')+' — not in your plan';
+    }
+  }).catch(()=>{});
   const botFormValue=()=>{
     const lines=id=>$(id,el).value.split('\n').map(value=>value.trim()).filter(Boolean),selected=[...el.querySelectorAll('[data-worker-tool]:checked')].map(input=>input.dataset.workerTool),selectedSet=new Set(selected),advertised=new Set(toolOptions.map(tool=>tool.name)),existing=b.tools?JSON.parse(b.tools):[];
     const tools=[...existing.filter(name=>!advertised.has(name)||selectedSet.has(name)),...selected.filter(name=>!existing.includes(name))];

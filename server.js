@@ -23,6 +23,7 @@ import {configureBranchHost,enqueueCommittedRun} from './runner.js';
 import {compactConversation} from './runtime/compact.js';
 import {isLocalSlash,runLocalSlash} from './runtime/slash.js';
 import {claudeStatus} from './runtime/claude.js';
+import {openaiCatalogTiers} from './runtime/plan-models.js';
 import { cloudStatus, CodexClient } from './runtime/codex.js';
 import { localCatalog } from './runtime/local.js';
 import { resources } from './runtime/resources.js';
@@ -135,7 +136,7 @@ function postToThread(thread, text, files = [], mode='context') {
     const message=addMessage(thread,'user','text',text);
     // The reply is posted after the request transaction commits; no model turn starts.
     setImmediate(()=>runLocalSlash(text,{query:q,bot,thread,dataDir:DATA_DIR,settings:config().context,stopRun,
-      providerStatus:async()=>{const [openai,claude]=await Promise.all([cloudStatus(),claudeStatus()]);return {openai:{...openai,ok:openai.subscription},claude};}})
+      providerStatus:async()=>{const [openai,claude]=await Promise.all([cloudStatus(),claudeStatus()]);return {openai:{...openai,ok:openai.subscription,tiers:openaiCatalogTiers(openai,config())},claude};}})
       .then(note=>{addMessage(thread,'system','note',note);broadcast('state_changed',{});},
         error=>{try{addMessage(thread,'system','error',error.message);}catch{}}));
     return message;

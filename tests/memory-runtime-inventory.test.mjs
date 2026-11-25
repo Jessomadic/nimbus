@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {fileURLToPath} from 'node:url';import {Maintenance} from '../runtime/maintenance.js';
 const root=fileURLToPath(new URL('../',import.meta.url));
-const pins={"http-route.mjs":"a21b9c93864543ac6f003075beade9e5a8de9679549530fe16e03b0511c12e34","recall.mjs":"814438adc0eb79386c0dc7aeacbb413548aac6eb4da15b1b9105dec8034cfa9e","routing.mjs":"754da86baa659a0a39c7f28e65ecf3e2de40d8e19e079e167e2d584c7b82c1dc","server-composition.mjs":"5fd61a442e9ac631301fdd01280b66833355bd759e9e5943dd9f60486837685e","session-adapter.mjs":"077296638511066c05f9acc02377b6ee56a0743a2004d58ab62969febf074a21","worker-binding.mjs":"ef01a48a7fb1f206905ae70938d02294a2a02c1c4d668eedafc2ff66e9e835da"};
+const pins={"surfaces.mjs":"cae0ad542e9f90fd0063a23668abcbb8f66be4d9e35d215d94a5dee53d4fc4fd","http-route.mjs":"a21b9c93864543ac6f003075beade9e5a8de9679549530fe16e03b0511c12e34","recall.mjs":"814438adc0eb79386c0dc7aeacbb413548aac6eb4da15b1b9105dec8034cfa9e","routing.mjs":"4a9e930a91b1ac4b22b1edd0cc7b6fc19863751b5a00e61567dbc9133f0fcfe2","server-composition.mjs":"5fd61a442e9ac631301fdd01280b66833355bd759e9e5943dd9f60486837685e","session-adapter.mjs":"077296638511066c05f9acc02377b6ee56a0743a2004d58ab62969febf074a21","worker-binding.mjs":"e4668e96b99f520384863b1f78fae457d33e4604a8e1bd29995fa0318926fc24"};
 test('production inventory includes all exact memory pins and active imports use runtime',()=>{
  const inv=new Maintenance({root,dataDir:path.join(root,'data')}).inventory();
  for(const [name,sha]of Object.entries(pins))assert.equal(inv.files['runtime/memory-private/'+name],sha);

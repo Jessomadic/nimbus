@@ -17,14 +17,17 @@ const watcher=setInterval(()=>{if(fs.existsSync(stop))stopping=true;},500);
 try{
   let failures=0;
   while(!stopping){
-    child=spawn(process.execPath,['--no-warnings','--env-file-if-exists=.env',path.join(ROOT,'server.js')],{cwd:ROOT,windowsHide:true,stdio:['ignore',out,err]});
+    child=spawn(process.execPath,['--no-warnings','--env-file-if-exists=.env',process.env.NIMBUS_SERVER_SCRIPT||path.join(ROOT,'server.js')],{cwd:ROOT,windowsHide:true,stdio:['ignore',out,err]});
     fs.writeFileSync(path.join(DATA,'server.pid'),String(child.pid));
     const start=Date.now();
     const code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});
-    if(fs.existsSync(stop)||code===0)break;
+    // Only an explicit stop request (Stop-Nimbus.ps1 writes it) ends supervision.
+    // A clean exit 0, for example POST /api/admin/shutdown, is respawned so Nimbus
+    // never stays down until the next scheduled recovery tick.
+    if(fs.existsSync(stop))break;
     failures=Date.now()-start>60000?0:failures+1;
     if(failures>=5)throw new Error('Nimbus stopped after five rapid startup failures. See server.stderr.log.');
-    await new Promise(r=>setTimeout(r,code===75?250:Math.min(30000,failures*2000)));
+    await new Promise(r=>setTimeout(r,code===75||code===0?250:Math.min(30000,failures*2000)));
   }
 }catch(e){fs.appendFileSync(path.join(DATA,'supervisor.errors.log'),new Date().toISOString()+' '+e.message+'\n');process.exitCode=1;}
 finally{clearInterval(watcher);fs.closeSync(out);fs.closeSync(err);if(fs.existsSync(lock))fs.unlinkSync(lock);}

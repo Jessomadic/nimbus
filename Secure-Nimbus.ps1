@@ -1,12 +1,41 @@
 # Locks this checkout to its Windows owner, SYSTEM and local Administrators.
 # Do not point this at a parent drive or another application's data directory.
-param()
+# -Mode Full checks every item. -Mode Incremental (the default) checks every
+# item outside data\, every directory, and every file in a directory changed
+# since the last verified scan: the protected root ACL means only the owner,
+# SYSTEM or Administrators can add items, and adding, moving or renaming an
+# item updates its parent directory's modification time. A weekly Full scan
+# covers in-place ACL edits by an administrator.
+param([ValidateSet('Full','Incremental')][string]$Mode='Incremental')
 $ErrorActionPreference='Stop'
+$nimbusStarted=[DateTime]::UtcNow
 $nimbusSecureRoot=[IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
 if(-not (Test-Path -LiteralPath (Join-Path $nimbusSecureRoot 'server.js') -PathType Leaf) -or
    -not (Test-Path -LiteralPath (Join-Path $nimbusSecureRoot 'package.json') -PathType Leaf)){
   throw 'Run Secure-Nimbus.ps1 from the Nimbus project directory.'
 }
+$nimbusEvidenceDir=Join-Path $nimbusSecureRoot 'data\verification'
+New-Item -ItemType Directory -Path $nimbusEvidenceDir -Force | Out-Null
+function Get-NimbusLastVerified{
+  foreach($nimbusFile in Get-ChildItem -LiteralPath $nimbusEvidenceDir -Filter 'windows-acl-*.json' -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 20){
+    try{if((Get-Content -LiteralPath $nimbusFile.FullName -Raw | ConvertFrom-Json).verified -eq $true){return $nimbusFile.LastWriteTimeUtc}}catch{}
+  }
+  return $null
+}
+# One scan at a time per checkout. A caller that waited behind a scan which
+# completed after this caller started has nothing left to check.
+$nimbusRootHash=[BitConverter]::ToString([Security.Cryptography.SHA1]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($nimbusSecureRoot.ToLowerInvariant()))).Replace('-','')
+$nimbusMutex=[Threading.Mutex]::new($false,'Local\NimbusSecure-'+$nimbusRootHash)
+try{[void]$nimbusMutex.WaitOne()}catch [Threading.AbandonedMutexException]{}
+try{
+$nimbusLastVerified=Get-NimbusLastVerified
+if($nimbusLastVerified -and $nimbusLastVerified -ge $nimbusStarted){
+  Write-Output ('Nimbus Windows permissions were verified by a concurrent scan at '+$nimbusLastVerified.ToString('o')+'; nothing to repeat.')
+  return
+}
+if($Mode -eq 'Incremental' -and -not $nimbusLastVerified){$Mode='Full'}
+$nimbusSince=if($Mode -eq 'Incremental'){$nimbusLastVerified.AddMinutes(-10)}else{$null}
+$nimbusDataRoot=Join-Path $nimbusSecureRoot 'data'
 $nimbusIdentity=[Security.Principal.WindowsIdentity]::GetCurrent()
 $nimbusOwnerSid=(Get-Acl -LiteralPath $nimbusSecureRoot).GetOwner([Security.Principal.SecurityIdentifier]).Value
 $nimbusTrustedSids=@($nimbusOwnerSid,'S-1-5-18','S-1-5-32-544') | Select-Object -Unique
@@ -16,22 +45,27 @@ if($nimbusRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Th
 # outside this checkout. Links are reported and deliberately not traversed.
 $nimbusItems=[Collections.Generic.List[IO.FileSystemInfo]]::new()
 $nimbusLinks=[Collections.Generic.List[string]]::new()
-$nimbusQueue=[Collections.Generic.Queue[string]]::new()
-$nimbusQueue.Enqueue($nimbusSecureRoot)
+$nimbusQueue=[Collections.Generic.Queue[IO.DirectoryInfo]]::new()
+$nimbusQueue.Enqueue([IO.DirectoryInfo]::new($nimbusSecureRoot))
+$nimbusTotal=0
 while($nimbusQueue.Count){
-  foreach($nimbusItem in Get-ChildItem -LiteralPath $nimbusQueue.Dequeue() -Force){
+  $nimbusDir=$nimbusQueue.Dequeue()
+  $nimbusInData=$nimbusDir.FullName -eq $nimbusDataRoot -or $nimbusDir.FullName.StartsWith($nimbusDataRoot+'\',[StringComparison]::OrdinalIgnoreCase)
+  # Files in an unchanged data directory keep the inherited protection of that
+  # directory; the directory itself is still checked below.
+  $nimbusCheckFiles=$Mode -eq 'Full' -or -not $nimbusInData -or $nimbusDir.LastWriteTimeUtc -ge $nimbusSince
+  foreach($nimbusItem in $nimbusDir.EnumerateFileSystemInfos()){
+    $nimbusTotal++
     if($nimbusItem.Attributes -band [IO.FileAttributes]::ReparsePoint){$nimbusLinks.Add($nimbusItem.FullName);continue}
-    $nimbusItems.Add($nimbusItem)
-    if($nimbusItem.PSIsContainer){$nimbusQueue.Enqueue($nimbusItem.FullName)}
+    if($nimbusItem -is [IO.DirectoryInfo]){$nimbusItems.Add($nimbusItem);$nimbusQueue.Enqueue($nimbusItem);continue}
+    if($nimbusCheckFiles -or $nimbusItem.LastWriteTimeUtc -ge $nimbusSince -or $nimbusItem.CreationTimeUtc -ge $nimbusSince){$nimbusItems.Add($nimbusItem)}
   }
 }
 $nimbusChanges=[Collections.Generic.List[object]]::new()
 $nimbusChangedPaths=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-$nimbusEvidenceDir=Join-Path $nimbusSecureRoot 'data\verification'
-New-Item -ItemType Directory -Path $nimbusEvidenceDir -Force | Out-Null
 $nimbusReceiptPath=Join-Path $nimbusEvidenceDir ('windows-acl-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()+'.json')
 function Save-NimbusAclReceipt{
-  [ordered]@{root=$nimbusSecureRoot;account=$nimbusIdentity.Name;trustedSids=$nimbusTrustedSids;changes=@($nimbusChanges.ToArray());skippedLinks=@($nimbusLinks.ToArray());verified=$false} |
+  [ordered]@{root=$nimbusSecureRoot;account=$nimbusIdentity.Name;trustedSids=$nimbusTrustedSids;mode=$Mode;startedAt=$nimbusStarted.ToString('o');incrementalSince=$(if($nimbusSince){$nimbusSince.ToString('o')}else{$null});totalItems=$nimbusTotal;changes=@($nimbusChanges.ToArray());skippedLinks=@($nimbusLinks.ToArray());verified=$false} |
     ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $nimbusReceiptPath -Encoding utf8
 }
 function Set-NimbusPrivateAcl([string]$nimbusAclPath,[bool]$nimbusDirectory){
@@ -88,16 +122,24 @@ function Test-NimbusPrivateAcl([string]$nimbusAclPath){
 }
 # Root inheritance automatically fixes ordinary descendants. Explicit or
 # protected child ACLs are checked and repaired individually if necessary.
-Set-NimbusPrivateAcl $nimbusSecureRoot $true
+Save-NimbusAclReceipt
+# Rewriting an already-correct inheritable root DACL makes Windows re-propagate
+# it to every descendant, so the root is only rewritten when it fails the check.
+if(-not (Test-NimbusPrivateAcl $nimbusSecureRoot)){Set-NimbusPrivateAcl $nimbusSecureRoot $true}
+$nimbusRepaired=[Collections.Generic.List[IO.FileSystemInfo]]::new()
 foreach($nimbusItem in $nimbusItems){
-  if(-not (Test-NimbusPrivateAcl $nimbusItem.FullName)){Set-NimbusPrivateAcl $nimbusItem.FullName ([bool]$nimbusItem.PSIsContainer)}
+  if(-not (Test-NimbusPrivateAcl $nimbusItem.FullName)){Set-NimbusPrivateAcl $nimbusItem.FullName ($nimbusItem -is [IO.DirectoryInfo]);$nimbusRepaired.Add($nimbusItem)}
 }
+# Items that passed were read once; only repaired items and the root are re-read.
 $nimbusVerified=Test-NimbusPrivateAcl $nimbusSecureRoot
-foreach($nimbusItem in $nimbusItems){if(-not (Test-NimbusPrivateAcl $nimbusItem.FullName)){throw ('Unsafe ACL remains: '+$nimbusItem.FullName)}}
+foreach($nimbusItem in $nimbusRepaired){if(-not (Test-NimbusPrivateAcl $nimbusItem.FullName)){throw ('Unsafe ACL remains: '+$nimbusItem.FullName)}}
 if(-not $nimbusVerified){throw 'The Nimbus root ACL could not be verified.'}
 $nimbusReceipt=Get-Content -LiteralPath $nimbusReceiptPath -Raw | ConvertFrom-Json
 $nimbusReceipt.verified=$true
 $nimbusReceipt | Add-Member -NotePropertyName checkedItems -NotePropertyValue ($nimbusItems.Count+1)
+$nimbusReceipt | Add-Member -NotePropertyName repairedItems -NotePropertyValue $nimbusRepaired.Count
+$nimbusReceipt | Add-Member -NotePropertyName seconds -NotePropertyValue ([math]::Round(([DateTime]::UtcNow-$nimbusStarted).TotalSeconds,1))
 $nimbusReceipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $nimbusReceiptPath -Encoding utf8
-Write-Output ('Nimbus Windows permissions verified for '+($nimbusItems.Count+1)+' items. Receipt: '+$nimbusReceiptPath)
+Write-Output ('Nimbus Windows permissions verified ('+$Mode+') for '+($nimbusItems.Count+1)+' of '+($nimbusTotal+1)+' items. Receipt: '+$nimbusReceiptPath)
 if($nimbusLinks.Count){Write-Warning ('Skipped '+$nimbusLinks.Count+' filesystem links; their targets require separate permission verification.')}
+}finally{$nimbusMutex.ReleaseMutex();$nimbusMutex.Dispose()}

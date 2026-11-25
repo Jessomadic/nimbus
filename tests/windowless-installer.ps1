@@ -20,6 +20,7 @@ function Run($exe,$arguments) {
 }
 # Scheduled-task commands are deliberately shadowed; NEVER call real registration.
 $script:registrations=0
+$script:skipped=0
 function New-ScheduledTaskAction { param($Execute,$Argument,$WorkingDirectory) [pscustomobject]@{Execute=$Execute;Argument=$Argument;WorkingDirectory=$WorkingDirectory} }
 function New-ScheduledTaskTrigger { param([switch]$AtLogOn,$User,[switch]$Once,$At,$RepetitionInterval) [pscustomobject]@{AtLogOn=[bool]$AtLogOn;User=$User;Once=[bool]$Once;RepetitionInterval=$RepetitionInterval;Repetition=[pscustomobject]@{StopAtDurationEnd=$true}} }
 function New-ScheduledTaskPrincipal { param($UserId,$LogonType,$RunLevel) [pscustomobject]@{UserId=$UserId;LogonType=$LogonType;RunLevel=$RunLevel} }
@@ -67,7 +68,9 @@ try {
    $coreCommand=Get-Command pwsh.exe -ErrorAction SilentlyContinue
    if ($coreCommand) { $coreModules=Join-Path (Split-Path $coreCommand.Source) 'Modules' }
   }
-  if (!$coreModules -or !(Test-Path -LiteralPath (Join-Path $coreModules 'Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1'))) { throw 'Actual PowerShell Core modules are required for this regression fixture' }
+  # PowerShell 7 is optional on this host. Without its modules the two checks
+  # that need them are recorded as skipped instead of failing the whole run.
+  if (!$coreModules -or !(Test-Path -LiteralPath (Join-Path $coreModules 'Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1'))) { $script:skipped+=2 } else {
   $env:PSModulePath=$coreModules+';'+(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules')
   $inherited=$env:PSModulePath
   $native='param([switch]$Foreground,[switch]$Automatic); $ErrorActionPreference="Stop"; $h=Get-FileHash -LiteralPath $PSCommandPath; $s=Get-AuthenticodeSignature -LiteralPath ($PSHOME+"\powershell.exe"); if($h.Hash.Length -ne 64 -or $s.Status -ne "Valid"){exit 98}; [IO.File]::WriteAllText((Join-Path $PSScriptRoot "native-ok.txt"),$h.Hash); exit 0'
@@ -75,6 +78,7 @@ try {
   $r=Run $exe ('"'+$fixture+'"')
   Check 'native-modules-under-Core-inheritance' ($r.exit -eq 0 -and (Test-Path (Join-Path $fixture 'native-ok.txt'))) $r
   Check 'caller-environment-unchanged' ($env:PSModulePath -ceq $inherited) $inherited
+  }
  } finally { $env:PSModulePath=$parentPath }
  $id='a'*32
  $rejected=0
@@ -92,6 +96,6 @@ try {
  [IO.File]::WriteAllText($src,$saved)
  $inputs | ForEach-Object { $inputPath=$_; $h=Hash $inputPath; $baseline=Get-Content -Raw (Join-Path $base 'before-hashes.json')|ConvertFrom-Json; $expected=($baseline|Where-Object path -eq $inputPath).sha256; Check ('input-unchanged: '+$_) ($h -eq $expected) $h }
 } catch { $failure=$_.ToString() } finally {
- [pscustomobject]@{at=[DateTime]::UtcNow.ToString('o');count=$results.Count;passed=@($results|Where-Object pass).Count;failed=@($results|Where-Object {!$_.pass}).Count;error=$failure;results=@($results.ToArray())} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $base 'tests.json') -Encoding UTF8
+ [pscustomobject]@{at=[DateTime]::UtcNow.ToString('o');count=$results.Count;passed=@($results|Where-Object pass).Count;skipped=$script:skipped;failed=@($results|Where-Object {!$_.pass}).Count;error=$failure;results=@($results.ToArray())} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $base 'tests.json') -Encoding UTF8
 }
 if($failure){Write-Error $failure;exit 1};exit 0

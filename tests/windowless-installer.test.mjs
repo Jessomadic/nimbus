@@ -24,7 +24,9 @@ test('startup installer preserves hidden execution and recovery behavior',{skip:
       await capture(exe,['-NoProfile','-NonInteractive','-File',script,'-OutputRoot',output],{env,timeout:60000});
       const report=JSON.parse(fs.readFileSync(path.join(output,'tests.json'),'utf8').replace(/^\uFEFF/,''));
       assert.equal(report.error,null,JSON.stringify(report));
-      assert.equal(report.failed,0);assert.equal(report.passed,14);
+      assert.equal(report.failed,0);assert.equal(report.passed+(report.skipped||0),14);
+      // Only the two PowerShell 7 checks may be skipped, and only when PowerShell 7 is absent.
+      assert.ok((report.skipped||0)===0||!core&&report.skipped===2,'unexpected skipped count '+report.skipped);
       // Preserve the owned compile/launch evidence for failed future regressions.
       t.diagnostic(name+' evidence: '+output);
     });

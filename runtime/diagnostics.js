@@ -42,7 +42,7 @@ function secretDetector(unsafe){
 // Only complete lines enter the buffer; oversized lines and partial credentials
 // are discarded, not truncated into apparently safe fragments.
 export function createFailureDiagnostics({onSecret=()=>{}}={}){
- let pending='',dropping=false,raw='',bytes=0,active=false,lines=0,count=0,truncated=false,suppressed=false;
+ let pending='',dropping=false,raw='',bytes=0,active=false,lines=0,count=0,truncated=false,suppressed=false,specSummary=false,specBlock=false;
  const suppress=reason=>{suppressed=true;pending='';raw='';bytes=0;active=false;truncated=true;onSecret(reason);};
  const detect=secretDetector(suppress);
  const append=line=>{
@@ -53,9 +53,15 @@ export function createFailureDiagnostics({onSecret=()=>{}}={}){
  const accept=line=>{
   const clean=stripVTControlCharacters(line);
   if(/-----BEGIN(?:\s|$)/i.test(clean)){suppress('multiline_secret_marker');return;}
-  const start=/^\s*not ok(?:\s+\d+)?(?:\s+-\s+|\s*$)/.test(clean)||/^\s*(?:[\w.]*Error(?:\s*\[[^\]]+\])?:)/.test(clean);
-  if(start){count++;active=true;lines=0;}
-  else if(active&&/^\s*(?:ok\b|# Subtest:|1\.\.\d+|# (?:tests|suites|pass|fail|duration_ms)\b)/.test(clean)){active=false;}
+  // Node's spec reporter (the default on Node 26 even when piped) repeats every
+  // failure under a closing "✖ failing tests:" summary; count each failure once.
+  if(/^\s*✖ failing tests:\s*$/.test(clean)){specSummary=true;active=false;return;}
+  const specStart=!specSummary&&/^\s*✖ \S/.test(clean);
+  // In a spec block the error line is that failure's cause, not a new failure.
+  const errorStart=!specSummary&&!(active&&specBlock)&&/^\s*(?:[\w.]*Error(?:\s*\[[^\]]+\])?:)/.test(clean);
+  const start=specStart||/^\s*not ok(?:\s+\d+)?(?:\s+-\s+|\s*$)/.test(clean)||errorStart;
+  if(start){count++;active=true;lines=0;specBlock=specStart;}
+  else if(active&&/^\s*(?:ok\b|# Subtest:|1\.\.\d+|# (?:tests|suites|pass|fail|duration_ms)\b|[✔ℹ▶] )/.test(clean)){active=false;}
   if(!active)return;
   if(lines++>=48){truncated=true;active=false;return;}
   append(clean);

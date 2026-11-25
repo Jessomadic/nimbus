@@ -103,7 +103,7 @@ export class Maintenance {
       // A validator invoked by a test must start an independent test runner.
       // Node propagates this internal flag and otherwise hides child failures.
       const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
-      const output = await capture(process.execPath, ['--no-warnings', '--test', '--test-concurrency=1', ...tests],
+      const output = await capture(process.execPath, ['--no-warnings', '--test', '--test-reporter=tap', '--test-concurrency=1', ...tests],
         { cwd: this.root, timeout: 600000, signal, env, diagnosticTail:true });
       receipt.checks.push({ name: 'Nimbus tests', pass: true, output: output.slice(-12000), ...keepOutput(output) });
       signal?.throwIfAborted();

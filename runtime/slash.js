@@ -18,6 +18,9 @@ export const SLASH_COMMANDS=[
   ['/rename','Rename this worker: /rename New name'],
 ];
 const ACTIVE="('queued','routing','running','waiting_local','waiting_cloud','waiting_approval','waiting_input')";
+// A tier is offered only when its subscription is connected and its plan includes it.
+// openai.tiers / claude.allowedTiers come from the live catalog and plan.
+const inPlan=({openai,claude},t)=>t==='auto'||t==='local'?true:isClaudeTier(t)?!!claude?.ok&&(claude.allowedTiers||[]).includes(t):!!openai?.ok&&(openai.tiers||[]).includes(t);
 const roleText=bot=>[bot.template,bot.name,bot.role].filter(Boolean).join(' — ');
 
 export function isLocalSlash(text){
@@ -41,6 +44,8 @@ export async function runLocalSlash(text,{query,bot,thread,dataDir,settings,stop
   if(command==='/model'){
     if(!arg)return `Model: ${bot.model||'auto'} (role preference ${bot.default_model||'none'}).`;
     if(!TIERS.includes(arg))throw bad('Unknown model. Choose one of: '+TIERS.join(', '));
+    const plans=await providerStatus();
+    if(!inPlan(plans,arg))throw bad(`${arg} is not included in the connected plans. Available: ${TIERS.filter(t=>inPlan(plans,t)).join(', ')}.`);
     query('UPDATE bots SET model=? WHERE id=?').run(arg,bot.id);
     return `Model set to ${arg}${arg==='auto'?' (best ranked model for the role, then next best)':isClaudeTier(arg)?' (Claude subscription)':arg==='local'?' (shared local model)':' (OpenAI subscription)'}.`;
   }
@@ -51,9 +56,10 @@ export async function runLocalSlash(text,{query,bot,thread,dataDir,settings,stop
   }
   if(command==='/providers'){
     const {openai,claude}=await providerStatus();
-    const ranking=rankCandidates({role:roleText(bot),preferredTier:bot.default_model||'',available:t=>isClaudeTier(t)?claude.ok:openai.ok});
+    const ranking=rankCandidates({role:roleText(bot),preferredTier:bot.default_model||'',available:t=>inPlan({openai,claude},t)});
     const all=rankCandidates({role:roleText(bot),preferredTier:bot.default_model||''});
-    return `Role category: ${ranking.category} (${ranking.basis} ranking).\nAvailable now, best first: ${ranking.candidates.join(' → ')||'none'}.\nFull ranking: ${all.candidates.join(' → ')}.`;
+    const excluded=all.candidates.filter(t=>!ranking.candidates.includes(t));
+    return `Role category: ${ranking.category} (${ranking.basis} ranking).\nAvailable now, best first: ${ranking.candidates.join(' → ')||'none'}.\nNot in your plans or not connected: ${excluded.join(', ')||'none'}.`;
   }
   if(command==='/usage'){
     const {openai,claude}=await providerStatus();

@@ -1,0 +1,11 @@
+# Keep the repository and working tree on LF. Several tests and the maintenance
+# source hash read files byte-for-byte, so Windows checkouts must not convert
+# them to CRLF (core.autocrlf=true is common on Windows).
+* text=auto eol=lf
+*.png binary
+*.webp binary
+*.ico binary
+*.jpg binary
+*.apk binary
+*.pyc binary
+*.dpapi binary

@@ -1,6 +1,6 @@
 import { localChat } from './local.js';
 import { config } from './config.js';
-import {rankCandidates,isClaudeTier,CLAUDE_TIER_NAMES} from './provider-catalog.js';
+import {rankCandidates,isClaudeTier,CLAUDE_TIER_NAMES,OPENAI_TIER_NAMES,TIER_CLASS} from './provider-catalog.js';
 const TIERS=['local','luna','terra','sol','astra',...CLAUDE_TIER_NAMES];
 
 export const ROUTE_SCHEMA = { type: 'object', additionalProperties: false, properties: {
@@ -19,8 +19,15 @@ export function parseRoute(text) {
   }
   return route;
 }
-export function cloudFallbackTier(preferredTier,c=config()) {
-  return ['luna','terra','sol','astra'].includes(preferredTier)?preferredTier:c.routing.cloudFallbackTier;
+// The OpenAI tier to use when the role preference or the configured fallback is
+// not in the account's plan: the nearest available capability class, cheaper first.
+export function cloudFallbackTier(preferredTier,c=config(),available=()=>true) {
+  const start=OPENAI_TIER_NAMES.includes(preferredTier)?preferredTier:c.routing.cloudFallbackTier;
+  if(available(start))return start;
+  const target=TIER_CLASS[preferredTier]??TIER_CLASS[start]??1;
+  const nearest=OPENAI_TIER_NAMES.filter(available).sort((a,b)=>Math.abs(TIER_CLASS[a]-target)-Math.abs(TIER_CLASS[b]-target)||TIER_CLASS[a]-TIER_CLASS[b])[0];
+  if(!nearest)throw Object.assign(new Error('No OpenAI model in the connected plan is available'),{pause:true});
+  return nearest;
 }
 function pinnedTier(pinned,c){
   if(TIERS.includes(pinned))return pinned;
@@ -40,8 +47,8 @@ export async function chooseRoute({ task, role, preferredTier='', pinned = '', e
     if(pinned&&pinned!=='auto'){
       const tier=pinnedTier(pinned,c)||(pinned===c.local.model?'local':null);
       if(!tier)throw new Error(`Unknown model override: ${pinned}`);
-      const ok=tier==='local'?c.local.enabled:isClaudeTier(tier)?claudeAvailable:cloudAvailable;
-      return withCandidates({tier:ok?tier:ranking.candidates[0],effort,reason:ok?'Explicit model override':`${tier} is unavailable; using the next best ranked model`,fallbackTier:ranking.candidates.find(t=>t!==tier)||'local',router:'explicit'},ranking);
+      const ok=tier==='local'?c.local.enabled:(isClaudeTier(tier)?claudeAvailable:cloudAvailable)&&tierAvailable(tier);
+      return withCandidates({tier:ok?tier:ranking.candidates[0],effort,reason:ok?'Explicit model override':`${tier} is not available on the connected plans; using the next best ranked model`,fallbackTier:ranking.candidates.find(t=>t!==tier)||'local',router:'explicit'},ranking);
     }
     if(!c.local.enabled)return withCandidates({tier:ranking.candidates[0],effort,reason:`Local models disabled; best available ${ranking.category} model by evidence ranking`,fallbackTier:ranking.candidates[1]||ranking.candidates[0],router:'ranking'},ranking);
   }
@@ -50,15 +57,18 @@ export async function chooseRoute({ task, role, preferredTier='', pinned = '', e
   if (!c.local.enabled) {
     if (!cloudAvailable) throw Object.assign(new Error('No model provider available: local models are disabled and OpenAI is unavailable'),{pause:true});
     const explicit=pinned&&pinned!=='auto'&&pinned!=='local'&&pinned!==c.local.model;
-    const tier=explicit?pinnedTier(pinned,c):cloudFallbackTier(preferredTier,c);
-    if(!tier)throw new Error(`Unknown model override: ${pinned}`);
-    return {tier,effort,reason:'Local models disabled; using OpenAI',fallbackTier:tier,router:'availability'};
+    const wanted=explicit?pinnedTier(pinned,c):null;
+    if(explicit&&!wanted)throw new Error(`Unknown model override: ${pinned}`);
+    const tier=wanted&&tierAvailable(wanted)?wanted:cloudFallbackTier(wanted||preferredTier,c,tierAvailable);
+    return {tier,effort,reason:wanted&&tier!==wanted?`${wanted} is not available on the connected plan; using ${tier}`:'Local models disabled; using OpenAI',fallbackTier:tier,router:'availability'};
   }
   if (pinned && pinned !== 'auto') {
     const tier = pinned === c.local.model || pinned === 'local' ? 'local' : Object.keys(c.cloud.models).find(k => k === pinned || c.cloud.models[k] === pinned);
     if (!tier) throw new Error(`Unknown model override: ${pinned}`);
-    return { tier: cloudAvailable || tier === 'local' ? tier : 'local', effort: effort === 'max' ? 'xhigh' : effort,
-      reason: cloudAvailable || tier === 'local' ? 'Explicit model override' : 'OpenAI is unavailable; using local capacity', fallbackTier: tier==='local'&&cloudAvailable?cloudFallbackTier(preferredTier,c):'local', router: 'explicit' };
+    const inPlan=tier==='local'||tierAvailable(tier);
+    const chosen=!cloudAvailable&&tier!=='local'?'local':inPlan?tier:cloudFallbackTier(tier,c,tierAvailable);
+    return { tier: chosen, effort: effort === 'max' ? 'xhigh' : effort,
+      reason: !cloudAvailable&&tier!=='local' ? 'OpenAI is unavailable; using local capacity' : inPlan ? 'Explicit model override' : `${tier} is not available on the connected plan; using ${chosen}`, fallbackTier: tier==='local'&&cloudAvailable?cloudFallbackTier(preferredTier,c,tierAvailable):'local', router: 'explicit' };
   }
   if ((!cloudAvailable || !c.cloud.enabled) && !ranking) return { tier: 'local', effort, reason: 'OpenAI unavailable or disabled; use local capacity', fallbackTier: 'local', router: 'availability' };
   const guide = `You are the local Nimbus model router. Select the model suited to the task, not the worker's name.
@@ -75,14 +85,17 @@ The input includes a preferredTier for this specialist and preferredEffort. Trea
       if(selected.tier==='local'&&selected.fallbackTier==='local')selected.fallbackTier=ranking.candidates[0];
       return withCandidates({ ...selected, preferredTier:preferredTier||null, router: result.model, usage: result.usage },ranking);
     }
+    // Never route to a tier the connected plan does not include.
+    if(selected.tier!=='local'&&!tierAvailable(selected.tier))selected.tier=cloudFallbackTier(selected.tier,c,tierAvailable);
+    if(selected.fallbackTier!=='local'&&!tierAvailable(selected.fallbackTier))selected.fallbackTier=cloudFallbackTier(selected.fallbackTier,c,tierAvailable);
     // Keep a cloud escape route even if a local classifier chose local twice.
-    if(selected.tier==='local'&&selected.fallbackTier==='local')selected.fallbackTier=cloudFallbackTier(preferredTier,c);
+    if(selected.tier==='local'&&selected.fallbackTier==='local')selected.fallbackTier=cloudFallbackTier(preferredTier,c,tierAvailable);
     return { ...selected, preferredTier:preferredTier||null, router: result.model, usage: result.usage };
   }catch(error){
     signal?.throwIfAborted();
     if(ranking)return withCandidates({tier:ranking.candidates[0],effort,preferredTier:preferredTier||null,router:'ranking',fallbackTier:ranking.candidates[1]||'local',fallbackFrom:'local',
       fallbackReason:`Local router unavailable: ${error.message}`,reason:`The local router is unavailable; using ${ranking.candidates[0]}, the best available ${ranking.category} model by evidence ranking.`},ranking);
-    const tier=cloudFallbackTier(preferredTier,c);
+    const tier=cloudFallbackTier(preferredTier,c,tierAvailable);
     return{tier,effort,preferredTier:preferredTier||null,router:'availability',fallbackTier:'local',fallbackFrom:'local',
       fallbackReason:`Local router unavailable: ${error.message}`,
       reason:`The local router is unavailable; using OpenAI ${tier}${preferredTier===tier?' from the worker role preference':' as the configured cloud fallback'}.`};

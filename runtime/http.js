@@ -6,6 +6,7 @@ import { config } from './config.js';
 import { updateRuntimeConfig } from './local-service-config.js';
 import { cloudStatus, CodexClient } from './codex.js';
 import { claudeStatus, setClaudeToken } from './claude.js';
+import { openaiCatalogTiers } from './plan-models.js';
 import { localCatalog } from './local.js';
 import { resources } from './resources.js';
 import { browsers } from './tools.js';
@@ -28,8 +29,8 @@ export function registerRuntimeRoutes({ route, body, json, reviewAuthority }) {
     const [cloud,local,hardware,claude]=await Promise.all([cloudStatus(),localCatalog(),resources(),claudeStatus()]);
     const c=config();
     let contact;try{contact=orchestratorStatus(q('SELECT id,name,template,parent_bot_id,model,default_model,effort FROM bots ORDER BY id').all());}catch(error){contact={configured:false,error:error.message};}
-    json(res,200,{cloud:{ok:cloud.ok,subscription:cloud.subscription,plan:cloud.plan,models:cloud.models,runtime:cloud.runtime,error:cloud.error},
-      claude:{ok:claude.ok,enabled:claude.enabled,subscription:claude.subscription,mode:claude.mode,plan:claude.plan,tokenAt:claude.tokenAt,limited:claude.limited,models:claude.models,error:claude.error},local,hardware,
+    json(res,200,{cloud:{ok:cloud.ok,subscription:cloud.subscription,plan:cloud.plan,tiers:openaiCatalogTiers(cloud,config()),models:cloud.models,runtime:cloud.runtime,error:cloud.error},
+      claude:{ok:claude.ok,allowedTiers:claude.allowedTiers,excludedTiers:claude.excludedTiers,enabled:claude.enabled,subscription:claude.subscription,mode:claude.mode,plan:claude.plan,tokenAt:claude.tokenAt,limited:claude.limited,models:claude.models,error:claude.error},local,hardware,
       queues:runtimeQueues(),browserGroups:browsers.snapshot(),configuration:{localModel:c.local.model,routerModel:c.routing.routerModel||'shared loaded model',resourceCeiling:c.local.resourceCeiling},
       lumos:{connected:false,phase:contact.configured?'Orchestrator contact ready; Hermes/Lumos bridge is not configured':'Orchestrator setup required; Hermes/Lumos bridge is not configured',contactConfigured:contact.configured,taskEndpoint:'/api/orchestrator/tasks',orchestrator:contact.orchestrator||null,...(contact.error?{error:contact.error}:{})}});
   });
@@ -62,7 +63,8 @@ export function registerRuntimeRoutes({ route, body, json, reviewAuthority }) {
   // Claude account: a token from `claude setup-token` (DPAPI-protected) or the
   // server's own Claude Code login. The token wins when both exist. The token is
   // never returned by any endpoint.
-  route('GET','/api/claude/status',async(req,res)=>{const s=await claudeStatus({fresh:true});json(res,200,{ok:s.ok,enabled:s.enabled,mode:s.mode,plan:s.plan,tokenAt:s.tokenAt,limited:s.limited,models:s.models,error:s.error});});
+  // The UI polls this; it shares the 30-second status cache instead of starting a process each time.
+  route('GET','/api/claude/status',async(req,res)=>{const s=await claudeStatus();json(res,200,{ok:s.ok,enabled:s.enabled,mode:s.mode,plan:s.plan,tokenAt:s.tokenAt,limited:s.limited,models:s.models,allowedTiers:s.allowedTiers,excludedTiers:s.excludedTiers,error:s.error});});
   route('POST','/api/claude/token',async(req,res)=>{
     const {token}=await body(req);
     try{await setClaudeToken(token);}catch(error){return json(res,400,{error:error.message});}

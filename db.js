@@ -8,7 +8,8 @@ import {ensureJournalIndexes} from './runtime/journal-indexes.js';
 import {ensureDelegationScopeSchema} from './runtime/delegation-scope.js';
 import {config} from './runtime/config.js';
 
-export const DATA_DIR = path.resolve(process.env.NIMBUS_DATA || './data');
+export { DATA_DIR } from './runtime/data-dir.js';
+import { DATA_DIR } from './runtime/data-dir.js';
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 export const db = new DatabaseSync(path.join(DATA_DIR, 'nimbus.db'));

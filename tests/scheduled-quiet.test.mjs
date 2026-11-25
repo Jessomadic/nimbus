@@ -10,7 +10,7 @@ test('scheduled quiet tasks retain exact requests, results, and recovery holds',
   const env={...process.env};
   delete env.NODE_TEST_CONTEXT;
   const fixture=fileURLToPath(new URL('./helpers/scheduled-quiet-fixture.mjs',import.meta.url));
-  const result=spawnSync(process.execPath,['--no-warnings','--experimental-test-module-mocks','--test','--test-concurrency=1',fixture],{
+  const result=spawnSync(process.execPath,['--no-warnings','--experimental-test-module-mocks','--test','--test-reporter=tap','--test-concurrency=1',fixture],{
     cwd:path.dirname(fixture),env,encoding:'utf8',windowsHide:true,timeout:110000,maxBuffer:1024*1024,
   });
   assert.equal(result.error,undefined,String(result.error));

@@ -21,6 +21,7 @@ import { workerSlots, localSlots, cloudSlots } from './runtime/slots.js';
 import { cloudStatus, codexTurn } from './runtime/codex.js';
 import { claudeStatus, claudeTurn, resolveClaudeModel, claudeModelAvailable } from './runtime/claude.js';
 import { isClaudeTier, providerOf, backendOf } from './runtime/provider-catalog.js';
+import { openaiCatalogTiers } from './runtime/plan-models.js';
 import {resolveCloudModel} from './runtime/model-selection.js';
 import { localChat } from './runtime/local.js';
 import { chooseRoute, cloudFallbackTier } from './runtime/router.js';
@@ -513,7 +514,10 @@ async function execute(runId,prompt) {
     const status=await cloudStatus(); const cloudAllowed=usableCloud(status,c);
     const claudeAccount=await claudeStatus(); const claudeAllowed=claudeAccount.ok===true;
     const modelFor=tier=>tier==='local'?c.local.model:isClaudeTier(tier)?resolveClaudeModel(tier,c):resolveCloudModel(tier,status,c);
-    const tierAvailable=tier=>tier==='local'?c.local.enabled:isClaudeTier(tier)?claudeAllowed&&claudeModelAvailable(resolveClaudeModel(tier,c)):cloudAllowed;
+    // Only models the connected plans include: the live Codex catalog for OpenAI,
+    // the Claude plan (and models it refused at run time) for Claude.
+    const openaiTiers=new Set(openaiCatalogTiers(status,c));
+    const tierAvailable=tier=>tier==='local'?c.local.enabled:isClaudeTier(tier)?claudeAllowed&&(claudeAccount.allowedTiers||[]).includes(tier)&&claudeModelAvailable(resolveClaudeModel(tier,c)):cloudAllowed&&openaiTiers.has(tier);
     let route;
     try{route=state.providerRecovery?retainedRecoveryRoute(state.providerRecovery,state.route,recoverySelection(bot)):await chooseRoute({task:prompt,role:[bot.template,bot.name,bot.role].filter(Boolean).join(' — '),preferredTier:bot.default_model||'',pinned:bot.model||bot.runtime,effort:bot.effort,signal,cloudAvailable:cloudAllowed,claudeAvailable:claudeAllowed,tierAvailable,c});}
     catch(e){if(signal.aborted)throw e;throw Object.assign(new Error(`Could not choose an available model: ${e.message}. Task checkpoint retained.`),{pause:true});}
@@ -707,7 +711,7 @@ async function execute(runId,prompt) {
         // Next best: the evidence-ranked candidates when both subscriptions are in play,
         // then the original local/cloud alternation.
         const rankedNext=(route.candidates||[]).find(t=>!attempted.has(t)&&tierAvailable(t)&&!(isClaudeTier(t)&&e.code==='claude_limit'&&isClaudeTier(tier)));
-        const next=rankedNext||(tier!=='local'?'local':route.fallbackTier!=='local'?route.fallbackTier:cloudFallbackTier(bot.default_model||'',c));
+        const next=rankedNext||(tier!=='local'?'local':route.fallbackTier!=='local'?route.fallbackTier:(()=>{try{return cloudFallbackTier(bot.default_model||'',c,t=>tierAvailable(t)&&!attempted.has(t));}catch{return 'local';}})());
         if(attempted.has(next)||!tierAvailable(next))throw Object.assign(e,{pause:true});
         q('UPDATE runs SET fallback_reason=? WHERE id=?').run(redact(e.message),runId);
         body.fallback=e.message;const from=tier;tier=next;event(runId,'model.fallback',{from,to:tier,phase:'execution',reason:e.message,completedTools:state.steps});

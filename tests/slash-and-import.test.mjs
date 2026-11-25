@@ -19,7 +19,7 @@ function fixture(){
   const query=sql=>db.prepare(sql);
   const bot=()=>query('SELECT * FROM bots WHERE id=1').get();
   const ctx=(extra={})=>({query,bot:bot(),thread:'bot:1',dataDir:dir,settings:{maxHistoryChars:1000},stopRun:()=>{},
-    providerStatus:async()=>({openai:{ok:true,subscription:true,plan:'pro'},claude:{ok:true,enabled:true,mode:'token',plan:'max'}}),...extra});
+    providerStatus:async()=>({openai:{ok:true,subscription:true,plan:'pro',tiers:['luna','terra','sol','astra']},claude:{ok:true,enabled:true,mode:'token',plan:'max',allowedTiers:['claude-haiku','claude-sonnet','claude-opus','claude-fable']}}),...extra});
   return {db,query,bot,ctx,dir};
 }
 

@@ -18,6 +18,8 @@ import {imageData,retainedImages} from './workbench.js';
 import {inferenceView,toolResultText} from './inference-context.js';
 import {dynamicToolNames} from './tool-names.js';
 import {protect,unprotect} from './credentials.js';
+import {DATA_DIR} from './data-dir.js';
+import {claudePlanTiers} from './plan-models.js';
 
 const BRIDGE=path.join(path.dirname(fileURLToPath(import.meta.url)),'claude-bridge.mjs');
 export const claudeSlots=new Slots(2);
@@ -27,8 +29,7 @@ export const CLAUDE_TOKEN_RE=/^sk-ant-oat\d*-[A-Za-z0-9_-]{20,}$/;
 // Haiku 4.5), so exact IDs are used; override per tier with claude.models.
 export const CLAUDE_TIERS={'claude-haiku':'claude-haiku-5-5','claude-sonnet':'claude-sonnet-5-5','claude-opus':'claude-opus-5-5','claude-fable':'claude-fable-5-2'};
 
-const dataDir=()=>path.resolve(process.env.NIMBUS_DATA||'./data');
-const tokenFile=()=>path.join(dataDir(),'credentials','claude-token.dpapi');
+const tokenFile=()=>path.join(DATA_DIR,'credentials','claude-token.dpapi');
 
 // --- Account -------------------------------------------------------------
 let tokenCache;
@@ -68,11 +69,17 @@ export function claudeBin(setting=config().claude?.bin||'auto'){
   return candidates.find(file=>{try{return fs.statSync(file).isFile();}catch{return false;}})||'claude';
 }
 
-let statusCache;
+let statusCache,statusInflight;
+// One `claude auth status` at a time; results are reused for 30 s, or 5 s when
+// the caller asks for a fresh answer (after connecting or removing a token).
 export async function claudeStatus({fresh=false}={}){
   const c=config();
-  if(!c.claude?.enabled)return {ok:false,enabled:false,subscription:false,mode:'disabled',models:[]};
-  if(!fresh&&statusCache&&Date.now()-statusCache.at<30000)return statusCache.data;
+  if(!c.claude?.enabled)return {ok:false,enabled:false,subscription:false,mode:'disabled',models:[],allowedTiers:[]};
+  if(statusCache&&Date.now()-statusCache.at<(fresh?5000:30000))return statusCache.data;
+  statusInflight??=readClaudeStatus(c).finally(()=>{statusInflight=null;});
+  return statusInflight;
+}
+async function readClaudeStatus(c){
   const bin=claudeBin(c.claude.bin),hasToken=!!await claudeToken();
   let data;
   try{
@@ -81,10 +88,14 @@ export async function claudeStatus({fresh=false}={}){
     const status=JSON.parse(result.stdout||'{}');
     // A stored setup-token is only verified by a real turn; auth status reports the CLI login.
     const subscription=hasToken||status.loggedIn===true&&status.authMethod!=='api_key'&&status.apiProvider==='firstParty';
-    data={ok:subscription,enabled:true,subscription,mode:hasToken?'token':status.loggedIn?'login':'none',tokenAt:hasToken?tokenSavedAt():null,
-      plan:status.subscriptionType||'',authMethod:status.authMethod||null,bin,
-      models:Object.entries(CLAUDE_TIERS).filter(([tier])=>!c.claude.disabledTiers?.includes(tier)&&claudeModelAvailable(resolveClaudeModel(tier,c))).map(([tier,alias])=>({id:tier,model:c.claude.models?.[tier]&&c.claude.models[tier]!=='auto'?c.claude.models[tier]:alias,name:'Claude '+tier.slice(7)[0].toUpperCase()+tier.slice(8)}))};
-  }catch(error){data={ok:false,enabled:true,subscription:false,mode:hasToken?'token':'none',models:[],error:/ENOENT/.test(error.message)?`Claude Code was not found (tried ${bin}). Install it or set claude.bin.`:error.message};}
+    // Only the models the account's plan includes are offered to workers.
+    const plan=status.subscriptionType||'',planTiers=claudePlanTiers(plan,c);
+    const allowedTiers=planTiers.filter(tier=>claudeModelAvailable(resolveClaudeModel(tier,c)));
+    data={ok:subscription&&allowedTiers.length>0,enabled:true,subscription,mode:hasToken?'token':status.loggedIn?'login':'none',tokenAt:hasToken?tokenSavedAt():null,
+      plan,authMethod:status.authMethod||null,bin,planTiers,allowedTiers,
+      excludedTiers:Object.keys(CLAUDE_TIERS).filter(tier=>!allowedTiers.includes(tier)),
+      models:allowedTiers.map(tier=>({id:tier,model:resolveClaudeModel(tier,c),name:'Claude '+tier.slice(7)[0].toUpperCase()+tier.slice(8)}))};
+  }catch(error){data={ok:false,enabled:true,subscription:false,mode:hasToken?'token':'none',models:[],allowedTiers:[],error:/ENOENT/.test(error.message)?`Claude Code was not found (tried ${bin}). Install it or set claude.bin.`:error.message};}
   if(data.ok&&claudeLimitedUntil>Date.now())data={...data,ok:false,limited:true,limitedUntil:claudeLimitedUntil};
   statusCache={at:Date.now(),data};return data;
 }
