@@ -9,3 +9,6 @@
 *.apk binary
 *.pyc binary
 *.dpapi binary
+
+# Byte-identical pinned copies (hash-checked at startup): never convert line endings.
+integration/lumos-memory/pinned/** -text
