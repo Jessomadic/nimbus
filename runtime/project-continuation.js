@@ -58,6 +58,11 @@ export class ProjectContinuation {
     const results=[];
     for(const policy of this.query('SELECT * FROM project_continuations WHERE stopped=0 AND (remaining=-1 AND expires=0 OR remaining>0 AND expires>?) ORDER BY run_id').all(this.now())){
       if(this.owned.has(policy.run_id)||this.withheld(policy.run_id))continue;
+      // Only interrupted or paused leaders can resume (see the status gate below).
+      // Check status first so finished runs never load or parse multi-MB checkpoints
+      // and tool results on every one-second tick.
+      const head=this.query('SELECT status FROM runs WHERE id=?').get(policy.run_id);
+      if(!head||!['interrupted','paused'].includes(head.status))continue;
       const run=this.query('SELECT * FROM runs WHERE id=?').get(policy.run_id);
       if(!run||!run.checkpoint)continue;
       let state;try{state=JSON.parse(run.checkpoint);}catch{continue;}
