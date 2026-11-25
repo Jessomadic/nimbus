@@ -25,12 +25,13 @@ CREATE TABLE room_members(room_id INTEGER,bot_id INTEGER);
 CREATE TABLE runs(id INTEGER PRIMARY KEY,bot_id INTEGER,thread TEXT,prompt TEXT,status TEXT,source TEXT,parent_run INTEGER,last_error TEXT,origin_request_id TEXT,actual_model TEXT);
 CREATE TABLE messages(id INTEGER PRIMARY KEY,thread TEXT,author TEXT,kind TEXT,body TEXT,run_id INTEGER);`);
   db.prepare("INSERT INTO bots VALUES(7,'Lumos',?,NULL,'auto')").run(JSON.stringify(['openbubbles_operation']));
-  const sent=[],completed=[],reads=[];let n=0;
+  const sent=[],completed=[],reads=[],attachments=[];let n=0;
   const bridge=await listen((req,res)=>{
     let raw='';req.on('data',c=>raw+=c);req.on('end',()=>{
       const send=(s,b)=>{res.writeHead(s,{'content-type':'application/json'});res.end(JSON.stringify(b));};
       if(req.headers.authorization!=='Bearer '+TOKEN)return send(401,{});
       if(req.url==='/api/v1/message/text'){if(bridgeFails)return send(500,{});const b=JSON.parse(raw);sent.push(b);return send(200,{status:200,data:{guid:'native-'+(++n),tempGuid:b.tempGuid,accepted:true}});}
+      if(req.url==='/api/v1/message/attachment'){attachments.push({type:req.headers['content-type'],bytes:raw.length,hasFile:/name="files"; filename="[^"]+.m4a"/.test(raw)});return send(200,{status:200,data:{guid:'att-'+(++n)}});}
       if(req.url.startsWith('/api/v1/attachment/')){const big=req.url.includes('big');res.writeHead(200,{'content-type':'image/png','content-length':big?String(30*1024*1024):'4'});return res.end(big?'':'PNG!');}
       if(req.url.startsWith('/api/v1/events'))return send(200,{status:200,data:[]});
       if(/\/(read|typing)$/.test(req.url)){reads.push(req.url);return send(200,{status:200,data:{}});}
@@ -50,7 +51,7 @@ CREATE TABLE messages(id INTEGER PRIMARY KEY,thread TEXT,author TEXT,kind TEXT,b
   const finishRun=(id,status,body)=>{db.prepare('UPDATE runs SET status=? WHERE id=?').run(status,id);if(body)db.prepare("INSERT INTO messages(thread,author,kind,body,run_id) SELECT thread,'7','text',?,id FROM runs WHERE id=?").run(body,id);};
   const webhook=(n,text,extra={})=>({type:'new-message',_lumos_relay:true,data:{guid:guid(n),chatIdentifier:OWNER,sender:OWNER,text,isFromMe:false,attachments:extra.attachments||[]},_lumos_event:{sequence:100+n,chat_guid:CHAT,guid:guid(n),sender:OWNER,is_from_me:false}});
   const post=(body,password=TOKEN)=>lumos.handleWebhook({'x-password':password},JSON.stringify(body));
-  return {db,lumos,config,sent,completed,reads,runs,finishRun,webhook,post,setClassify:f=>{classify=f;},dir};
+  return {db,lumos,config,sent,completed,reads,attachments,runs,finishRun,webhook,post,setClassify:f=>{classify=f;},dir};
 }
 const settle=async f=>{for(let i=0;i<20;i++){await f.lumos.processInbox();await f.lumos.tick();await wait(10);}};
 
@@ -251,4 +252,37 @@ test('every third reply starts a quiet review: proposals go to a validator on a 
   f.db.prepare("UPDATE runs SET actual_model='gpt-5.6-terra' WHERE id=?").run(validator.id);f.finishRun(validator.id,'done','accepted');await settle(f);
   assert.equal(f.db.prepare('SELECT state FROM lumos_reviews').get().state,'done');
   assert.equal(f.sent.length,3,'review sends nothing to Jesse');
+});
+
+test('service-manual requests and their follow-ups run on Claude Opus at medium effort; research-only requests do not',async t=>{
+  const {serviceManualRequested}=await import('../runtime/lumos-manual.js');
+  assert.equal(serviceManualRequested('Create a field service manual for the HP E786'),true);
+  assert.equal(serviceManualRequested('Update the guide for my Epson printer'),true);
+  assert.equal(serviceManualRequested('Find sources and PDFs for the E786 service manual'),false,'source discovery is not authoring');
+  assert.equal(serviceManualRequested('continue with the screw diagram',['Create a service manual for the HP E786']),true);
+  assert.equal(serviceManualRequested('what is the weather',['Create a service manual for the HP E786']),false);
+  const f=await fixture(t);
+  f.post(f.webhook(1,'Create a service manual for the HP E786 printer'));await settle(f);
+  f.post(f.webhook(2,'continue with the screw diagram'));await settle(f);
+  f.setClassify(async()=>JSON.stringify({target:'NEW',label:'Dinner'}));
+  f.post(f.webhook(3,'Suggest a dinner recipe'));await settle(f);
+  const runs=f.db.prepare('SELECT id FROM runs ORDER BY id').all().map(r=>f.lumos.modelFor(r.id));
+  assert.deepEqual(runs.map(r=>r&&r.tier+'/'+r.effort),['claude-opus/medium','claude-opus/medium',null]);
+});
+
+test('voice replies: refused clearly without a voice server; with one, audio is converted to .m4a and sent as an attachment',async t=>{
+  const f=await fixture(t);
+  f.post(f.webhook(1,'say hi out loud'));await settle(f);
+  const run=f.db.prepare('SELECT id FROM runs').get();
+  assert.match((await f.lumos.speak({id:7,tools:JSON.stringify(['openbubbles_operation'])},{text:'Hi'},run.id)).error,/No voice server/);
+  const voice=await listen((req,res)=>{let raw='';req.on('data',c=>raw+=c);req.on('end',()=>{assert.equal(JSON.parse(raw).input,'Hi Jesse');res.writeHead(200,{'content-type':'audio/wav'});res.end(Buffer.from('RIFFfakewav'));});});
+  t.after(()=>voice.close());
+  f.config.lumos.voice={url:voice.url+'/v1/audio/speech',model:'',voice:'',ffmpeg:'ffmpeg'};
+  let ffmpegArgs;
+  const spawnProcess=(cmd,args)=>{ffmpegArgs=args;fs.writeFileSync(args.at(-1),Buffer.from('fake m4a'));const c=new EventEmitter();setImmediate(()=>c.emit('close',0));return c;};
+  const result=await f.lumos.speak({id:7,tools:JSON.stringify(['openbubbles_operation'])},{text:'Hi Jesse'},run.id,{spawnProcess});
+  assert.equal(result.results[0].state,'submitted');
+  assert.equal(f.attachments.length,1);assert.ok(f.attachments[0].type.startsWith("multipart/form-data; boundary="));assert.ok(f.attachments[0].hasFile,'the .m4a file part was sent');
+  assert.ok(ffmpegArgs.includes('aac')&&ffmpegArgs.at(-1).endsWith('.m4a'));
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM ob_content WHERE run_id=?").get(run.id).n,1,'audio staged as private content');
 });

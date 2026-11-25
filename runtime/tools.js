@@ -36,6 +36,7 @@ export const coreTools = [
  {type:'function',function:{name:'memory_recall',description:'Read copied historical untrusted memory; get exact ID or substring search/recall, with citations and paging. Not ranked search.',parameters:{type:'object',properties:{surface:{type:'string',enum:['brain','archive','sessions','relationships','chunks','topics','attachments','attachment']},operation:{type:'string',enum:['recall','search','get']},query:text,id:text,sessionId:text,role:text,offset:{type:'integer'},limit:{type:'integer'},textOffset:{type:'integer'},textLimit:{type:'integer'}},required:['surface'],additionalProperties:false,allOf:[{if:{properties:{operation:{const:'get'}},required:['operation']},then:{required:['id']},else:{required:['query']}}]}}},
 
   spec('openbubbles_operation','iMessage actions for the owner’s current Lumos conversation only (available only in Lumos runs). Your final answer is sent automatically; use this for files (kind attachments, files:[{path}] for up to 4 local files of at most 25 MB: images, video, audio, PDF or text), reactions, typing, read receipts, edits, unsends or effects. Each call needs a new operationId. Sends are never repeated automatically.',{operationId:text,kind:{type:'string',enum:['text','attachments','reaction','typing','read','edit','unsend']},text,files:{type:'array'},active:{type:'boolean'},targetGuid:text,reaction:text,replyToMessageGuid:text,replyPartIndex:{type:'integer'},partIndex:{type:'integer'},effect:text},['operationId','kind']),
+  spec('lumos_speak','Lumos only: send a short spoken reply to Jesse as an iMessage voice attachment, using the local voice server. Use only when Jesse asks for audio or a spoken answer helps; also give the key points in text.',{text},['text']),
   spec('lumos_reminder','Lumos only: schedule, list or cancel reminders for Jesse over iMessage. kind "message" sends your text at that time; kind "task" runs your text as a new request then and sends the answer (for follow-up checks). Give at (date and time with offset, e.g. 2026-11-26T09:00:00-05:00) for once, or cron (minute hour day month weekday, local time) to repeat.',{action:{type:'string',enum:['create','list','cancel']},kind:{type:'string',enum:['message','task']},text,at:text,cron:text,id:text},['action']),
   spec('request_tool','Report a genuinely missing reusable capability and request Nimbus agents to design, build, test and review a native tool. Inspect the catalogue first. Existing disabled tools, denied approvals, credentials, dependencies and outages are setup gaps, not reasons to build around restrictions. The host parks this task and publishes progress to its original source, resuming only after verified deployment.',
     {title:text,toolName:text,capability:text,domain:{type:'string',enum:['engineering','data','research','browser','operations','content']},acceptanceCriteria:{type:'array',minItems:1,maxItems:20,items:text},gapType:{type:'string',enum:['missing_tool','missing_connector','missing_credentials','missing_dependency','permission_denied','service_unavailable']},effects:{type:'string',enum:['read','local_write','host_execute','external_write']}},['title','toolName','capability','acceptanceCriteria']),
@@ -111,6 +112,23 @@ export async function buildTools(bot,{openBubblesAuthority,conversationOnly=fals
   const mcp = await connectors.tools(bot.id, definitions,current);
   return { tools: [...tools, ...mcp.available], bindings: mcp.bindings, errors: mcp.errors };
 }
+// MCP image content (for example a desktop screenshot) is saved in the worker's
+// workspace and attached like view_image, so vision models see the pixels instead
+// of a truncated base64 string in the JSON preview.
+export function connectorImages(bot,result){
+  const items=Array.isArray(result?.content)?result.content:[];
+  if(!items.some(c=>c?.type==='image'&&typeof c.data==='string'))return result;
+  const dir=path.join(botDir(bot.id),'screens');fs.mkdirSync(dir,{recursive:true});
+  const saved=[];
+  const content=items.map((c,i)=>{
+    if(c?.type!=='image'||typeof c.data!=='string')return c;
+    const ext=/jpe?g/.test(c.mimeType||'')?'.jpg':'.png',file=path.join(dir,Date.now()+'-'+i+ext);
+    fs.writeFileSync(file,Buffer.from(c.data,'base64'));saved.push(file);
+    return {type:'text',text:'[image saved: '+file+']'};
+  });
+  let image;try{image=inspectImage(saved[0]).image;}catch{}
+  return {...result,content,...(image?{image}:{}),...(saved.length>1?{otherImages:saved.slice(1)}:{})};
+}
 export async function executeTool(bot, name, args, { signal, bindings, askWorker, workerResult, updatePlan, askUser,sendChildContext,questionInbox,answerWorkerQuestion,escalateWorkerQuestion,availableTools,connectorErrors,runId,requestTool,toolRequestStatus,projectRecovery,projectSuccessorHandoff,openBubblesAuthority } = {}) {
   signal?.throwIfAborted();
   // Dispatch memory only after the conversation-scope gate below.
@@ -124,10 +142,11 @@ export async function executeTool(bot, name, args, { signal, bindings, askWorker
   }
   if(name==='send_child_context'){if(bot.template!=='orchestrator'||!sendChildContext)throw new Error('Owned coordinator context callback unavailable');return sendChildContext(args);}
   if(name==='openbubbles_operation')return dispatchOpenBubbles(bot,args,{runId,signal,openBubblesAuthority});
+  if(name==='lumos_speak'){const lumos=getLumos();if(!lumos)throw new Error('Lumos is not running');return lumos.speak(bot,args,runId);}
   if(name==='lumos_reminder'){const lumos=getLumos();if(!lumos)throw new Error('Lumos is not running');return lumos.reminder(bot,args,runId);}
   if (bindings?.has(name)) {
     const binding = bindings.get(name);
-    return invokeConnector(binding,bot.id,args,{signal});
+    return connectorImages(bot,await invokeConnector(binding,bot.id,args,{signal}));
   }
   if(name.startsWith('mcp__')||name.startsWith('nimbus__connector_'))throw new Error('MCP connector authorization denied');
   availableTools=(availableTools||[]).filter(t=>!t.function.name.startsWith('mcp__')||connectorAllowed(bindings?.get(t.function.name),bot.id));

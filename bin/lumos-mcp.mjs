@@ -24,6 +24,11 @@ const hermes=JSON.parse(execFileSync(PY,['-c','import yaml,json,sys;c=yaml.safe_
 const entries={},report=[];
 // Lumos's own memory (integration/lumos-memory) over the Nimbus-owned copy.
 if(Number.isSafeInteger(botId)&&botId>0)hermes.memory={command:PY,args:['-B','F:/Nimbus/integration/lumos-memory/server.py','--home','F:/Nimbus/data/lumos/home','--render',`F:/Nimbus/data/bots/${botId}/MEMORY.md`],cwd:'F:/Nimbus/integration/lumos-memory'};
+// Desktop control, as Hermes's computer_use toolset: the same cua-driver binary
+// over MCP stdio, with its anonymous telemetry turned off.
+hermes.computer={command:'F:/Projects/Lumos/HermesPilot/home/tools/cua-driver-0.21.0-win32-x64/cua-driver.exe',args:['mcp'],env:{CUA_DRIVER_RS_TELEMETRY_ENABLED:'0'},timeout:60};
+// Only these driver tools are offered (Hermes exposed a similar curated set).
+const ALLOW={'lumos-computer':['list_apps','list_windows','get_window_state','get_desktop_state','get_screen_size','get_cursor_position','get_accessibility_tree','zoom','verify_state','click','double_click','right_click','drag','type_text','press_key','hotkey','set_value','scroll','move_cursor','bring_to_front','launch_app']};
 const EFFECTS={'lumos-memory':{memory:'write',fact_store:'write',fact_feedback:'write',session_search:'read'}};
 for(const [name,d] of Object.entries(hermes)){
   if(SKIP[name]||d.url){report.push({name,skipped:SKIP[name]||'remote server'});continue;}
@@ -41,6 +46,7 @@ for(const [name,d] of Object.entries(hermes)){
   }catch(error){report.push({name,error:error.message});continue;}
   finally{try{await client.close();}catch{}}
   const server='lumos-'+name;
+  if(ALLOW[server])tools=tools.filter(t=>ALLOW[server].includes(t.name));
   def.reviewedTools=tools.map(t=>t.name);
   const hash=effectTransportHash(server,def);
   // Read-only only when the server says so or the name is plainly a read;

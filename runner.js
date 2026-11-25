@@ -22,6 +22,7 @@ import { cloudStatus, codexTurn } from './runtime/codex.js';
 import { claudeStatus, claudeTurn, resolveClaudeModel, claudeModelAvailable } from './runtime/claude.js';
 import { isClaudeTier, providerOf, backendOf } from './runtime/provider-catalog.js';
 import { openaiCatalogTiers } from './runtime/plan-models.js';
+import { getLumos } from './runtime/lumos-registry.js';
 import {resolveCloudModel} from './runtime/model-selection.js';
 import { localChat } from './runtime/local.js';
 import { chooseRoute, cloudFallbackTier } from './runtime/router.js';
@@ -520,8 +521,10 @@ async function execute(runId,prompt) {
     // the Claude plan (and models it refused at run time) for Claude.
     const openaiTiers=new Set(openaiCatalogTiers(status,c));
     const tierAvailable=tier=>tier==='local'?c.local.enabled:isClaudeTier(tier)?claudeAllowed&&(claudeAccount.allowedTiers||[]).includes(tier)&&claudeModelAvailable(resolveClaudeModel(tier,c)):cloudAllowed&&openaiTiers.has(tier);
+    // Lumos service-manual requests carry a per-run model choice (runtime/lumos-manual.js).
+    const lumosOverride=run.source==='lumos'?getLumos()?.modelFor(runId):null;
     let route;
-    try{route=state.providerRecovery?retainedRecoveryRoute(state.providerRecovery,state.route,recoverySelection(bot)):await chooseRoute({task:prompt,role:[bot.template,bot.name,bot.role].filter(Boolean).join(' — '),preferredTier:bot.default_model||'',pinned:bot.model||bot.runtime,effort:bot.effort,signal,cloudAvailable:cloudAllowed,claudeAvailable:claudeAllowed,tierAvailable,c});}
+    try{route=state.providerRecovery?retainedRecoveryRoute(state.providerRecovery,state.route,recoverySelection(bot)):await chooseRoute({task:prompt,role:[bot.template,bot.name,bot.role].filter(Boolean).join(' — '),preferredTier:bot.default_model||'',pinned:lumosOverride?.tier||bot.model||bot.runtime,effort:lumosOverride?.effort||bot.effort,signal,cloudAvailable:cloudAllowed,claudeAvailable:claudeAllowed,tierAvailable,c});}
     catch(e){if(signal.aborted)throw e;throw Object.assign(new Error(`Could not choose an available model: ${e.message}. Task checkpoint retained.`),{pause:true});}
     if(state.providerRecovery)assertRecoveryRoute(state.providerRecovery,{model:modelFor(route.tier),backend:backendOf(route.tier),provider:providerOf(route.tier),fallback:!!route.fallbackReason});
     state.route=route; save();

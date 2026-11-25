@@ -10,6 +10,7 @@
 //   unknown becomes uncertain and the relay asks the owner, nothing is resent.
 // - The /complete report has no side effects and is retried until recorded.
 import http from 'node:http';
+import {spawn as spawnChild} from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import {timingSafeEqual,createHash} from 'node:crypto';
@@ -18,10 +19,12 @@ import {OpenBubblesStore} from './openbubbles-store.js';
 import {hostAuthority,attachHostRun,dispatchOpenBubbles} from './openbubbles-dispatch.js';
 import {LumosTopics} from './lumos-topics.js';
 import {cronMatches,isValidCron} from './cron.js';
+import {serviceManualRequested,MANUAL_ROUTE} from './lumos-manual.js';
 
 export const LUMOS_SCHEMA=`CREATE TABLE IF NOT EXISTS lumos_inbox(guid TEXT PRIMARY KEY,received_at INTEGER NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL,run_id INTEGER,topic TEXT,error TEXT);
 CREATE TABLE IF NOT EXISTS lumos_delivery(run_id INTEGER PRIMARY KEY,guid TEXT NOT NULL,state TEXT NOT NULL,outcome TEXT,complete_state TEXT NOT NULL DEFAULT 'none',pause_noted INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS lumos_notes(id TEXT PRIMARY KEY,guid TEXT,text TEXT NOT NULL,state TEXT NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS lumos_run_model(run_id INTEGER PRIMARY KEY,tier TEXT NOT NULL,effort TEXT NOT NULL,reason TEXT);
 CREATE TABLE IF NOT EXISTS lumos_reviews(id INTEGER PRIMARY KEY,reviewer_run INTEGER,validator_run INTEGER,state TEXT NOT NULL,exchanges TEXT NOT NULL,created_at INTEGER NOT NULL,note TEXT);
 CREATE TABLE IF NOT EXISTS lumos_reminders(id TEXT PRIMARY KEY,kind TEXT NOT NULL,text TEXT NOT NULL,at INTEGER,cron TEXT,topic TEXT,state TEXT NOT NULL,created_at INTEGER NOT NULL,created_run INTEGER,last_fire TEXT,fires INTEGER NOT NULL DEFAULT 0);`;
 const BINDING='lumos',GENERATION=1;
@@ -69,11 +72,12 @@ export function createLumos({db,getConfig,loadRoute,insertRun,enqueue,stopRun,pa
     const l=cfg();
     if(!l.botId||!q('SELECT id FROM bots WHERE id=?').get(l.botId))throw new Error('The Lumos worker is not set up yet (Switch-LumosBackend.ps1 -To nimbus does it).');
     store.bind({id:BINDING,generation:GENERATION,owner:route.owner,chat:route.chat,botId:l.botId});
-    authority=hostAuthority({store,reader:ref=>readContent(ref),stage:stageFile,sink:(wire,{signal}={})=>bridge(wire.path,{method:wire.method,body:wire.body,headers:wire.headers,signal})});
+    const scratch=path.join(dataDir,'lumos','scratch');fs.mkdirSync(scratch,{recursive:true});
+    authority=hostAuthority({store,reader:ref=>readContent(ref),stage:stageFile,scratch,sink:(wire,{signal}={})=>bridge(wire.path,{method:wire.method,body:wire.body,headers:wire.headers,signal})});
     // Runs that were active before a restart regain their bridge tools.
     for(const r of q("SELECT run_id FROM lumos_inbox WHERE state='ingested' AND run_id IN (SELECT id FROM runs WHERE status NOT IN ('done','error','stopped','needs_review'))").all())attachHostRun(r.run_id,authority);
   }
-  const EXT={'.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.heic':'image/heic','.webp':'image/webp','.mp4':'video/mp4','.mov':'video/quicktime','.mp3':'audio/mpeg','.m4a':'audio/x-m4a','.pdf':'application/pdf','.txt':'text/plain'};
+  const EXT={'.m4a':'audio/x-m4a','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.heic':'image/heic','.webp':'image/webp','.mp4':'video/mp4','.mov':'video/quicktime','.mp3':'audio/mpeg','.m4a':'audio/x-m4a','.pdf':'application/pdf','.txt':'text/plain'};
   // Copy a local file into private content so its exact bytes are what gets sent.
   function stageFile(file,c){
     const mime=EXT[path.extname(file).toLowerCase()];
@@ -158,6 +162,9 @@ export function createLumos({db,getConfig,loadRoute,insertRun,enqueue,stopRun,pa
       q("INSERT INTO ob_inbox VALUES(?,?,?,?,?,?,?,'text',?)").run(BINDING,GENERATION,sequence,row.guid,digest(row.payload),topic.id,id,JSON.stringify({guid:row.guid,text:text.slice(0,2000),attachments:files.map(f=>({name:f.name,mime:f.mime}))}));
       q('UPDATE ob_binding SET cursor=? WHERE id=? AND generation=?').run(sequence,BINDING,GENERATION);
       q("UPDATE lumos_inbox SET state='ingested',run_id=?,topic=? WHERE guid=?").run(id,topic.id,row.guid);
+      // Service-manual work (and its follow-ups in the same topic) runs on the owner-chosen model.
+      const earlier=q("SELECT payload FROM lumos_inbox WHERE topic=? AND guid<>? AND state='ingested' ORDER BY received_at").all(topic.id,row.guid).map(r=>String(JSON.parse(r.payload).data?.text||''));
+      if(serviceManualRequested(text,earlier))q('INSERT INTO lumos_run_model VALUES(?,?,?,?)').run(id,MANUAL_ROUTE.tier,MANUAL_ROUTE.effort,'service manual');
       q("INSERT INTO lumos_delivery(run_id,guid,state,updated_at) VALUES(?,?,'waiting',?)").run(id,row.guid,now());
       return id;
     });
@@ -390,6 +397,25 @@ export function createLumos({db,getConfig,loadRoute,insertRun,enqueue,stopRun,pa
     }
   }
 
+  // --- Voice replies (pluggable local voice server) ---------------------------
+  async function speak(bot,args,runId,{spawnProcess}={}){
+    if(bot.id!==cfg().botId)throw new Error('lumos_speak is only available to Lumos');
+    const v=cfg().voice||{},text=String(args?.text||'').trim();
+    if(!v.url)return {error:'No voice server is configured yet (lumos.voice.url). Reply in text instead.'};
+    if(!text||text.length>4000)throw new Error('text is required (up to 4000 characters)');
+    const response=await fetchImpl(v.url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:v.model||undefined,voice:v.voice||undefined,input:text,response_format:'wav'})});
+    if(!response.ok)return {error:'Voice server returned HTTP '+response.status};
+    const audio=Buffer.from(await response.arrayBuffer());
+    if(!audio.length||audio.length>50*1024*1024)return {error:'Voice server returned no usable audio'};
+    const dir=path.join(dataDir,'bots',String(bot.id),'voice'),stamp=Date.now();fs.mkdirSync(dir,{recursive:true});
+    const raw=path.join(dir,stamp+'.wav'),out=path.join(dir,'Lumos-'+stamp+'.m4a');fs.writeFileSync(raw,audio);
+    // iMessage plays AAC .m4a; the bridge accepts audio/x-m4a.
+    const code=await new Promise(resolve=>{const child=(spawnProcess||spawnChild)(v.ffmpeg||'ffmpeg',['-y','-loglevel','error','-i',raw,'-c:a','aac','-b:a','64k',out],{windowsHide:true,stdio:'ignore'});child.on('error',()=>resolve(-1));child.on('close',resolve);});
+    try{fs.rmSync(raw,{force:true});}catch{}
+    if(code!==0||!fs.existsSync(out))return {error:'Audio conversion failed (ffmpeg exit '+code+')'};
+    return dispatchOpenBubbles(bot,{operationId:'voice-'+stamp,kind:'attachments',files:[{path:out}]},{runId,openBubblesAuthority:authority});
+  }
+
   // --- Lifecycle -------------------------------------------------------------
   let delivering=null;
   const tick=async()=>{if(delivering)return delivering;delivering=(async()=>{try{await deliver();if(ready()){await queueWork();await fireReminders();advanceReviews();}}catch(error){lastError=error.message;log.error('Lumos delivery:',error.message);}finally{delivering=null;}})();return delivering;};
@@ -425,5 +451,5 @@ export function createLumos({db,getConfig,loadRoute,insertRun,enqueue,stopRun,pa
   }
   // Re-read config (after enable/disable) and pick up a changed route.
   async function reconfigure(){try{route=loadRoute(cfg());ensureBinding();lastError=null;}catch(error){route=null;authority=null;lastError=error.message;}tick();return status();}
-  return {start,stop,status,reconfigure,handleWebhook,tick,topics,store,deliver,processInbox:queueWork,reminder,fireReminders,advanceReviews};
+  return {start,stop,status,reconfigure,handleWebhook,tick,topics,store,deliver,processInbox:queueWork,reminder,fireReminders,advanceReviews,speak,modelFor:runId=>q('SELECT tier,effort,reason FROM lumos_run_model WHERE run_id=?').get(runId)||null};
 }

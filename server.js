@@ -885,7 +885,7 @@ function setupLumosWorker(){
   if(!fs.existsSync(pointer))throw new Error('Import Lumos state first (bin/lumos-import.mjs)');
   const home=JSON.parse(fs.readFileSync(pointer,'utf8')).path;
   const persona=fs.readFileSync(path.join(home,'persona','LUMOS.md'),'utf8');
-  const tools=JSON.stringify([...new Set(['shell','exec_command','write_stdin','apply_patch','read_file','write_file','list_files','view_image','skills','update_plan','capabilities','request_tool','tool_request_status','browser','shared_note','ask_worker','memory_recall','openbubbles_operation','lumos_reminder','code_search','research_search','research_fetch','scholar_search','knowledge_search','project_map','file_manifest'])].filter(n=>coreTools.some(t=>t.function.name===n)));
+  const tools=JSON.stringify([...new Set(['shell','exec_command','write_stdin','apply_patch','read_file','write_file','list_files','view_image','skills','update_plan','capabilities','request_tool','tool_request_status','browser','shared_note','ask_worker','memory_recall','openbubbles_operation','lumos_reminder','lumos_speak','code_search','research_search','research_fetch','scholar_search','knowledge_search','project_map','file_manifest'])].filter(n=>coreTools.some(t=>t.function.name===n)));
   const role='Personal assistant for Jesse over iMessage: research, writing, scheduling, media and PC operations';
   let id=config().lumos.botId;
   if(id&&q('SELECT id FROM bots WHERE id=?').get(id))q('UPDATE bots SET name=?,role=?,instructions=?,tools=?,approval_rules=?,default_model=? WHERE id=?').run('Lumos',role,persona,tools,'[]','claude-sonnet',id);

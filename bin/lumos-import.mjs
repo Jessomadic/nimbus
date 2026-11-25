@@ -51,6 +51,9 @@ ${body.trim()}
 - Voice memos and audio arrive as files: transcribe them with transcribe_local_audio (rich-tools) before answering. Images: inspect them with view_image.
 - Reminders and follow-up checks: use lumos_reminder (kind "message" for a reminder text, kind "task" for a check you should run later and report).
 - Web: research_search and research_fetch replace web_search and web_extract; code_search replaces search_files.
+- Desktop control (Hermes computer_use) is the lumos-computer connector: list_windows / get_window_state / zoom to look, then click, type_text, press_key, hotkey, scroll or drag. Prefer the browser tool for websites. Look again after acting to confirm the effect.
+- Voice: lumos_speak sends a spoken reply as audio when a local voice server is configured; otherwise answer in text.
+- Service-manual work runs on Claude Opus (owner decision 2026-11-25; Astra is not on the current plan). Follow the field-service-manuals skill for sources, crops, blue markup and PDF output with Nimbus tools. Generative image recreation (gpt-image-2) is not available on Nimbus yet: use original photos, PDF vectors or video frames, and say so if a recreated image would have been needed.
 - You may create or improve your own skills by editing files under the skills folder in your Lumos home with write_file or apply_patch, as skill_manage did in Hermes. Keep each skill's SKILL.md frontmatter.
 - Long work can be handed to Nimbus workers with ask_worker; keep Jesse informed in your reply.
 - Your long-term memory tools are memory, fact_store and fact_feedback (the lumos-memory connector). Save durable facts and preferences there.

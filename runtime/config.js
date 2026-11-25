@@ -19,6 +19,8 @@ export const LUMOS_DEFAULTS={
   reviewerBotId:null,
   validatorBotId:null,
   reviewEvery:3,
+  // Local voice server (OpenAI-compatible POST /v1/audio/speech). Empty = no voice replies.
+  voice:{url:'',model:'',voice:'',ffmpeg:'C:/FFMPEG/bin/ffmpeg.exe'},
 };
 const loopback=(value,label)=>{
   let url;try{url=new URL(value);}catch{throw new Error(`Invalid Lumos ${label}`);}
@@ -31,6 +33,8 @@ export function validateLumosConfig(l){
   if(l.botId!==null&&(!Number.isSafeInteger(l.botId)||l.botId<1))throw new Error('Invalid Lumos worker id');
   for(const key of ['bridgeConfigPath','ownerConfigPath','homeDir','python'])if(typeof l[key]!=='string')throw new Error(`Invalid Lumos ${key}`);
   if(!Number.isFinite(l.topicTimeoutSeconds)||l.topicTimeoutSeconds<2||l.topicTimeoutSeconds>20)throw new Error('Invalid Lumos topic timeout');
+  if(!l.voice||typeof l.voice!=='object'||['url','model','voice','ffmpeg'].some(k=>typeof l.voice[k]!=='string'))throw new Error('Invalid Lumos voice settings');
+  if(l.voice.url){let u;try{u=new URL(l.voice.url);}catch{throw new Error('Invalid Lumos voice server URL');}if(!['http:','https:'].includes(u.protocol)||u.username||u.password)throw new Error('Lumos voice server URL must be http(s) without credentials');}
   if(l.enabled&&(!l.botId||!l.homeDir))throw new Error('Lumos needs botId and homeDir before it can be enabled');
   return l;
 }
