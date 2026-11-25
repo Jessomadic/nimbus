@@ -84,3 +84,13 @@ test('Claude token format and model resolution',()=>{
   assert.equal(resolveClaudeModel('claude-opus'),'claude-opus-5-5');
   const c=config();c.claude.models['claude-opus']='claude-opus-5';assert.equal(resolveClaudeModel('claude-opus',c),'claude-opus-5');
 });
+
+test('a long worker brief is passed as a file, not on the command line, and the file is removed afterwards',async()=>{
+  const long='Lumos persona. '.repeat(4000);let seen;
+  const spawnSpy=(cmd,args,opts)=>{seen=args;return fakeSpawn()(cmd,args,opts);};
+  const r=await claudeTurn({model:'claude-sonnet-5-5',effort:'low',instructions:long,messages:[{role:'user',content:'Say hello'}],tools,callTool:async()=>({echo:'x'}),cwd:dir,spawnProcess:spawnSpy});
+  assert.match(r.text,/echoed/);
+  assert.ok(seen.join(' ').length<4000,'command line stays short');
+  const file=seen[seen.indexOf('--system-prompt-file')+1];
+  assert.ok(!fs.existsSync(file),'temporary prompt file is cleaned up');
+});

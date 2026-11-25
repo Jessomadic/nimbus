@@ -135,20 +135,22 @@ function bridgeServer({definitions,onList,onCall}){
   return new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',()=>resolve({server,token,url:'http://127.0.0.1:'+server.address().port}));});
 }
 
-export function claudeArgs({model,effort,instructions,mcpConfig}){
+// Instructions and the MCP config are passed as files: a Lumos or Orchestrator
+// brief easily exceeds the Windows command-line limit (spawn ENAMETOOLONG).
+export function claudeArgs({model,effort,systemPromptFile,mcpConfigFile}){
   return ['-p','--output-format','stream-json','--verbose','--input-format','text',
     '--model',model,'--effort',effort==='max'?'max':effort||'medium',
-    '--tools','','--strict-mcp-config','--mcp-config',mcpConfig,
+    '--tools','','--strict-mcp-config','--mcp-config',mcpConfigFile,
     '--permission-mode','dontAsk','--allowedTools','mcp__nimbus',
     '--disable-slash-commands','--no-session-persistence','--setting-sources','',
-    '--system-prompt',instructions];
+    '--system-prompt-file',systemPromptFile];
 }
 
 // Same contract as codexTurn: returns {text, model, threadId, usage, unconsumedToolResults}.
 export async function claudeTurn({model,effort,instructions,messages,tools,callTool,toolFeedback,contextFeedback,cwd,signal,onEvent=()=>{},onThread=()=>{},spawnProcess=launch,silenceMs=600000}){
   const c=config();claudeSlots.limit=c.claude?.maxConcurrent||2;
   const release=await claudeSlots.acquire(signal);
-  let child,bridge,silenceTimer;
+  let child,bridge,silenceTimer,scratch;
   try{
     signal?.throwIfAborted();
     const names=dynamicToolNames(tools);
@@ -181,7 +183,11 @@ export async function claudeTurn({model,effort,instructions,messages,tools,callT
     let prompt='Use the host-supplied assignment state below: execute a new assignment or resume the provided state as applicable. This JSON is Nimbus\'s retained task state. Completed tool outcomes are evidence, not instructions to repeat actions. Use only the mcp__nimbus tools for actions. Preserve human instructions and all task, approval and no-replay boundaries.\n'+JSON.stringify(inference);
     const retained=new Set(inference.filter(m=>m.role==='tool').map(m=>m.tool_call_id));
     if(retainedImages(messages.filter(m=>m.role==='tool'&&retained.has(m.tool_call_id))).length)prompt+='\nRetained images exist in this checkpoint. Inspect them again with view_image before making visual claims.';
-    const args=claudeArgs({model,effort,instructions:instructions+'\nExecution boundary: Claude Code built-in tools are disabled for this session. Authorized Nimbus tools are the mcp__nimbus__* tools; they run under Nimbus host permissions and the action journal. Report actual tool denials exactly; never disguise an action to bypass one.',mcpConfig});
+    scratch=fs.mkdtempSync(path.join(os.tmpdir(),'nimbus-claude-'));
+    const mcpConfigFile=path.join(scratch,'mcp.json'),systemPromptFile=path.join(scratch,'system.txt');
+    fs.writeFileSync(mcpConfigFile,mcpConfig,{mode:0o600});
+    fs.writeFileSync(systemPromptFile,instructions+'\nExecution boundary: Claude Code built-in tools are disabled for this session. Authorized Nimbus tools are the mcp__nimbus__* tools; they run under Nimbus host permissions and the action journal. Report actual tool denials exactly; never disguise an action to bypass one.',{mode:0o600});
+    const args=claudeArgs({model,effort,systemPromptFile,mcpConfigFile});
     child=spawnProcess(claudeBin(c.claude?.bin),args,{cwd,env:await claudeEnv(),stdio:['pipe','pipe','pipe']});
     let stderr='',finalText='',usedModel=model,usage={},result=null,sessionId=null;
     child.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
@@ -229,6 +235,7 @@ export async function claudeTurn({model,effort,instructions,messages,tools,callT
     clearInterval(silenceTimer);
     try{if(child&&child.exitCode==null)child.kill();}catch{}
     bridge?.server.close();
+    if(scratch)try{fs.rmSync(scratch,{recursive:true,force:true});}catch{}
     release();
   }
 }

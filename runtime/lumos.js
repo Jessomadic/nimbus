@@ -64,6 +64,7 @@ export function createLumos({db,getConfig,loadRoute,insertRun,enqueue,stopRun,pa
   const ready=()=>!!(cfg().enabled&&route&&authority&&cfg().botId&&q('SELECT id FROM bots WHERE id=?').get(cfg().botId));
   function ensureBinding(){
     const l=cfg();
+    if(!l.botId||!q('SELECT id FROM bots WHERE id=?').get(l.botId))throw new Error('The Lumos worker is not set up yet (Switch-LumosBackend.ps1 -To nimbus does it).');
     store.bind({id:BINDING,generation:GENERATION,owner:route.owner,chat:route.chat,botId:l.botId});
     authority=hostAuthority({store,reader:ref=>readContent(ref),stage:stageFile,sink:(wire,{signal}={})=>bridge(wire.path,{method:wire.method,body:wire.body,headers:wire.headers,signal})});
     // Runs that were active before a restart regain their bridge tools.

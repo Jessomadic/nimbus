@@ -8,7 +8,12 @@ const args = process.argv.slice(2), flag = name => args[args.indexOf(name) + 1];
 let prompt = ''; for await (const chunk of process.stdin) prompt += chunk;
 const out = value => process.stdout.write(JSON.stringify(value) + '\n');
 const mode = process.env.FAKE_CLAUDE_MODE || 'tool';
-const server = JSON.parse(flag('--mcp-config')).mcpServers.nimbus;
+const fs = await import('node:fs');
+const rawConfig = flag('--mcp-config');
+// Nimbus passes the MCP config and system prompt as files (command-line length).
+const server = JSON.parse(rawConfig.trim().startsWith('{') ? rawConfig : fs.readFileSync(rawConfig, 'utf8')).mcpServers.nimbus;
+const systemPrompt = fs.readFileSync(flag('--system-prompt-file'), 'utf8');
+if (!systemPrompt.includes('Execution boundary')) throw new Error('system prompt file missing the execution boundary');
 out({ type: 'system', subtype: 'init', session_id: 'fake-session', model: flag('--model'), apiKeySource: mode === 'apikey' ? 'ANTHROPIC_API_KEY' : 'none',
   tools: [], mcp_servers: [{ name: 'nimbus', status: 'pending' }], argv: { tools: flag('--tools'), permission: flag('--permission-mode'), allowed: flag('--allowedTools'), env: Object.keys(process.env).filter(k => /^(ANTHROPIC|CLAUDE)/.test(k)) } });
 if (mode === 'nomodel') { out({ type: 'result', is_error: true, result: "You're out of usage credits. Switch to another model, or manage usage credits to continue." }); process.exit(1); }
