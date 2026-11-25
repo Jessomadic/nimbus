@@ -1,0 +1,44 @@
+Build and 14 URL/origin assertions passed.
+SHA256 hash of F:\Nimbus\data\bots\15\windows-app\windows-client\dist\Nimbus.exe:
+c24db4609841c6f9d15b143bbdfba04d977d16fb3f0148ea35c3da3060da9916
+CertUtil: -hashfile command completed successfully.
+SHA256 hash of F:\Nimbus\data\bots\15\windows-app\windows-client\dist\NimbusSetup.exe:
+72bdab49da88c3bd3b8b13be52b0c986ec7756d2e15c7bec54177744b585b332
+CertUtil: -hashfile command completed successfully.
+Launch PID=40244, window=658192, exited=False
+
+
+
+Connect
+Connect
+Connected: https://nimbus.jessecopas.com
+
+
+Nimbus
+
+Nimbus - Web content
+
+
+
+
+
+
+
+
+
+
+
+
+?? windows-client/
+
+Name                            Length
+----                            ------
+install.ps1                        905
+Microsoft.Web.WebView2.Core.dll 603712
+Microsoft.Web.WebView2.Wpf.dll   83008
+Nimbus.exe                       13312
+Nimbus.exe.config                  138
+NimbusSetup.exe                 405504
+NimbusSetup.sed                    984
+README.md                         3503
+WebView2Loader.dll              165968
