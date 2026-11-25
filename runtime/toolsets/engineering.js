@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { capture } from '../process.js';
+import { installedRipgrepBins } from '../ripgrep.js';
 import { redact as baseRedact } from '../../redact.js';
 const redact = value => baseRedact(String(value).replace(/\b(https?:\/\/)[^/\s@]+@/gi, '$1[credentials]@'));
 
@@ -148,20 +149,21 @@ function environment() {
   delete env.NODE_TEST_CONTEXT; delete env.GH_DEBUG;
   return env;
 }
-async function command(ctx, executable, argv, { cwd, timeout = 20000 } = {}) {
+async function command(ctx, executable, argv, { cwd, timeout = 20000, diagnosticTail = false } = {}) {
   ctx.signal?.throwIfAborted();
   if (ctx.commandRunner) return ctx.commandRunner(executable, argv, { cwd, timeout, signal: ctx.signal, env: environment() });
   const started = Date.now();
   try {
-    const stdout = await capture(executable, argv, { cwd, timeout, signal: ctx.signal, env: environment() });
-    return { exitCode: 0, stdout, stderr: '', durationMs: Date.now() - started };
+    const result = await capture(executable, argv, { cwd, timeout, signal: ctx.signal, env: environment(), resultEvidence: true, diagnosticTail });
+    return { ...result, durationMs: Date.now() - started };
   } catch (error) {
     if (ctx.signal?.aborted) throw error;
-    return { exitCode: error.exitCode ?? null, stdout: error.stdout || '', stderr: error.stderr || '', error: redact(error.message), durationMs: Date.now() - started, timedOut: /timed out/i.test(error.message) };
+    if (error.uncertain || error.evidence?.captureOverflow || error.exitCode === 0) throw error;
+    return { exitCode: error.exitCode ?? null, stdout: error.stdout || '', stderr: error.stderr || '', evidence: error.evidence, error: redact(error.message), durationMs: Date.now() - started, timedOut: /timed out/i.test(error.message) };
   }
 }
 function success(result, label) {
-  if (result.exitCode !== 0) throw new Error(`${label}: ${redact(result.error || result.stderr || result.stdout || 'command failed').slice(-1600)}`);
+  if (result.exitCode !== 0 || result.timedOut || result.error || result.evidence?.outputComplete === false) throw Object.assign(new Error(`${label}: ${redact(result.error || result.stderr || result.stdout || 'command failed').slice(-1600)}`), { evidence: result.evidence });
   return result.stdout;
 }
 function safeRef(value, label = 'ref') {
@@ -317,8 +319,17 @@ export async function execute(name, args = {}, ctx = {}) {
     for(const dir of ignored)argv.push('--glob','!**/'+dir+'/**');
     for(const glob of ['!**/.env*','!**/*.pem','!**/*.key','!**/credentials*','!**/secrets*'])argv.push('--glob',glob);
     argv.push('--',args.query,root);
-    const result=await command(ctx,'rg',argv,{cwd:rootStat.isDirectory()?root:path.dirname(root),timeout:15000});
-    if(![0,1].includes(result.exitCode))return{available:result.exitCode!==null,path:root,dependency:'ripgrep (rg)',error:result.error||redact(result.stderr),matches:[]};
+    const options={cwd:rootStat.isDirectory()?root:path.dirname(root),timeout:15000};
+    let result=await command(ctx,'rg',argv,options);
+    // Sign-in tasks inherit Windows' normal PATH, without Codex's session-only
+    // additions. Reuse its installed companion binary when rg cannot launch.
+    if(result.exitCode===null&&process.platform==='win32'){
+      for(const executable of installedRipgrepBins()){
+        result=await command(ctx,executable,argv,options);
+        if(result.exitCode!==null)break;
+      }
+    }
+    if(![0,1].includes(result.exitCode))return{available:result.exitCode!==null,path:root,dependency:'ripgrep (rg)',evidence:result.evidence,error:result.error||redact(result.stderr),matches:[]};
     const matches=[];let truncated=false;
     for(const line of result.stdout.split(/\r?\n/)){
       if(!line)continue;
@@ -364,9 +375,9 @@ export async function execute(name, args = {}, ctx = {}) {
       if(relative==='..'||relative.startsWith('..'+path.sep)||path.isAbsolute(relative))throw new Error('testDirectory must stay in the project');
       executable=process.platform==='win32'?'python.exe':'python3';argv=['-m','unittest','discover','-s',directory,'-v'];
     }else throw new Error('Choose node_test, npm_script or python_unittest');
-    const result=await command(ctx,executable,argv,{cwd:root,timeout:bounded(args.timeoutSeconds,120,180)*1000});
-    return{path:root,runner:args.runner,command:{executable,args:argv},pass:result.exitCode===0&&!result.timedOut,exitCode:result.exitCode,durationMs:result.durationMs,
-      stdout:redact(result.stdout.slice(-40000)),stderr:redact(result.stderr.slice(-12000)),...(result.error?{error:result.error}:{}),timedOut:!!result.timedOut,truncated:result.stdout.length>40000||result.stderr.length>12000};
+    const result=await command(ctx,executable,argv,{cwd:root,timeout:bounded(args.timeoutSeconds,120,180)*1000,diagnosticTail:true});
+    return{path:root,runner:args.runner,command:{executable,args:argv},pass:result.exitCode===0&&!result.timedOut&&!result.error&&result.evidence?.outputComplete!==false,exitCode:result.exitCode,durationMs:result.durationMs,
+      stdout:redact(result.stdout).slice(-40000),stderr:redact(result.stderr).slice(-12000),...(result.evidence!==undefined?{evidence:result.evidence}:{}),...(result.error?{error:result.error}:{}),timedOut:!!result.timedOut,truncated:!!result.evidence?.stdoutTruncated||!!result.evidence?.stderrTruncated||result.stdout.length>40000||result.stderr.length>12000};
   }
   if(name.startsWith('git_')){
     const root=await gitRoot(args,ctx),state=await headState(root,ctx);
@@ -427,7 +438,7 @@ export async function execute(name, args = {}, ctx = {}) {
       argv=['run','view',String(args.runId),'--repo',repository,'--json','databaseId,name,workflowName,event,headBranch,headSha,status,conclusion,url,createdAt,updatedAt,jobs'];
     }
     const result=await command(ctx,'gh',argv,{cwd:ctx.workspace||ctx.root||process.cwd(),timeout:45000});
-    if(result.exitCode!==0)return{available:false,repository,dependency:'Independently authenticated GitHub CLI (gh)',mode:'read_only',error:result.error||redact(result.stderr||result.stdout).slice(-3000)};
+    if(result.exitCode!==0)return{available:false,repository,dependency:'Independently authenticated GitHub CLI (gh)',mode:'read_only',evidence:result.evidence,error:result.error||redact(result.stderr||result.stdout).slice(-3000)};
     let record;try{record=JSON.parse(result.stdout);}catch{throw new Error('GitHub CLI returned invalid JSON');}
     const bounds={};
     if(Array.isArray(record.statusCheckRollup)){bounds.totalChecks=record.statusCheckRollup.length;bounds.checksTruncated=record.statusCheckRollup.length>100;record.statusCheckRollup=record.statusCheckRollup.slice(0,100);}
@@ -438,7 +449,7 @@ export async function execute(name, args = {}, ctx = {}) {
     const output={available:true,repository,mode:'read_only',verification:'GitHub CLI API response',record,bounds};
     if(name==='github_actions_inspect'&&args.failedLogs){
       const logs=await command(ctx,'gh',['run','view',String(args.runId),'--repo',repository,'--log-failed'],{cwd:ctx.workspace||ctx.root||process.cwd(),timeout:45000});
-      const limit=bounded(args.maxLogCharacters,16000,40000,1000);output.failedLogs={available:logs.exitCode===0,output:redact(logs.stdout.slice(-limit)),truncated:logs.stdout.length>limit,...(logs.error?{error:logs.error}:{})};
+      const limit=bounded(args.maxLogCharacters,16000,40000,1000);output.failedLogs={available:logs.exitCode===0,evidence:logs.evidence,output:redact(logs.stdout).slice(-limit),truncated:logs.stdout.length>limit,...(logs.error?{error:logs.error}:{})};
     }
     return output;
   }

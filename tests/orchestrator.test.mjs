@@ -70,6 +70,23 @@ test('Discovery and setup plan are honest about the unconfigured Hermes/Lumos br
   const plan=planOrchestratorSetup(roster());assert.equal(plan.create,false);assert.deepEqual(plan.attach.map(bot=>bot.id),[31,72]);assert.deepEqual(plan.preserveParents.map(bot=>[bot.id,bot.parent_bot_id]),[[83,72],[96,31]]);
 });
 
+test('scoped Orchestrators preserve the canonical root and explicit task selection',()=>{
+  const bots=[...roster(),worker(301,'Memory Orchestrator','orchestrator',207),worker(302,'Recall Orchestrator','orchestrator',301),worker(303,'Memory Builder','builder',301)];
+  assert.equal(resolveOrchestrator(bots).id,207);
+  assert.equal(resolveTaskWorker({},bots).id,207);
+  assert.equal(resolveTaskWorker({botId:302},bots).id,302);
+  assert.throws(()=>resolveTaskWorker({botId:301},bots,{orchestratorOnly:true}),errorCode('orchestrator_redirect_rejected'));
+  assert.deepEqual(orchestratorStatus(bots).coordinators.map(bot=>[bot.id,bot.parent_bot_id]),[[301,207],[302,301]]);
+  const plan=planOrchestratorSetup(bots);assert.equal(plan.create,false);assert.deepEqual(plan.attach.map(bot=>bot.id),[31,72]);assert.ok(plan.preserveParents.some(bot=>bot.id===303&&bot.parent_bot_id===301));
+});
+
+test('scoped Orchestrators cannot conceal duplicate roots, cycles, missing parents or name collisions',()=>{
+  const root=worker(207,'Orchestrator','orchestrator');
+  for(const children of [[worker(301,'Memory','orchestrator',999)],[worker(301,'Memory','orchestrator',302),worker(302,'Skills','orchestrator',301)],[worker(301,'Memory','orchestrator',31),worker(31,'Builder','builder',207)]])assert.throws(()=>resolveOrchestrator([root,...children]),errorCode('invalid_coordinator_hierarchy'));
+  assert.throws(()=>resolveOrchestrator([root,worker(301,'Memory','orchestrator',207),worker(302,'Second root','orchestrator')]),errorCode('ambiguous_orchestrator'));
+  assert.throws(()=>resolveOrchestrator([root,worker(301,'Memory','orchestrator',207),worker(302,'Orchestrator','builder',207)]),errorCode('orchestrator_name_collision'));
+});
+
 test('Task destination defaults only when selectors are omitted and refuses ambiguous or conflicting selectors',()=>{
   const bots=roster();assert.equal(resolveTaskWorker({},bots).id,207);assert.equal(resolveTaskWorker({worker:' builder '},bots).id,31);assert.equal(resolveTaskWorker({botId:'31',worker:'Builder'},bots).id,31);
   assert.equal(resolveTaskWorker({botId:31},bots.filter(bot=>bot.id!==207)).id,31);

@@ -33,6 +33,10 @@ function increment(value, maximum = MAX_COUNTER) {
 }
 
 export function chargeToolAttempt(state, name, options) {
+  if(options?.executionMode==='progress') {
+    for(const key of ['steps','toolAttempts','totalActionSteps','totalToolAttempts']) state[key]=increment(counter(state[key],MAX_COUNTER));
+    return {executionMode:'progress',attemptedTool:name};
+  }
   const limits = budgetLimits(options);
   if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('Tool budget state must be a mutable checkpoint object');
 
@@ -66,6 +70,7 @@ export function chargeToolAttempt(state, name, options) {
 }
 
 export function toolBudgetFeedback(state, options) {
+  if(options?.executionMode==='progress') return '';
   const budget = currentBudget(state, budgetLimits(options));
   if (budget.actionsUsed < Math.ceil(budget.actionLimit * 0.75) && budget.attemptsUsed < Math.ceil(budget.attemptLimit * 0.75)) return '';
   return `Tool budget: ${budget.actionRemaining} of ${budget.actionLimit} action slots and ${budget.attemptRemaining} of ${budget.attemptLimit} tool attempts remain in this continuation. Preserve verified progress and exact evidence. Prefer a bounded continuation or an enabled-worker handoff over repeated exploration; collect accepted work with bounded worker_result or tool_request_status polling. If the remaining action slots cannot safely finish the work, retain the checkpoint and pause before another action. Status polls consume attempts even when they do not consume action slots.`;

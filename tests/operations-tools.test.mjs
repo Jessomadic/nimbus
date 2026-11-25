@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {registeredConnector} from './helpers/registered-connector.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,6 +17,7 @@ function fixture(t){
 }
 test('tool catalogue reflects enabled tools and connector inventory never returns transport secrets',async t=>{
   const ctx=fixture(t);ctx.availableTools=[...tools,{function:{name:'mcp__test__lookup',description:'Lookup fixture'}}];ctx.bindings=new Map([['mcp__test__lookup',{readOnly:true,secret:'PRIVATE'}]]);
+  const registered=await registeredConnector(ctx.botId,'mcp__test__lookup',{readOnly:true},{type:'object',properties:{}});ctx.bot={id:ctx.botId};ctx.availableTools=[...tools,...registered.availableTools];ctx.bindings=registered.bindings;
   const catalog=await execute('tool_catalog',{query:'schedule',details:true},ctx);assert.ok(catalog.tools.some(t=>t.name==='automation_schedule'&&t.parameters));
   ctx.connectorErrors=[{server:'test',error:'Authorization: Bearer PRIVATE_MARKER'}];
   const inventory=await execute('connector_inventory',{},ctx);assert.equal(inventory.tools.length,1);assert.equal(inventory.tools[0].readOnly,true);assert.ok(!JSON.stringify(inventory).includes('PRIVATE'));
@@ -63,6 +65,17 @@ test('task history only exposes the current worker\'s runs',async t=>{
   assert.equal((await execute('task_history',{},ctx)).runs.length,1);
   assert.equal((await execute('task_history',{runId:11},ctx)).events[0].data.ok,true);
   await assert.rejects(execute('task_history',{runId:12},ctx),/owned/);
+});
+test('archived tool evidence is paged exactly and remains restricted to the owning worker',async t=>{
+  const ctx=fixture(t);ctx.db.exec("CREATE TABLE tool_calls(id TEXT,run_id INTEGER,name TEXT,args TEXT,result TEXT,state TEXT);INSERT INTO runs(id,bot_id,status) VALUES(11,1,'done'),(12,2,'done');");
+  const args=JSON.stringify({path:'proof.txt'}),result=JSON.stringify({text:'A'.repeat(9000),end:'EXACT_END'});
+  ctx.query('INSERT INTO tool_calls VALUES(?,?,?,?,?,?)').run('11:retained-call',11,'read_file',args,result,'done');
+  ctx.query('INSERT INTO tool_calls VALUES(?,?,?,?,?,?)').run('12:private-call',12,'read_file','{}','{"private":true}','done');
+  let offset=0,text='';do{const page=await execute('task_history',{callId:'retained-call',offset,maxChars:1024},ctx);assert.equal(page.runId,11);assert.equal(page.readOnly,true);assert.ok(page.text.length<=1024);text+=page.text;offset=page.nextOffset;}while(offset!==null);
+  assert.deepEqual(JSON.parse(text),{arguments:JSON.parse(args),result:JSON.parse(result)});
+  await assert.rejects(execute('task_history',{callId:'private-call'},ctx),/owned/);
+  await assert.rejects(execute('task_history',{callId:'retained-call',runId:12},ctx),/different run/);
+  assert.equal(ctx.query('SELECT count(*) n FROM tool_calls').get().n,2);
 });
 test('shared cron parser retains weekday, ranges and invalid-step behavior',()=>{
   assert.equal(isValidCron('*/15 9-17 * * 1-5'),true);assert.equal(isValidCron('*/0 * * * *'),false);

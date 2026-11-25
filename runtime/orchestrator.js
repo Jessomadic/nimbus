@@ -5,14 +5,23 @@ export class OrchestratorError extends Error{
   constructor(message,statusCode=400,code='invalid_request'){super(message);this.name='OrchestratorError';this.statusCode=statusCode;this.status=statusCode;this.code=code;}
 }
 function roster(bots){if(!Array.isArray(bots))throw new OrchestratorError('A current worker roster is required',500,'invalid_roster');return bots;}
-function coordinatorCandidates(bots){return roster(bots).filter(bot=>bot.template===ORCHESTRATOR_PROFILE_ID||String(bot.name||'').trim().toLowerCase()==='orchestrator');}
 export function resolveOrchestrator(bots,{required=true}={}){
-  const candidates=coordinatorCandidates(bots);
-  if(candidates.length>1)throw new OrchestratorError('Multiple Orchestrator identities exist. Resolve duplicate profiles/names before routing or setup.',409,'ambiguous_orchestrator');
-  if(candidates.length===1&&candidates[0].template!==ORCHESTRATOR_PROFILE_ID)throw new OrchestratorError('An unregistered worker already uses the Orchestrator name. Classify it explicitly before creating a coordinator.',409,'orchestrator_name_collision');
-  if(!candidates.length){if(required)throw new OrchestratorError('Orchestrator is not configured. Run the Orchestrator setup before submitting default tasks.',404,'orchestrator_not_configured');return null;}
-  const result=candidates[0];
-  if(result.parent_bot_id!=null)throw new OrchestratorError('The Orchestrator has a parent. Setup will not silently reparent it; resolve that hierarchy explicitly.',409,'orchestrator_has_parent');
+  const all=roster(bots),coordinators=all.filter(bot=>bot.template===ORCHESTRATOR_PROFILE_ID),roots=coordinators.filter(bot=>bot.parent_bot_id==null);
+  if(all.some(bot=>bot.template!==ORCHESTRATOR_PROFILE_ID&&String(bot.name||'').trim().toLowerCase()==='orchestrator'))throw new OrchestratorError('An unregistered worker already uses the Orchestrator name. Classify it explicitly before creating a coordinator.',409,'orchestrator_name_collision');
+  if(roots.length>1)throw new OrchestratorError('Multiple root Orchestrator identities exist. Resolve duplicate roots before routing or setup.',409,'ambiguous_orchestrator');
+  if(!roots.length){
+    if(coordinators.length)throw new OrchestratorError('The Orchestrator has a parent but no canonical root. Resolve that hierarchy explicitly.',409,'orchestrator_has_parent');
+    if(required)throw new OrchestratorError('Orchestrator is not configured. Run the Orchestrator setup before submitting default tasks.',404,'orchestrator_not_configured');return null;
+  }
+  const result=roots[0],byId=new Map(all.map(bot=>[Number(bot.id),bot]));
+  for(const coordinator of coordinators){
+    const seen=new Set();let current=coordinator;
+    while(Number(current.id)!==Number(result.id)){
+      if(seen.has(Number(current.id)))throw new OrchestratorError('Coordinator hierarchy contains a cycle.',409,'invalid_coordinator_hierarchy');
+      seen.add(Number(current.id));current=byId.get(Number(current.parent_bot_id));
+      if(!current||current.template!==ORCHESTRATOR_PROFILE_ID)throw new OrchestratorError('Each scoped Orchestrator must belong to an Orchestrator chain ending at the canonical root.',409,'invalid_coordinator_hierarchy');
+    }
+  }
   return result;
 }
 function positiveId(value){
@@ -41,6 +50,7 @@ export function resolveTaskWorker(body,bots,{orchestratorOnly=false}={}){
 export function orchestratorStatus(bots){
   const coordinator=resolveOrchestrator(bots,{required:false});
   return{configured:!!coordinator,orchestrator:coordinator?{id:Number(coordinator.id),name:coordinator.name,template:coordinator.template,parent_bot_id:null,model:coordinator.model||'auto',default_model:coordinator.default_model||'',effort:coordinator.effort||null}:null,
+    coordinators:roster(bots).filter(bot=>bot.template===ORCHESTRATOR_PROFILE_ID&&bot.parent_bot_id!=null).map(bot=>({id:Number(bot.id),name:bot.name,parent_bot_id:Number(bot.parent_bot_id)})),
     taskEndpoint:'/api/orchestrator/tasks',bridge:{connected:false,status:'not_configured',contacts:['hermes','lumos'],message:'This endpoint is the designated Nimbus contact for Hermes/Lumos. No bridge connection, credentials or live integration has been configured or verified.'},
     ...(!coordinator?{setupRequired:true,message:'Create the unique Orchestrator profile through bin/setup-orchestrator.mjs --apply.'}:{})};
 }
@@ -73,6 +83,7 @@ export function createTaskSubmission({db,query,runTask,getTask}={}){
     const prompt=task.task+'\nContext:\n'+context+(task.files.length?'\nHost files:\n'+task.files.join('\n'):'');
     db.exec('BEGIN IMMEDIATE');
     try{
+      if(query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_handoff_reservations'").get()&&query('SELECT 1 FROM project_handoff_reservations WHERE request_id=?').get(requestId))throw new OrchestratorError('requestId is owned by a host successor reservation',409,'request_id_conflict');
       const previous=query('SELECT * FROM task_requests WHERE request_key=?').get(requestId);
       if(previous){
         if(previous.fingerprint!==fingerprint)throw new OrchestratorError('requestId was already used for different task data',409,'request_id_conflict');

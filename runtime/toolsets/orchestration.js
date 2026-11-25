@@ -20,5 +20,5 @@ export function execute(name,args={},ctx={}){
   });
   const filter=args.includeRecent?'':` AND status IN (${active.map(()=>'?').join(',')})`,params=args.includeRecent?ids:[...ids,...active];
   const runs=ctx.query(`SELECT id,bot_id,status,parent_run,substr(source,1,80) AS source,started_at,ended_at FROM runs WHERE bot_id IN (${slots})${filter} ORDER BY id DESC LIMIT ?`).all(...params,runLimit+1);
-  return{observedAt:new Date().toISOString(),workers,runs:runs.slice(0,runLimit),truncated:found.length>limit||runs.length>runLimit,readOnly:true,note:'Use ask_worker to delegate and worker_result to collect the actual delegated outcome. Task metadata is not completion evidence.'};
+  return{observedAt:new Date().toISOString(),workers,runs:runs.slice(0,runLimit),questions:ctx.questionInbox?ctx.questionInbox({limit:20}):[],truncated:found.length>limit||runs.length>runLimit,readOnly:true,note:'Use ask_worker to delegate and worker_result to collect the actual delegated outcome. Handle owned questions with answer_worker_question or escalate_worker_question; task metadata is not completion evidence.'};
 }

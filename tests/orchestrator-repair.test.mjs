@@ -6,12 +6,17 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {ROLE_PROFILES} from '../runtime/roles.js';
 import {PROMPT_VERSION,buildWorkerBrief} from '../runtime/prompts.js';
+import {executeSpecialist} from '../runtime/toolsets/index.js';
 import {LEGACY_ORCHESTRATOR_INSTRUCTIONS,CUSTOM_INSTRUCTIONS_MARKER,planOrchestratorRepair,repairOrchestrator} from '../bin/repair-orchestrator.mjs';
 
 const clone=value=>JSON.parse(JSON.stringify(value));
 const rootProfile=()=>ROLE_PROFILES.find(profile=>profile.id==='orchestrator');
 const removed=['read_file','write_file','list_files','shell','exec_command','apply_patch','browser','view_image','skills','write_stdin'];
-const expected=['update_plan','request_user_input','capabilities','request_tool','tool_request_status','shared_note','ask_worker','self_update','tool_catalog','connector_inventory','task_history','team_status'];
+// Full explicit repair targets the current declared template. This differs from
+// the question deployment's additive three-tool installed-profile migration;
+// inherited lifecycle schema registration does not activate its host callback.
+const questionTools=['question_inbox','answer_worker_question','escalate_worker_question'];
+const expected=['update_plan','request_user_input','question_inbox','answer_worker_question','escalate_worker_question','capabilities','request_tool','tool_request_status','project_recovery','shared_note','ask_worker','self_update','tool_catalog','connector_inventory','task_history','team_status','project_successor_handoff','task_lifecycle_reconcile'];
 function fixture(t,{instructions=LEGACY_ORCHESTRATOR_INSTRUCTIONS,active=0,queued=0}={}){
   const temp=fs.mkdtempSync(path.join(os.tmpdir(),'nimbus-orchestrator-repair-')),calls=[],oldTools=['shell','exec_command','write_stdin','apply_patch','read_file','write_file','list_files','view_image','skills','update_plan','request_user_input','capabilities','request_tool','tool_request_status','browser','shared_note','ask_worker','self_update','tool_catalog','connector_inventory','task_history','team_status'];
   const root={id:22,name:'Orchestrator',template:'orchestrator',parent_bot_id:null,instructions,tools:JSON.stringify(oldTools),model:'astra',default_model:'terra',effort:'max',role:'Keep custom role',color:'#abc123',shape:'square',runtime:'auto',computer:0,display_group:'',created_at:44,approval_rules:['Retain approvals'],allow_rules:['Retain permissions'],plugins:['configured-plugin'],status:{state:'idle'},today:{runs:1}},builder={id:2,name:'Builder',template:'builder',parent_bot_id:22,instructions:'Retain Builder custom instructions',tools:JSON.stringify(['shell','read_file','apply_patch']),model:'sol',default_model:'terra',approval_rules:['Keep specialist rules'],plugins:['retain-specialist-plugin']};
@@ -26,13 +31,24 @@ test('Coordinator has only coordination and inventory tools while specialists re
   for(const name of removed)assert.ok(!rootProfile().tools.includes(name),name);
   for(const id of ['builder','architect','windows-operator','automation-engineer','qa-engineer']){
     const profile=ROLE_PROFILES.find(item=>item.id===id);for(const name of removed)assert.ok(profile.tools.includes(name),id+': '+name);
+    for(const name of questionTools)assert.ok(!profile.tools.includes(name),'Coordinator-only question tool on '+id+': '+name);
   }
 });
 
 test('Coordinator prompt requires an early current-run handoff and preserves clarification and authority',()=>{
-  assert.equal(PROMPT_VERSION,'2026-10-27.3');const profile=rootProfile(),brief=buildWorkerBrief({bot:{id:22,...profile,template:'orchestrator'},team:[{id:2,name:'Builder',parent_bot_id:22}]});
+  assert.equal(PROMPT_VERSION,'2026-11-14.questions.1');const profile=rootProfile(),brief=buildWorkerBrief({bot:{id:22,...profile,template:'orchestrator'},team:[{id:2,name:'Builder',parent_bot_id:22}]});
   assert.match(brief,/first coordination tool call is team_status/);assert.match(brief,/within about three coordination calls/);assert.match(brief,/exact worker ID returned by team_status/);assert.match(brief,/children created by this CURRENT run/);assert.match(brief,/Simple conversation/);assert.match(brief,/disabled coordinator tool is not a missing implementation/);assert.match(brief,/human owner remains the authority/);assert.match(brief,/host-supplied memory/);assert.doesNotMatch(brief,/Read MEMORY.md in your workspace/);
+  assert.match(brief,/question_inbox, including nested delegations/);assert.match(brief,/retained evidence and recorded decisions with answer_worker_question/);assert.match(brief,/escalate_worker_question only when a genuinely missing fact/);assert.match(brief,/never a permission grant, approval, credential, QA acceptance or uncertainty resolution/);assert.match(brief,/Handle pending questions before finishing/);assert.match(brief,/question-attention task owns only its explicitly bound questions, not the original project's lifecycle or source authority/);
   const specialist=buildWorkerBrief({bot:{...ROLE_PROFILES.find(item=>item.id==='builder'),template:'builder'}});assert.doesNotMatch(specialist,/## Coordination lane/);assert.match(specialist,/Read MEMORY.md in your workspace/);assert.match(specialist,/Delegate a bounded specialist task only when it helps/);
+  assert.match(specialist,/request_user_input routes worker questions to the actual Orchestrator first/);assert.match(specialist,/After an answer arrives, treat the question as resolved and continue the original authorized work/);assert.match(specialist,/Preserve the answer's actual coordinator or human provenance/);
+});
+
+test('Inherited lifecycle schema remains fail-closed without a real host callback after template repair',async()=>{
+  assert.ok(rootProfile().tools.includes('task_lifecycle_reconcile'));
+  for(const args of [{action:'preview',runIds:[960]},{action:'reconcile',runIds:[960],previewToken:'synthetic-not-authority',reason:'Fixture only'}]){
+    await assert.rejects(executeSpecialist('task_lifecycle_reconcile',args,{botId:22,runId:999}),/Host lifecycle ownership service unavailable/);
+  }
+  await assert.rejects(executeSpecialist('task_lifecycle_reconcile',{action:'preview',runIds:[960],hostAuthority:{authenticated:true}},{botId:22,runId:999}),/invalid_arguments/);
 });
 
 test('Legacy repair provenance is bound to the actual shipped original profile text',()=>{

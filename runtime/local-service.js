@@ -9,8 +9,26 @@ import { localToken } from './credentials.js';
 import { checkResources } from './resources.js';
 import { Slots } from './slots.js';
 
-export async function startLocalService() {
-  const c=config();if(!c.local.enabled||!c.local.managed.enabled)return null;
+export function createLocalService({getConfig=config,getToken=localToken,run=capture,guard=checkResources,request=fetch}={}) {
+  const config=getConfig,localToken=getToken,capture=run,checkResources=guard,fetch=request;
+  let server=null,starting=null,closing=false,boundUrl=null;
+  async function start(c=config()) {
+    if(closing)throw new Error('Managed local service is shutting down');
+    if(!c.local.enabled||!c.local.managed.enabled)return null;
+    if(starting){await starting;return start(c);}
+    if(server){
+      if(boundUrl!==c.local.baseUrl)throw new Error('Managed local endpoint change requires Nimbus restart');
+      return server;
+    }
+    starting=bind(c);
+    try{server=await starting;boundUrl=c.local.baseUrl;return server;}finally{starting=null;}
+  }
+  async function close(){
+    closing=true;
+    if(starting)try{await starting;}catch{}
+    if(server){const owned=server;server=null;await new Promise(resolve=>{owned.close(resolve);owned.closeAllConnections();});}
+  }
+  async function bind(c) {
   const managed=c.local.managed,url=new URL(c.local.baseUrl);
   if(url.hostname!=='127.0.0.1')throw new Error('The managed local service must bind to loopback');
   const slots=new Slots(1);
@@ -24,16 +42,21 @@ export async function startLocalService() {
   const json=(res,code,body)=>{res.writeHead(code,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(body));};
   const server=http.createServer(async(req,res)=>{
     try{
+      let c=config();const managed=c.local.managed;
       if(req.url==='/health')return json(res,200,{ok:true,managed:true,localConcurrency:1});
       const token=await localToken(c.local),expected=Buffer.from('Bearer '+token),supplied=Buffer.from(req.headers.authorization||'');
       if(!token||supplied.length!==expected.length||!timingSafeEqual(supplied,expected))return json(res,401,{error:'Unauthorized'});
       if(req.method==='GET'&&req.url==='/api/v1/models')return json(res,200,modelList(await loaded()));
       if(req.method==='GET'&&req.url==='/v1/models')return json(res,200,{data:modelList(await loaded()).models.map(m=>({id:m.key,object:'model'}))});
       if(req.method!=='POST'||req.url!=='/v1/chat/completions')return json(res,404,{error:'Not found'});
+      if(!c.local.enabled||!managed.enabled)throw new Error('Local models are disabled');
       let raw='';for await(const chunk of req){raw+=chunk;if(Buffer.byteLength(raw)>8*1024*1024)return json(res,413,{error:'Request too large'});}
       const body=JSON.parse(raw);
       const abort=new AbortController();res.on('close',()=>{if(!res.writableEnded)abort.abort(new Error('Nimbus client disconnected'));});
       await slots.use(abort.signal,async()=>{
+        c=config();
+        if(!c.local.enabled||!c.local.managed.enabled)throw new Error('Local models are disabled');
+        const managed=c.local.managed;
         await checkResources(c.local.resourceCeiling);
         let models=await loaded();
         if(!models.some(m=>m.identifier===body.model)){
@@ -62,4 +85,9 @@ export async function startLocalService() {
   });
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(Number(url.port||80),'127.0.0.1',resolve);});
   return server;
+  }
+  return {start,close};
 }
+const managedService=createLocalService();
+export const startLocalService=(c)=>managedService.start(c);
+export const closeLocalService=()=>managedService.close();

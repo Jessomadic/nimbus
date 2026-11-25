@@ -1,5 +1,6 @@
 // Honest implementation inventory, not a claim of full Codex equivalence.
 export const capabilities = [
+  {id:'openbubbles',state:'disabled',detail:'Disabled protocol and durable handoff/dispatcher prepared for host-only synthetic testing. Live transport, event consumer, startup and secret resolution unavailable. No live cutover or parity claim.'},
   {id:'orchestration',state:'implemented',detail:'Dedicated top-level Orchestrator, live team_status inventory, specialist handoffs and result collection, stable idempotent Hermes/Lumos contact endpoints, and independently collapsible root/groups. The external Hermes/Lumos bridge remains unconfigured.'},
   {id:'tool_development',state:'implemented',detail:'Workers can request genuinely missing native capabilities; durable origin-correlated jobs assign design/Builder/QA/Reviewer, park requesters, validate/apply exact source, probe the installed tool and safely resume. Disabled tools, denied approvals and missing credentials/dependencies/services remain explicit blockers.'},
   {id:'specialist_tools',state:'implemented',detail:'Structured specialist tools across orchestration, engineering/Git, research/evidence, data/content/browser and host/automation. Every built-in role has a specialist assignment. tool_catalog lists each worker\'s actual native and discovered MCP tools.'},

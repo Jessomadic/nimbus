@@ -1,5 +1,13 @@
 // Nimbus web app. Plain JS, no build step.
 import { createRuntimeUI } from './runtime.js';
+import {renderQuestionCard} from './question-card.js';
+import {installDownloads} from './downloads.js';
+installDownloads({report:message=>toast(message)});
+import {traceWaitingLabel} from './trace-state.js';
+import {createTraceWorkerLabels} from './trace-workers.js';
+import {describeTraceStep,traceToolName,traceTechnicalDetails} from './trace-activity.js';
+import {followThreadBottom} from './thread-scroll.js';
+import {capabilityRequest,groupToolRequestMessages,renderToolRequestChain} from './tool-request-chain.js';
 import {hierarchyRows} from './team-tree.js';
 import {DISPLAY_GROUPS,defaultDisplayGroup} from './agent-groups.js';
 import {SIDEBAR_GROUPS,normalizeSidebarLayout,sidebarGroupAncestors} from './sidebar-layout.js';
@@ -229,6 +237,7 @@ function md(src) {
     if (i % 2) return `<pre><code>${esc(part.replace(/^\w*\n/, ''))}</code></pre>`;
     return part.trim().split(/\n{2,}/).map((para) => {
       let h = esc(para)
+        .replace(/\[([^\]]+)\]\((\/api\/(?:bots\/\d+\/download|documents\/[a-f0-9-]+\/export)(?:\?[^\s"'<>)]*)?)\)/g, '<a href="$2" download>$1</a>')
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
         .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
@@ -277,8 +286,16 @@ function syncSidebarSeen(){
   if(changed)saveSidebarPreferences();
 }
 function unreadThread(key){const last=S.data?.last?.[key];return !!last&&key!==threadKey()&&last.author!=='user'&&sidebarPrefs.seen[key]!==lastSignature(last);}
+function markAllThreadsRead(){
+  const prefs=sidebarPreferences();
+  for(const [key,last] of Object.entries(S.data?.last||{}))prefs.seen[key]=lastSignature(last);
+  prefs.seeded=true;saveSidebarPreferences();renderSide();
+  document.querySelector('[data-act="mark-all-read"]')?.focus({preventScroll:true});
+  toast('All chats marked as read');
+}
 function orchestratorAgents(){return(S.data?.bots||[]).filter(agent=>agent.template==='orchestrator');}
-function rootOrchestrator(){const agents=orchestratorAgents();return agents.length===1?agents[0]:null;}
+function isRootOrchestrator(agent){return agent?.template==='orchestrator'&&agent.parent_bot_id==null;}
+function rootOrchestrator(){const agents=orchestratorAgents().filter(isRootOrchestrator);return agents.length===1?agents[0]:null;}
 function revealSidebarThread(key){
   const list=$('.side-list'),item=list?[...list.querySelectorAll('.side-item')].find(row=>row.dataset.key===key):null;if(!list||!item)return;
   if(item.classList.contains('fixed-root')){list.scrollTop=0;return;}
@@ -291,7 +308,7 @@ function revealSidebarThread(key){
 function sidebarItems(){
   const d=S.data;
   const items = [
-    ...d.bots.map((b) => ({ key:'bot:'+b.id,parent:b.parent_bot_id?'bot:'+b.parent_bot_id:null,group:b.template==='orchestrator'?null:displayGroup(b),rootCandidate:b.template==='orchestrator',name:b.name,av:avatar(b,38),state:b.status?.state||'idle',last:d.last['bot:'+b.id],fallback:b.role,created:b.created_at })),
+    ...d.bots.map((b) => ({ key:'bot:'+b.id,parent:b.parent_bot_id?'bot:'+b.parent_bot_id:null,group:isRootOrchestrator(b)?null:displayGroup(b),rootCandidate:isRootOrchestrator(b),name:b.name,av:avatar(b,38),state:b.status?.state||'idle',last:d.last['bot:'+b.id],fallback:b.role,created:b.created_at })),
     ...d.rooms.map((r) => ({ key:'room:'+r.id,parent:null,group:'rooms',name:r.name,av:roomAvatar(r,38),state:d.approvals.some(a=>a.thread==='room:'+r.id)?'waiting':r.members.some(id=>bot(id)?.status.state==='working')?'working':'idle',last:d.last['room:'+r.id],fallback:`${r.members.length} agents`,created:r.created_at }))
   ].sort((a,b)=>(b.last?.at||b.created||0)-(a.last?.at||a.created||0));
   // Your own order (from dragging) wins; chats not placed yet stay on top, newest first.
@@ -335,7 +352,33 @@ function sidebarOrchestrator(rootItem,items,sections){
   return `<div class="side-orchestrator" data-orchestrator-root>${orchestratorRow(rootItem)}<button type="button" class="side-orchestrator-toggle" data-orchestrator-toggle aria-expanded="${expanded}" aria-controls="side-orchestrator-team" aria-label="${expanded?'Collapse':'Expand'} subordinate team, ${agents.length} agents${badges.length?', '+badges.map(badge=>badge.text).join(', '):''}" ${sideQuery?'aria-disabled="true" title="Search results stay expanded until search is cleared"':''}><span class="side-group-label">${ICON.chevron}<span>Team agents</span><span class="side-group-count" aria-hidden="true">${agents.length}</span>${sideQuery?`<small>${matches} ${matches===1?'match':'matches'}</small>`:''}</span>${badges.length?`<span class="side-group-badges" aria-hidden="true">${badges.map(badge=>`<span class="side-group-badge side-badge-${badge.kind}" data-orchestrator-badge="${badge.kind}">${esc(badge.text)}</span>`).join('')}</span>`:''}</button></div>
   <div class="side-orchestrator-branch" id="side-orchestrator-team" data-orchestrator-body ${expanded?'':'hidden'}>${sections||`<div class="side-empty">${sideQuery?'No team agents or group chats match':'No subordinate agents yet'}</div>`}</div>`;
 }
+// Ordinary refresh must retain the native touched leaf until contact finishes.
+let paneContact=null,paneContactTimer;
+const paneRefreshes=new Map();
+function flushPaneRefreshes() {
+  paneContact=null;clearTimeout(paneContactTimer);
+  const jobs=[...paneRefreshes.values()];paneRefreshes.clear();
+  for(const job of jobs)job();
+}
+function deferPaneRefresh(id,render) {
+  if(paneContact?.isConnected && paneContact===document.querySelector(id)) {
+    paneRefreshes.set(id,render);return true;
+  }
+  return false;
+}
+document.addEventListener('touchstart',e=>{
+  if(!paneContact)paneContact=e.target.closest('#side,#aside');
+  clearTimeout(paneContactTimer);
+  // Lost-terminal recovery bound; recognition itself expires after 650ms.
+  paneContactTimer=setTimeout(flushPaneRefreshes,30000);
+},{capture:true,passive:true});
+for(const type of ['touchend','touchcancel'])document.addEventListener(type,e=>{
+  if(!e.touches.length){clearTimeout(paneContactTimer);paneContactTimer=setTimeout(flushPaneRefreshes,50);}
+},{capture:true,passive:true});
+for(const type of ['resize','orientationchange','pagehide'])window.addEventListener(type,flushPaneRefreshes);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)flushPaneRefreshes();});
 function renderSide() {
+  if(deferPaneRefresh('#side',renderSide))return;
   const d=S.data;syncSidebarSeen();
   const items=sidebarItems(),pending=d.approvals.length,scroll=$('.side-list')?.scrollTop||0,focused=document.activeElement,focusGroup=focused?.hasAttribute?.('data-display-group')?focused.getAttribute('data-display-group'):null,focusRoot=focused?.hasAttribute?.('data-orchestrator-toggle'),focusKey=focused?.dataset?.key||null,roots=items.filter(item=>item.rootCandidate);
   const layout=sidebarLayout(),groupItems=id=>items.filter(item=>item.group===id||sidebarGroupAncestors(layout,item.group).includes(id));
@@ -350,6 +393,7 @@ function renderSide() {
       <label class="search">${ICON.search}<input id="side-search" placeholder="Search" value="${esc(sideQuery)}" autocomplete="off"></label>
       <button class="icon-btn" data-act="new-menu" aria-label="New">${ICON.plus}</button>
     </div>
+    <div class="side-actions"><button type="button" class="side-mark-read" data-act="mark-all-read" ${items.some(item=>unreadThread(item.key))?'':'disabled'}>${ICON.check}<span>Mark all as read</span></button></div>
     <div class="side-list">
       ${sidebarBody}<div class="sr" id="sidebar-move-status" role="status" aria-live="polite"></div>
     </div>
@@ -377,6 +421,7 @@ sidebarDrag=installSidebarDrag({state:()=>S.data,items:sidebarItems,filtered:()=
 
 // ---------- activity drawer ----------
 function renderAside() {
+  if(deferPaneRefresh('#aside',renderAside))return;
   const d = S.data;
   const pct = d.usage.budget ? Math.min(100, Math.round((d.usage.windowCost / d.usage.budget) * 100)) : null;
   $('#aside').innerHTML = `
@@ -438,7 +483,12 @@ function drawPlanUsage(p) {
 }
 
 // ---------- main ----------
+let renderedThread = null;
+let threadScroll;
 function renderMain() {
+  threadScroll?.disconnect();
+  if (renderedThread && $('#msg')) { sessionDraft.set(renderedThread, $('#msg').value); sessionModes.set(renderedThread, $('#message-mode')?.value || 'context'); }
+  renderedThread = threadKey();
   const main = $('#main');
   if (!S.current) {
     const none = !S.data.bots.length;
@@ -447,6 +497,7 @@ function renderMain() {
         <img class="logo-art" src="/nimbus.webp" alt="Nimbus" width="160" height="160">
         <h2>${none ? 'Build your team' : 'Pick a bot to talk to'}</h2>
         <p>${none ? 'Workers share local inference and use your OpenAI subscription when the task needs it. Each has its own workspace and browser group.' : 'Hand off a task. You’ll see each step, and it’ll check with you before sending, paying, deleting or merging.'}</p>
+        ${!none ? `<div class="row"><button class="btn primary" data-act="menu">${ICON.menu} Open conversations</button><button class="btn" data-act="team">${ICON.grid} Team activity</button></div>` : ''}
         ${none ? `<div class="row"><button class="btn primary" data-act="market">${ICON.grid} Browse Marketplace</button><button class="btn" data-act="new-bot">${ICON.plus} New bot</button></div>` : ''}
       </div></div>`;
     return;
@@ -482,6 +533,7 @@ function renderMain() {
     </header>
     <div class="thread" id="thread"><div class="thread-inner">${renderMessages()}</div></div>
     <div class="composer">
+      <div class="composer-context"><label>Send as <select id="message-mode" aria-label="Message mode"><option value="context">Add context</option><option value="task">New task</option></select></label><span id="context-hint">While a task runs, context joins it at the next model step.</span></div>
       <div class="attach-list" id="attach-list"></div>
       <form id="composer">
         <button type="button" class="plus" data-act="${isBot ? 'plugins' : 'edit-room'}" aria-label="${isBot ? 'Plugins' : 'Chat settings'}">${ICON.plus}</button>
@@ -496,14 +548,41 @@ function renderMain() {
   attachAutocorrect($('#msg'));
   if (isRecording() || browserStop) micState('recording'); // re-render during dictation
   const th = $('#thread');
-  th.scrollTop = th.scrollHeight;
+  threadScroll = followThreadBottom(th);
+  threadScroll.bottom();
   const ta = $('#msg');
   const draft = sessionDraft.get(threadKey());
   if (draft) ta.value = draft;
+  $('#message-mode').value = sessionModes.get(threadKey()) || 'context';
+  $('#message-mode').dispatchEvent(new Event('change', {bubbles:true}));
+  drawAttachments();
   autosize(ta);
-  if (matchMedia('(min-width: 761px)').matches) ta.focus();
+  if (sessionSendErrors.has(threadKey())) {
+    toast(sessionSendErrors.get(threadKey())); sessionSendErrors.delete(threadKey());
+  }
+  if (matchMedia('(min-width: 761px) and (pointer: fine)').matches) ta.focus();
 }
 const sessionDraft = new Map();
+const sessionModes = new Map(), sessionFiles = new Map(), sessionSendErrors = new Map();
+let threadLoadSeq = 0;
+async function refreshThreadMessages(key) {
+  const seq = ++threadLoadSeq;
+  // Only live replacements/additions since this fetch may override server history.
+  const before = new Map(S.messages.map(m => [m.id, m]));
+  const rows = await api('/api/threads/' + encodeURIComponent(key) + '/messages');
+  if (seq !== threadLoadSeq || threadKey() !== key) return;
+  const merged = new Map(rows.map(m => [m.id, m]));
+  for (const m of S.messages) if (before.get(m.id) !== m) merged.set(m.id, m);
+  const th = $('#thread'), previousTop = th?.scrollTop || 0;
+  const followLatest = S.loadingThread || threadScroll?.following;
+  S.messages = [...merged.values()]; S.loadingThread = false;
+  const inner = th?.querySelector('.thread-inner');
+  if (inner) {
+    inner.innerHTML = renderMessages();
+    if (followLatest) threadScroll.bottom();
+    else th.scrollTop = previousTop;
+  }
+}
 function autosize(ta) { ta.style.height = 'auto'; ta.style.height = Math.min(200, ta.scrollHeight) + 'px'; }
 
 function renderMessages() {
@@ -513,7 +592,23 @@ function renderMessages() {
     const b = isBot ? bot(S.current.id) : null;
     return `<div class="empty">${isBot ? avatar(b, 72) : roomAvatar(room(S.current.id), 72)}<h2>${esc(isBot ? b.name : room(S.current.id).name)}</h2><p>${isBot ? esc(b.role || 'Give this bot a task. It’ll ask before sending, paying, deleting or merging.') : 'Post a goal. The lead bot splits the work, and bots @mention each other to hand things off.'}</p></div>`;
   }
-  return S.messages.map((m, i) => renderMessage(m, S.messages[i - 1])).join('');
+  const visible=groupToolRequestMessages(S.messages);
+  return visible.map((m, i) => renderMessage(m, visible[i - 1])).join('');
+}
+const openCapabilityHistories=new Set();
+function updateCapabilityChain(message) {
+  const request=capabilityRequest(message);if(!request)return false;
+  const grouped=groupToolRequestMessages(S.messages).find(item=>item.capabilityUpdates?.some(update=>update.id===message.id));
+  if(!grouped)return false;
+  const existing=[...document.querySelectorAll('[data-tool-request-chain]')].find(element=>element.dataset.toolRequestChain===request.requestId)?.closest('.msg');
+  const history=existing?.querySelector('details[data-capability-history]'),key=threadKey()+':'+request.requestId;
+  if(history)history.open?openCapabilityHistories.add(key):openCapabilityHistories.delete(key);
+  const focused=existing?.contains(document.activeElement)?document.activeElement.matches('summary')?'history':document.activeElement.matches('.runtime-attention-link')?'attention':document.activeElement.hasAttribute('data-tool-development')?'progress':null:null;
+  const markup=renderMessage(grouped);
+  if(existing)existing.outerHTML=markup;
+  else $('.thread-inner')?.insertAdjacentHTML('beforeend',markup);
+  if(focused){const updated=[...document.querySelectorAll('[data-tool-request-chain]')].find(element=>element.dataset.toolRequestChain===request.requestId);updated?.querySelector(focused==='history'?'summary':focused==='attention'?'.runtime-attention-link':'.runtime-capability-meta [data-tool-development]')?.focus({preventScroll:true});}
+  return true;
 }
 
 // Show the bot's name above its bubble in group chats, when the speaker changes.
@@ -531,7 +626,7 @@ function renderFiles(m) {
   if (!files.length) return '';
   return `<div class="files">${files.map((f) => isImage(f)
     ? `<a class="file-img" href="${fileUrl(f)}" target="_blank" rel="noopener"><img src="${fileUrl(f)}" alt="${esc(f.name)}" loading="lazy"></a>`
-    : `<a class="file-chip" href="${fileUrl(f)}" target="_blank" rel="noopener">${ICON.clip}<span>${esc(f.name)}</span><small>${fmtSize(f.size)}</small></a>`).join('')}</div>`;
+    : `<a class="file-chip" href="${fileUrl(f)}" download="${esc(f.name)}">${ICON.clip}<span>${esc(f.name)}</span><small>${fmtSize(f.size)}</small></a>`).join('')}</div>`;
 }
 function fmtSize(n) { return n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB'; }
 
@@ -568,7 +663,7 @@ document.addEventListener('contextmenu', (e) => {
 });
 
 // ---------- slash commands in the message box ----------
-const SLASH = [['/new', 'Start a fresh chat with this bot (memory is kept)']];
+const SLASH = [['/new', 'Start a fresh chat with this bot (memory is kept)'],['/compact','Compress context and archive full history; keep instructions and memory']];
 function slashHint(v) {
   let box = $('#slash-hint');
   const show = S.current?.type === 'bot' && /^\/\w*$/.test(v);
@@ -601,7 +696,8 @@ async function speak(btn) {
   } catch (err) { btn.textContent = '▶ Read aloud'; toast(err.message); }
 }
 function flashMessage(id) {
-  const el = document.querySelector(`[data-mid="${id}"]`);
+  const el = document.querySelector(`[data-mid="${id}"]`)||document.querySelector(`[data-capability-mid="${id}"]`);
+  const history=el?.closest('details[data-capability-history]');if(history)history.open=true;
   if (!el) return toast('That message is further back in the chat');
   el.scrollIntoView({ block: 'center', behavior: 'smooth' });
   el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 2200);
@@ -721,12 +817,10 @@ function renderMessage(m, prev) {
   if (m.kind === 'trace') return renderTrace(m, prev);
   if (m.kind === 'approval') return renderApproval(m, b, prev);
   if(m.kind==='capability'){
-    const request=JSON.parse(m.body);
-    return `<div class="msg bot" data-mid="${m.id}"><section class="runtime-capability-card compact"><div class="runtime-capability-heading"><b>${esc(request.title||'Tool development')}</b><span class="task-status ${esc(request.status)}">${esc(String(request.status||'queued').replaceAll('_',' '))}</span></div><p class="runtime-capability-message">${esc(request.message||'')}</p><div class="runtime-capability-meta"><code>${esc(request.toolName||'')}</code><button class="btn small" data-tool-development="${esc(request.requestId)}">View progress</button></div></section></div>`;
+    return renderToolRequestChain(m,{open:openCapabilityHistories.has(threadKey()+':'+capabilityRequest(m)?.requestId)});
   }
   if (m.kind === 'question') {
-    const q=JSON.parse(m.body),pending=q.status==='pending';
-    return `<div class="msg bot" data-mid="${m.id}">${speakerLabel(m,prev)}<div class="approval" data-question-id="${q.questionId}"><b>${pending?'Your input is needed':esc(q.status)}</b>${q.questions.map((item,index)=>`<label class="field">${esc(item.question)}${pending?`${item.options?.length?`<select data-question-choice="${index}"><option value="">Choose an answer or type below</option>${item.options.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select>`:''}<textarea data-question-answer="${index}" rows="2"></textarea>`:`<p>${esc(q.answers?.[index]||'No answer recorded')}</p>`}</label>`).join('')}${pending?'<button class="btn primary" data-answer-question>Submit answers</button>':''}</div></div>`;
+    return `<div class="msg bot" data-mid="${m.id}">${speakerLabel(m,prev)}${renderQuestionCard(JSON.parse(m.body))}</div>`;
   }
   return `<div class="msg bot ${m.kind === 'error' ? 'error' : ''}" data-mid="${m.id}" title="${clock(m.created_at)}">${speakerLabel(m, prev)}<div class="bubble md">${md(m.body)}</div>
     <div class="msg-actions"><button data-copy="${m.id}">Copy</button>${m.kind === 'error' ? '<button data-continue="1">Try again</button>' : `<button data-speak="${m.id}">▶ Read aloud</button><button data-continue="1">Continue</button>`}</div></div>`;
@@ -759,6 +853,18 @@ function traceStats(t) {
   return bits.length ? ' · ' + bits.join(' · ') : '';
 }
 
+const traceWorkerLabel=createTraceWorkerLabels({
+  worker:identity=>S.data?.bots.find(worker=>String(worker.id)===String(identity)||worker.name===String(identity)),
+  loadRun:id=>api(`/api/runs/${id}`),loadTools:async id=>(await api(`/api/runs/${id}/events`)).tools,
+  changed:()=>{
+    for(const span of document.querySelectorAll('[data-trace-worker]')){
+      const message=S.messages.find(message=>String(message.id)===span.dataset.traceWorker);
+      if(!message)continue;
+      const step=JSON.parse(message.body).steps[Number(span.dataset.traceStep)];
+      if(step)span.textContent=' (worker: '+traceWorkerLabel(step,message)+')';
+    }
+  }
+});
 function renderTrace(m, prev) {
   const t = JSON.parse(m.body);
   const running = t.status === 'running';
@@ -766,20 +872,26 @@ function renderTrace(m, prev) {
   const secs = Math.round((t.ended ? Math.max(0, t.ended - t.started) : elapsedMs(t.started)) / 1000);
   const dur = fmtDur(secs);
   const mark = { done: '✓', waiting: '⏸', error: '✗', rejected: '✗', stopped: '■', running: '' };
-  const waiting = running && t.steps.some((s) => s.state === 'waiting');
-  const label = running ? (waiting ? (t.steps.some(s=>s.tool==='request_user_input'&&s.state==='waiting')?'Waiting for your answer':'Waiting for your approval') : t.source === 'auto-compact' || t.compacting ? '<span class="shimmer">Compacting the chat…</span>' : `<span class="shimmer" data-phrase>${workPhrase(t.started)}</span>`) :
+  const waitingLabel = running ? traceWaitingLabel(t.steps) : null;
+  const waiting = !!waitingLabel;
+  const label = running ? (waitingLabel || (t.source === 'auto-compact' || t.compacting ? '<span class="shimmer">Compacting the chat…</span>' : `<span class="shimmer" data-phrase>${workPhrase(t.started)}</span>`)) :
     t.status === 'done' ? `${t.steps.length} step${t.steps.length === 1 ? '' : 's'}` : t.status === 'waiting_tool'?'Waiting for a new tool':t.status === 'stopped' ? 'Stopped' : t.status === 'interrupted' ? 'Interrupted' : t.status === 'paused' ? 'Task paused' : t.status === 'needs_review' ? 'Action needs review' : 'Run failed';
   const open = running || openTraces.has(m.id);
   return `<div class="msg bot" data-mid="${m.id}">${speakerLabel(m, prev)}<details class="trace ${running ? 'live' : ''} ${waiting ? 'paused' : ''}" ${open ? 'open' : ''} data-started="${t.started}">
     <summary>${running ? LOADER : ICON.chevron}<span>${label}</span><span class="sp"><span data-dur>${dur}</span>${traceStats(t)}</span>${running ? `<button class="stop" data-stop="${m.run_id}">Stop</button>` : ''}</summary>
     <div class="steps">
       ${t.plan?`<div class="task-plan">${t.plan.explanation?`<p>${esc(t.plan.explanation)}</p>`:''}<ol>${t.plan.steps.map(s=>`<li>${s.status==='completed'?'✓ ':s.status==='in_progress'?'→ ':''}${esc(s.step)}</li>`).join('')}</ol></div>`:''}
-      ${t.steps.map((s) => `<div class="step"><span class="mark ${s.state}">${mark[s.state] ?? ''}</span><span>${esc(s.text)}</span></div>`).join('')}
+      ${t.steps.map((s,index) => {
+        const text=`${esc(describeTraceStep(s))}<span class="trace-worker" data-trace-worker="${m.id}" data-trace-step="${index}"> (worker: ${esc(traceWorkerLabel(s,m))})</span>`;
+        const key=m.id+':'+(s.id??index);
+        return `<div class="step"><span class="mark ${s.state}">${mark[s.state] ?? ''}</span>${traceToolName(s)?`<details class="trace-call" data-trace-call="${esc(key)}" ${openTraceCalls.has(key)?'open':''}><summary title="Show tool details">${text}</summary><pre aria-label="Tool details">${esc(traceTechnicalDetails(s))}</pre></details>`:`<span>${text}</span>`}</div>`;
+      }).join('')}
       ${running && t.lastThought ? `<div class="thought">${esc(t.lastThought)}</div>` : ''}
     </div>
   </details></div>`;
 }
 const openTraces = new Set();
+const openTraceCalls = new Set();
 document.addEventListener('click',async event=>{
   const button=event.target.closest('[data-tool-development]');if(!button)return;
   try{await runtimeUI.toolRequest(button.dataset.toolDevelopment);}catch(error){toast(error.message);}
@@ -793,7 +905,7 @@ document.addEventListener('click',async e=>{
   const box=button.closest('[data-question-id]'),answers=[...box.querySelectorAll('[data-question-answer]')].map(f=>f.value.trim());
   if(answers.some(a=>!a))return toast('Answer each question before submitting');
   button.disabled=true;
-  try{await api(`/api/questions/${box.dataset.questionId}/answer`,{method:'POST',body:{answers}});toast('Answers sent');}
+  try{await api(`/api/questions/${box.dataset.questionId}/answer`,{method:'POST',body:{answers,expectedVersion:Number(box.dataset.questionVersion),idempotencyKey:`question:${box.dataset.questionId}:${box.dataset.questionVersion}:human`}});toast('Answers sent');}
   catch(error){button.disabled=false;toast(error.message);}
 });
 
@@ -823,16 +935,15 @@ function renderApproval(m, b, prev) {
 async function openThread(key) {
   const [type, id] = key.split(':');
   const prev = threadKey();
-  if (prev) sessionDraft.set(prev, $('#msg')?.value || '');
+  if (prev) { sessionDraft.set(prev, $('#msg')?.value || ''); sessionModes.set(prev, $('#message-mode')?.value || 'context'); sessionFiles.set(prev, attachments); }
+  attachments = sessionFiles.get(key) || [];
   S.current = { type, id: Number(id) };
-  sidebarPreferences();sideQuery='';const target=type==='bot'?bot(id):null;if(target?.template!=='orchestrator')revealDisplayGroup(type==='room'?'rooms':displayGroup(target||{}));syncSidebarSeen();
+  sidebarPreferences();sideQuery='';const target=type==='bot'?bot(id):null;if(!isRootOrchestrator(target))revealDisplayGroup(type==='room'?'rooms':displayGroup(target||{}));syncSidebarSeen();
   history.replaceState(null, '', '#' + key);
   S.loadingThread = true; S.messages = [];
   $('#side').classList.remove('open'); $('#aside').classList.remove('open');
   renderSide();revealSidebarThread(key);renderMain();
-  S.messages = await api(`/api/threads/${encodeURIComponent(key)}/messages`);
-  S.loadingThread = false;
-  if (threadKey() === key) { renderMain(); $('.thread-inner')?.classList.add('fade-in'); }
+  await refreshThreadMessages(key);
 }
 
 let stateSeq = 0;
@@ -857,13 +968,15 @@ function connect() {
       S.messages.push(m);
       const th = $('#thread');
       if (!th) return;
-      const nearBottom = th.scrollHeight - th.scrollTop - th.clientHeight < 200;
+      const nearBottom = threadScroll.following;
       const inner = $('.thread-inner', th);
       if (S.messages.length === 1) inner.innerHTML = '';
-      inner.insertAdjacentHTML('beforeend', renderMessage(m, prev));
-      inner.lastElementChild?.classList.add('enter');
+      if(!updateCapabilityChain(m)){
+        inner.insertAdjacentHTML('beforeend', renderMessage(m, prev));
+        inner.lastElementChild?.classList.add('enter');
+      }
       if (m.author !== 'user' && m.kind === 'text') buzz(6);
-      if (nearBottom || m.author === 'user') th.scrollTop = th.scrollHeight;
+      if (nearBottom || m.author === 'user') threadScroll.bottom();
     }
     if (m.kind === 'approval' && m.author !== 'user') notify(m);
     soon();
@@ -873,19 +986,23 @@ function connect() {
     const i = S.messages.findIndex((x) => x.id === m.id);
     if (i < 0) return;
     S.messages[i] = m;
+    if(capabilityRequest(m)){
+      const th=$('#thread'),nearBottom=th&&threadScroll.following;
+      updateCapabilityChain(m);if(th&&nearBottom)threadScroll.bottom();return;
+    }
     const el = document.querySelector(`[data-mid="${m.id}"]`);
     if (el) {
       const th = $('#thread');
-      const nearBottom = th.scrollHeight - th.scrollTop - th.clientHeight < 200;
+      const nearBottom = threadScroll.following;
       el.outerHTML = renderMessage(m, S.messages[i - 1]);
-      if (nearBottom) th.scrollTop = th.scrollHeight;
+      if (nearBottom) threadScroll.bottom();
     }
   });
   let pending;
   const soon = () => { clearTimeout(pending); pending = setTimeout(async () => { await refreshState(); if (S.current) updateHeaderBits(); }, 150); };
   for (const ev of ['bot_status', 'state_changed', 'approvals_changed']) es.addEventListener(ev, soon);
   es.onerror = () => { connectionStatus(navigator.onLine?'Reconnecting…':'Offline — instructions stay on this device');fetch('/api/state').then((r) => { if (r.status === 401) location.href = '/login'; }).catch(() => {}); };
-  es.onopen = () => { connectionStatus('Live · connected');refreshState(); if (S.current) openThread(threadKey()); };
+  es.onopen = () => { connectionStatus('Live · connected');refreshState(); if (S.current) refreshThreadMessages(threadKey()).catch(e => toast(e.message)); };
 }
 window.addEventListener('offline',()=>connectionStatus('Offline — instructions stay on this device'));
 window.addEventListener('online',()=>{connectionStatus('Reconnecting…');connect();});
@@ -938,10 +1055,10 @@ function closePopover() { document.querySelector('.popover')?.remove(); }
 function modal(html, { wide = false, cls = '', sticky = false } = {}) {
   closePopover();
   const root = $('#modal-root');
-  root.innerHTML = `<div class="scrim"><div class="modal ${wide ? 'wide' : ''} ${sticky ? 'sticky' : ''} ${cls}" role="dialog" aria-modal="true">${html}</div></div>`;
+  root.innerHTML = `<div class="scrim"><div class="modal ${wide ? 'wide' : ''} ${sticky ? 'sticky' : ''} ${cls}" role="dialog" aria-modal="true" ${sticky ? '' : 'data-swipe-dismissible'}>${html}</div></div>`;
   const scrim = $('.scrim', root);
   if (!sticky) scrim.addEventListener('mousedown', (e) => { if (e.target === scrim) closeModal(); });
-  setTimeout(() => $('input:not([type=checkbox]):not([type=color]), textarea', root)?.focus(), 30);
+  if (matchMedia('(pointer: fine)').matches) setTimeout(() => $('input:not([type=checkbox]):not([type=color]), textarea', root)?.focus(), 30);
   return $('.modal', root);
 }
 // Plays the close animation, unless another modal replaced this one meanwhile.
@@ -949,6 +1066,8 @@ function closeModal() {
   const root = $('#modal-root'), scrim = $('.scrim', root);
   if (!scrim || scrim.classList.contains('closing')) return;
   scrim.classList.add('closing');
+  scrim.inert = true;
+  scrim.style.pointerEvents = 'none';
   setTimeout(() => { if (root.contains(scrim)) root.innerHTML = ''; }, 160);
 }
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (!$('.modal.sticky')) closeModal(); closePopover(); } });
@@ -958,7 +1077,7 @@ function botModal(b) {
   const toolOptions=S.data.toolCatalog||['shell','exec_command','write_stdin','apply_patch','read_file','write_file','list_files','view_image','skills','update_plan','request_user_input','capabilities','browser','shared_note','ask_worker','self_update'].map(name=>({name,description:''}));
   b = b || { name: '', role: '', instructions: '', color: BOT_COLORS[S.data.bots.length % BOT_COLORS.length], shape: 'none/none', effort: 'medium', model: 'auto', default_model:'',
     approval_rules: ['shell(git push*)', 'shell(*Remove-Item*)', 'shell(*gh pr merge*)', 'mcp__*send*', 'mcp__*delete*', 'mcp__*pay*', 'mcp__*create_event*','automation_schedule(enable)'], allow_rules: [] };
-  const fixedRoot=b.template==='orchestrator';
+  const fixedRoot=isRootOrchestrator(b);
   let color = b.color;
   const look = outfit(b);
   const el = modal(`
@@ -1196,7 +1315,8 @@ async function marketModal(focus = '') {
     if (t.dataset.close !== undefined) return closeModal();
     try {
       if (t.dataset.addBot) {
-        const saved = await api(`/api/templates/${t.dataset.addBot}/add`, { method: 'POST' });
+        const parent=t.dataset.addBot==='orchestrator'?rootOrchestrator():null;
+        const saved = await api(`/api/templates/${t.dataset.addBot}/add`, { method: 'POST',...(parent?{body:{parent_bot_id:parent.id}}:{}) });
         closeModal(); await refreshState(); await openThread('bot:' + saved.id);
         toast(`${saved.name} joined your team`);
       }
@@ -1516,9 +1636,11 @@ document.addEventListener('click', async (e) => {
   if (t.dataset.reject) return rejectModal(t.dataset.reject);
   if (t.dataset.stop) { e.preventDefault(); return api(`/api/runs/${t.dataset.stop}/stop`, { method: 'POST' }); }
   if (t.dataset.unattach) { attachments = attachments.filter((a) => a.key !== t.dataset.unattach); return drawAttachments(); }
-  const act = t.dataset.act;
+  // Share the action dispatcher without duplicating desktop data-act selectors.
+  const act = ({team:'team', activity:'panel', settings:'user-menu'})[t.dataset.phone] || t.dataset.act;
   if (act) closePopover();
   switch (act) {
+    case 'mark-all-read': return markAllThreadsRead();
     case 'team': return runtimeUI.overview();
     case 'new-menu': e.stopPropagation(); return popover(t, [['new-bot', 'New bot', ICON.plus], ['new-room', 'New group chat', ICON.compose], ['market', 'Browse Marketplace', ICON.grid]]);
     case 'user-menu': e.stopPropagation(); return popover(t, [['appearance', 'Appearance', ICON.gear], ['server', 'Server settings', ICON.monitor], ['log', 'Activity log', ICON.clock], ['passkeys', 'Passkeys', ICON.lock], ['mfa', 'Two-factor authentication', ICON.lock], ['notify', 'Notifications', ICON.bell], ...(window.NimbusApp ? [['app-server', 'App: server address', ICON.gear]] : []), ['logout', 'Log out', ICON.close]]);
@@ -1577,6 +1699,8 @@ document.addEventListener('change', async (e) => {
   toast(`${cur.name} will use ${e.target.selectedOptions[0].text.toLowerCase()} effort from the next task`);
 });
 document.addEventListener('toggle', (e) => {
+  if(e.target.matches?.('details[data-trace-call]')){const key=e.target.dataset.traceCall;e.target.open?openTraceCalls.add(key):openTraceCalls.delete(key);}
+  if(e.target.matches?.('details[data-capability-history]')){const key=threadKey()+':'+e.target.dataset.capabilityHistory;e.target.open?openCapabilityHistories.add(key):openCapabilityHistories.delete(key);}
   if (e.target.matches?.('details.trace')) { const id = Number(e.target.closest('[data-mid]').dataset.mid); e.target.open ? openTraces.add(id) : openTraces.delete(id); }
 }, true);
 document.addEventListener('input', (e) => {
@@ -1615,16 +1739,34 @@ document.addEventListener('submit', async (e) => {
   const files = attachments.filter((a) => a.id).map((a) => a.id);
   if (!text && !files.length) return;
   if(!navigator.onLine)return toast('You’re offline. Your instructions have not been sent.');
-  const targetThread=threadKey(),sendKey=JSON.stringify({targetThread,text,files});
+  const mode=$('#message-mode')?.value||'context';
+  const targetThread=threadKey(),sendKey=JSON.stringify({targetThread,text,files,mode});
   if(!pendingSends.has(sendKey))pendingSends.set(sendKey,crypto.randomUUID());
   const requestId=pendingSends.get(sendKey);
   const kept = attachments;
   const sendBtn = $('.composer .send');
   sendBtn?.classList.remove('launch'); void sendBtn?.offsetWidth; sendBtn?.classList.add('launch');
   buzz(10);
-  ta.value = ''; autosize(ta); $('#slash-hint')?.remove(); sessionDraft.delete(threadKey()); attachments = []; drawAttachments();
-  try { await api(`/api/threads/${encodeURIComponent(targetThread)}/messages`, { method: 'POST', body: { text, files,requestId } });pendingSends.delete(sendKey); kept.forEach((a) => a.preview && URL.revokeObjectURL(a.preview)); }
-  catch (err) { ta.value = text; attachments = kept; drawAttachments(); toast(err.message); }
+  ta.value = ''; autosize(ta); $('#slash-hint')?.remove(); sessionDraft.delete(targetThread); attachments = []; sessionFiles.set(targetThread, attachments); drawAttachments();
+  try { await api(`/api/threads/${encodeURIComponent(targetThread)}/messages`, { method: 'POST', body: { text, files,requestId,mode } });pendingSends.delete(sendKey); kept.forEach((a) => a.preview && URL.revokeObjectURL(a.preview)); }
+  catch (err) {
+    const visible = threadKey() === targetThread, composer = visible ? $('#msg') : null;
+    const newerText = composer ? composer.value : sessionDraft.get(targetThread) || '';
+    const newerFiles = visible ? attachments : sessionFiles.get(targetThread) || [];
+    const recoveredText = newerText ? text + (text ? '\n\n' : '') + newerText : text;
+    const recoveredFiles = [...kept, ...newerFiles.filter(a => !kept.some(b => b.key === a.key))];
+    const recoveredMode = newerText || newerFiles.length ? (visible ? $('#message-mode')?.value : sessionModes.get(targetThread)) || mode : mode;
+    sessionDraft.set(targetThread, recoveredText); sessionFiles.set(targetThread, recoveredFiles); sessionModes.set(targetThread, recoveredMode);
+    if (composer) {
+      composer.value = recoveredText; autosize(composer); attachments = recoveredFiles;
+      $('#message-mode').value = recoveredMode; $('#message-mode').dispatchEvent(new Event('change', {bubbles:true}));
+      drawAttachments(); toast(err.message);
+    } else sessionSendErrors.set(targetThread, err.message);
+  }
+});
+
+document.addEventListener('change',e=>{
+  if(e.target.id==='message-mode')$('#context-hint').textContent=e.target.value==='task'?'Queues a separate assignment after current work.':'While a task runs, context joins it at the next model step.';
 });
 
 // Paste images/files into the message box, or drop them anywhere on the chat.
@@ -1642,6 +1784,9 @@ document.addEventListener('drop', (e) => {
 });
 
 window.addEventListener('hashchange', () => {
+  // Startup reads the latest hash after state arrives. A restored phone tab or
+  // early navigation must not render a conversation against a null workspace.
+  if(!S.data)return;
   const h = location.hash.slice(1);
   if (/^(bot|room):\d+$/.test(h) && h !== threadKey()) openThread(h);
 });
@@ -1658,4 +1803,8 @@ applyTheme();
   else if(candidates.length===0&&matchMedia('(min-width:761px)').matches&&(first||S.data.bots[0]))openThread(first||'bot:'+S.data.bots[0].id);
   else renderMain();
   connect();
-})();
+})().catch(error => {
+  console.error('Nimbus workspace startup failed:',error);
+  if(location.pathname==='/login')return;
+  $('#main').innerHTML='<section class="empty" role="alert"><h1>Nimbus couldn’t load your workspace</h1><p>Check your connection and try again.</p><p><a class="btn primary" href="/">Reload Nimbus</a></p></section>';
+});

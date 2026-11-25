@@ -1,4 +1,9 @@
 import test from 'node:test';
+import {registeredConnector} from './helpers/registered-connector.mjs';
+async function scopedContext(ctx){
+  const bot={id:ctx.botId,approval_rules:[],allow_rules:[],...ctx.bot},[name,binding]=[...ctx.bindings][0];
+  return {...ctx,bot,...await registeredConnector(bot.id,name,binding,ctx.availableTools?.[0]?.function.parameters)};
+}
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -59,19 +64,21 @@ test('malformed remote HTML is scanned once and preserves bounded evidence witho
 test('web search integrates only an advertised read-only MCP schema and reports missing setup honestly',async t=>{
   const {ctx}=fixture(t);const missing=await execute('research_search',{query:'known query'},ctx);assert.equal(missing.available,false);assert.equal(missing.ok,false);
   let submitted;const name='mcp__brave-search__brave_web_search',binding={readOnly:true,tool:'brave_web_search',client:{callTool:async request=>{submitted=request;return{content:[{type:'text',text:'Known result https://example.test/'}]};}}};
-  const result=await execute('research_search',{query:'known query',limit:3},{...ctx,bindings:new Map([[name,binding]]),availableTools:[{function:{name,parameters:{type:'object',properties:{query:{type:'string'},count:{type:'integer'}},required:['query']}}}]});
+  const result=await execute('research_search',{query:'known query',limit:3},await scopedContext({...ctx,bindings:new Map([[name,binding]]),availableTools:[{function:{name,parameters:{type:'object',properties:{query:{type:'string'},count:{type:'integer'}},required:['query']}}}]}));
   assert.deepEqual(submitted,{name:'brave_web_search',arguments:{query:'known query',count:3}});assert.equal(result.discoveryOnly,true);assert.match(result.content,/Known result/);
-  const noPermission=await execute('research_search',{query:'known query'},{...ctx,bindings:new Map([[name,{...binding,readOnly:false}]])});assert.equal(noPermission.available,false);
+  const noPermission=await execute('research_search',{query:'known query'},await scopedContext({...ctx,bindings:new Map([[name,{...binding,readOnly:false}]])}));assert.equal(noPermission.available,false);
 });
 test('search schema requirements are not guessed or silently omitted',async t=>{
   const {ctx}=fixture(t),name='mcp__web-search__search';let called=false;
-  const result=await execute('research_search',{query:'query'},{...ctx,bindings:new Map([[name,{readOnly:true,tool:'search',client:{callTool:async()=>{called=true;}}}]]),availableTools:[{function:{name,parameters:{properties:{query:{type:'string'},tenant:{type:'string'}},required:['query','tenant']}}}]});
+  const result=await execute('research_search',{query:'query'},await scopedContext({...ctx,bindings:new Map([[name,{readOnly:true,tool:'search',client:{callTool:async()=>{called=true;}}}]]),availableTools:[{function:{name,parameters:{properties:{query:{type:'string'},tenant:{type:'string'}},required:['query','tenant']}}}]}));
   assert.equal(called,false);assert.deepEqual(result.missingRequired,['tenant']);
 });
 test('search wrapper does not bypass canonical connector approval rules',async t=>{
   const {ctx}=fixture(t),name='mcp__brave-search__brave_web_search';let called=false;
-  const result=await execute('research_search',{query:'restricted evidence'},{...ctx,bot:{approval_rules:[name],allow_rules:[]},bindings:new Map([[name,{readOnly:true,tool:'brave_web_search',client:{callTool:async()=>{called=true;}}}]]),availableTools:[{function:{name,parameters:{properties:{query:{type:'string'}},required:['query']}}}]});
+  const result=await execute('research_search',{query:'restricted evidence'},await scopedContext({...ctx,bot:{approval_rules:[name],allow_rules:[]},bindings:new Map([[name,{readOnly:true,tool:'brave_web_search',client:{callTool:async()=>{called=true;}}}]]),availableTools:[{function:{name,parameters:{properties:{query:{type:'string'}},required:['query']}}}]}));
   assert.equal(called,false);assert.equal(result.requiresCanonicalApproval,true);assert.equal(result.tool,name);assert.deepEqual(result.arguments,{query:'restricted evidence'});
+  const allowed=await execute('research_search',{query:'restricted evidence'},await scopedContext({...ctx,permissionMode:'all',bot:{approval_rules:[name],allow_rules:[]},bindings:new Map([[name,{readOnly:true,tool:'brave_web_search',client:{callTool:async()=>{called=true;return{content:[{type:'text',text:'Mode-authorized search result'}]};}}}]]),availableTools:[{function:{name,parameters:{properties:{query:{type:'string'}},required:['query']}}}]}));
+  assert.equal(called,true);assert.equal(allowed.ok,true);assert.equal(allowed.requiresCanonicalApproval,undefined);
 });
 test('scholarly search encodes queries and preserves year-only publication precision without pretending full text was read',async t=>{
   const {ctx}=fixture(t),base=await server(t,(req,res)=>{assert.match(req.url,/query=optics%26physics/);res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({message:{'total-results':1,items:[{DOI:'10.5555/fixture',title:['Fixture &amp; physics'],author:[{given:'A',family:'Writer'}],published:{'date-parts':[[2024]]},type:'journal-article'}]}}));});

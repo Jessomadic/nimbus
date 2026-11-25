@@ -1,0 +1,113 @@
+{
+  "contract_version": 1,
+  "frozen": true,
+  "deployment": "not_deployed",
+  "callable": {
+    "module": "kb.publication",
+    "function": "publish",
+    "arguments": [
+      "store",
+      "manifest",
+      "input_root",
+      "archive_root"
+    ],
+    "status": "PublicationStore.status(request_id)"
+  },
+  "cli": {
+    "cwd": "installed knowledge_tools",
+    "executable": "operator configured Python",
+    "publish": [
+      "-m",
+      "kb.publication_cli",
+      "--db",
+      "DB",
+      "--input-root",
+      "INPUT",
+      "--archive-root",
+      "ARCHIVE",
+      "publish-nimbus",
+      "--request",
+      "MANIFEST"
+    ],
+    "status": [
+      "-m",
+      "kb.publication_cli",
+      "--db",
+      "DB",
+      "--input-root",
+      "INPUT",
+      "--archive-root",
+      "ARCHIVE",
+      "publication-status",
+      "--request-id",
+      "UUID"
+    ],
+    "stdout": "one JSON object",
+    "exit_success": 0,
+    "exit_failure": 1,
+    "run_py_integration": "pending"
+  },
+  "manifest": {
+    "additionalProperties": false,
+    "required": [
+      "request_id",
+      "source_namespace",
+      "source_document_id",
+      "source_revision",
+      "expected_published_revision",
+      "sha256",
+      "markdown_path",
+      "title",
+      "source_uri",
+      "author_label",
+      "published_by",
+      "published_at",
+      "citations"
+    ],
+    "request_id": "canonical UUID; immutable payload per request",
+    "source_namespace": "nimbus:<installation UUID>",
+    "source_document_id": "canonical UUID",
+    "source_revision": "integer >= 1",
+    "expected_published_revision": "null or integer >= 1",
+    "sha256": "lowercase SHA256 of exact UTF-8 Markdown bytes",
+    "markdown_path": "operator-controlled absolute local allowlisted .md; <= 1000000 bytes",
+    "source_uri": "nimbus://<installation UUID>/<document UUID>?rev=<revision>",
+    "citations": "<=20 objects; record_id,fingerprint,quote required; locator optional"
+  },
+  "receipt": {
+    "committed": [
+      "request_id",
+      "status",
+      "namespace",
+      "source_document_id",
+      "revision",
+      "sha256",
+      "kb_document_id",
+      "archive_path",
+      "manifest_path",
+      "previous_revision",
+      "committed_at",
+      "warnings"
+    ],
+    "status_values": [
+      "committed",
+      "not_committed"
+    ],
+    "not_committed": "NOT evidence that no writer is active"
+  },
+  "safety": [
+    "No HTTP or write MCP publication endpoint",
+    "No automatic retry on unknown outcome",
+    "Reconcile by request_id before replay",
+    "No Nimbus raw DB writes",
+    "Indexed is not shared-retrieval verified",
+    "Brain identity must resolve actual KB id/hash; never title"
+  ],
+  "remaining_gates": [
+    "run.py integration",
+    "ordinary read and Brain provenance",
+    "initial archive concurrency and crash reconciliation",
+    "real Brain fixtures",
+    "exact-context installer and backup rollback"
+  ]
+}

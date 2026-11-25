@@ -136,3 +136,18 @@ test('a failed retry preserves the old smoke and a later successful retry archiv
   const archives=fs.readdirSync(receiptDirectory).filter(name=>/^host-smoke-[a-f0-9-]+\.json$/.test(name));assert.equal(archives.length,1);assert.ok(fs.readFileSync(path.join(receiptDirectory,archives[0])).equals(original));
   assert.equal(JSON.parse(fs.readFileSync(smokePath,'utf8')).sourceHash,'e'.repeat(64));
 });
+
+test('host-owned handoff status profile executes actual dispatcher candidate and installed with exact QA source pin',async t=>{
+ const {Maintenance}=await import('../runtime/maintenance.js');
+ const f=fixture(t),sourceHash=new Maintenance({root:repository,dataDir:f.dataDir}).inventory().hash;
+ const qa=f.writeQA({args:{action:'activate',reservationId:'production'},assertions:[]},{approved:true,sourceHash});
+ const request={...f.request,tool_name:'project_successor_handoff',effects:'host_execute',stages:[{phase:'testing',artifact_hash:qa.hash}]};
+ for(const verify of [f.host.verifyCandidateTool,f.host.verifyInstalledTool]){
+  const result=await verify(request);
+  assert.equal(result.pass,true);assert.equal(result.result.state,'authorized');assert.equal(result.result.reservationId,'synthetic-status');assert.equal(result.result.successorRunId,null);
+ }
+ assert.equal(fs.existsSync(path.join(f.dataDir,'project-handoffs')),false,'No production reservation state');
+ const bad=f.writeQA({}, {approved:true,sourceHash:'0'.repeat(64)});
+ await assert.rejects(f.host.verifyCandidateTool({...request,stages:[{phase:'testing',artifact_hash:bad.hash}]}),/exact-source QA pin/);
+ await assert.rejects(f.host.verifyInstalledTool({...request,stages:[]}),/QA verification changed|exact-source QA pin/);
+});

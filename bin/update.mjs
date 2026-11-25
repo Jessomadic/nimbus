@@ -2,6 +2,7 @@
 // Local administration and offline source recovery; never expose the admin token.
 import fs from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
 import { ROOT } from '../runtime/config.js';
 import { Maintenance } from '../runtime/maintenance.js';
 const dataDir=path.resolve(process.env.NIMBUS_DATA||path.join(ROOT,'data'));
@@ -18,8 +19,20 @@ if(action==='restore'){
   console.log(JSON.stringify(manager.restore(snapshotId),null,2));
 }else{
   if(!['status','snapshot','validate','apply'].includes(action))throw new Error('Choose status, snapshot, validate, apply or restore');
-  const response=await fetch(`http://127.0.0.1:${process.env.PORT||8787}/api/updates${action==='status'&&snapshotId?'?snapshotId='+encodeURIComponent(snapshotId):''}`,{
-    method:action==='status'?'GET':'POST',headers:{'content-type':'application/json','x-nimbus-admin':fs.readFileSync(path.join(dataDir,'admin.token'),'utf8').trim()},
-    body:action==='status'?undefined:JSON.stringify({action,snapshotId}),signal:AbortSignal.timeout(240000)});
-  const result=await response.json();console.log(JSON.stringify(result,null,2));if(!response.ok)process.exitCode=1;
+  // Validation can exceed fetch/Undici's five-minute header timeout. Make one
+  // bounded local request; a transport failure must never resubmit the action.
+  const payload=action==='status'?undefined:JSON.stringify({action,snapshotId});
+  const response=await new Promise((resolve,reject)=>{
+    const request=http.request({hostname:'127.0.0.1',port:Number(process.env.PORT||8787),
+      path:'/api/updates'+(action==='status'&&snapshotId?'?snapshotId='+encodeURIComponent(snapshotId):''),
+      method:action==='status'?'GET':'POST',headers:{'content-type':'application/json','x-nimbus-admin':fs.readFileSync(path.join(dataDir,'admin.token'),'utf8').trim(),...(payload?{'content-length':Buffer.byteLength(payload)}:{})}},res=>{
+      let text='';res.setEncoding('utf8');res.on('data',chunk=>{text+=chunk;if(text.length>4*1024*1024)request.destroy(new Error('Update response exceeded limit; inspect the saved receipt before retrying'));});res.on('error',reject);
+      res.on('end',()=>{try{resolve({ok:res.statusCode>=200&&res.statusCode<300,result:JSON.parse(text)});}catch{reject(new Error('Invalid update response; inspect the saved receipt before retrying'));}});
+    });
+    const deadline=setTimeout(()=>request.destroy(new Error('Update request deadline exceeded; inspect the saved receipt before retrying')),660000);
+    deadline.unref();request.once('close',()=>clearTimeout(deadline));
+    request.setTimeout(660000,()=>request.destroy(new Error('Update request timed out; inspect the saved receipt before retrying')));
+    request.on('error',reject);request.end(payload);
+  });
+  console.log(JSON.stringify(response.result,null,2));if(!response.ok)process.exitCode=1;
 }

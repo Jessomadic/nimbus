@@ -170,6 +170,25 @@ test('specialist briefs carry role defaults and preserve private memory when reg
   fs.writeFileSync(memory,'Existing durable note');writeBotBrief(bot);
   assert.equal(fs.readFileSync(memory,'utf8'),'Existing durable note');assert.match(fs.readFileSync(path.join(dir,'AGENTS.md'),'utf8'),/retain OEM edition references/);
 });
+
+test('All permissions overrides every approval rule and switching back restores it',()=>{
+  const bot={approval_rules:['*'],allow_rules:[]};
+  assert.equal(config().workers.permissionMode,'rules');
+  for(const name of ['write_file','shell','exec_command','write_stdin','run_checks','self_update','mcp__mail__send']){
+    const args={command:'git push',chars:'git push',action:'apply'};
+    assert.equal(requiresApproval(bot,name,args),true);
+    assert.equal(requiresApproval(bot,name,args,'all'),false);
+    assert.equal(requiresApproval(bot,name,args,'rules'),true);
+  }
+  for(const value of ['ALL','never','',null,true,{}])assert.throws(()=>saveConfig({workers:{permissionMode:value}}),/permission mode/);
+  try{
+    saveConfig({workers:{permissionMode:'all'}});assert.equal(config().workers.permissionMode,'all');
+    const brief=buildWorkerBrief({bot:{name:'Fixture',tools:[]},permissionMode:'all'});
+    assert.match(brief,/without per-action approval/);assert.match(brief,/does not expand the assignment/);
+  }finally{saveConfig({workers:{permissionMode:'rules'}});}
+  assert.equal(config().workers.permissionMode,'rules');
+  assert.deepEqual(bot.approval_rules,['*']);
+});
 test('worker parent relationships reject self, descendant cycles and missing parents',()=>{
   const bots=[{id:1,parent_bot_id:null},{id:2,parent_bot_id:1},{id:3,parent_bot_id:2}];
   assert.doesNotThrow(()=>validateParentLink(4,3,bots));assert.throws(()=>validateParentLink(1,1,bots),/cycle/);

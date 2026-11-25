@@ -1,7 +1,10 @@
 // Fresh-process checks using isolated data/config and no connector credentials.
 import assert from 'node:assert/strict';
 import {coreTools,executeTool,browsers,connectors,terminals} from './tools.js';
-import {db} from '../db.js';
+import {db,DATA_DIR} from '../db.js';
+import {ROOT} from './config.js';
+import {Maintenance} from './maintenance.js';
+import {profile,handoffVerification} from './handoff-verification-profile.js';
 const [mode,name]=process.argv.slice(2);
 let input='';for await(const chunk of process.stdin){input+=chunk;if(input.length>262144)throw new Error('Probe input exceeds 256 KiB');}
 try{
@@ -9,10 +12,15 @@ try{
   if(mode==='inspect')console.log(JSON.stringify({found:Boolean(spec),spec:spec||null}));
   else if(mode==='verify'){
     if(!spec)throw new Error('The new tool is not present in the native registry');
-    const verification=JSON.parse(input||'{}');
+    let verification=JSON.parse(input||'{}'),context={};
+    if(verification.profile!==undefined){
+      if(name!=='project_successor_handoff'||verification.profile!==profile||Object.keys(verification).some(k=>!['profile','sourceHash'].includes(k))||verification.sourceHash!==new Maintenance({root:ROOT,dataDir:DATA_DIR}).inventory().hash)throw Error('Invalid synthetic profile/source pin');
+      const fixture=handoffVerification({db,dataDir:DATA_DIR,signal:AbortSignal.timeout(20000)});context=fixture.context;
+      verification={args:fixture.args,assertions:[{path:'reservationId',equals:'synthetic-status'},{path:'state',equals:'authorized'},{path:'leaderRunId',equals:1},{path:'successorRunId',equals:null}]};
+    }
     if(!verification.args||typeof verification.args!=='object'||Array.isArray(verification.args)||!Array.isArray(verification.assertions)||verification.assertions.length<1||verification.assertions.length>30)throw new Error('QA must supply args and 1 to 30 representative assertions');
     const bot={id:1,name:'Isolated tool acceptance',tools:JSON.stringify([name]),approval_rules:[],allow_rules:[]};
-    const result=await executeTool(bot,name,verification.args,{signal:AbortSignal.timeout(20000)});
+    const result=await executeTool(bot,name,verification.args,{signal:AbortSignal.timeout(20000),...context});
     if(result?.error)throw new Error('Representative tool execution failed: '+result.error);
     for(const assertion of verification.assertions){
       if(typeof assertion.path!=='string'||!assertion.path||!Object.hasOwn(assertion,'equals'))throw new Error('Each assertion needs a result field path and equals');

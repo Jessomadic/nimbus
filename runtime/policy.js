@@ -6,7 +6,9 @@ export function ruleMatches(rule, tool, input = {}) {
   return match ? globToRe(match[1].trim()).test(tool) && globToRe(match[2]).test(String(input.command ?? input.path ?? input.url ?? input.action ?? JSON.stringify(input)))
     : globToRe(normalized.trim()).test(tool);
 }
-export function requiresApproval(bot, name, args) {
+export function requiresApproval(bot, name, args, permissionMode = 'rules') {
+  if (permissionMode === 'all') return false;
+  if(name==='openbubbles_operation')return !bot.allow_rules.some(rule=>ruleMatches(rule,name,args));
   // A new terminal tool must not bypass existing shell command approval rules.
   const policyName=name==='exec_command'||name==='run_checks'||name==='write_stdin'&&args.chars?'shell':name;
   const policyArgs=name==='write_stdin'?{...args,command:args.chars}:args;

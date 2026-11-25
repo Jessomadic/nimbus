@@ -1,8 +1,12 @@
 import { DatabaseSync } from 'node:sqlite';
+import {OB_SCHEMA} from './runtime/openbubbles-store.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {buildWorkerBrief} from './runtime/prompts.js';
 import {defaultDisplayGroup} from './public/agent-groups.js';
+import {ensureJournalIndexes} from './runtime/journal-indexes.js';
+import {ensureDelegationScopeSchema} from './runtime/delegation-scope.js';
+import {config} from './runtime/config.js';
 
 export const DATA_DIR = path.resolve(process.env.NIMBUS_DATA || './data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -73,6 +77,7 @@ for (const [col, type] of [['shape', "TEXT DEFAULT 'blob'"], ['template', "TEXT 
   if (!db.prepare('PRAGMA table_info(bots)').all().some((c) => c.name === col)) db.exec(`ALTER TABLE bots ADD COLUMN ${col} ${type}`);
 }
 
+db.exec(OB_SCHEMA);
 export const q = (sql) => db.prepare(sql);
 db.exec(`CREATE TABLE IF NOT EXISTS task_questions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
@@ -99,7 +104,7 @@ export function writeBotBrief(bot) {
   if (!fs.existsSync(mem)) fs.writeFileSync(mem, `# What ${bot.name} has learned\n\n`);
   const team=q('SELECT id,name,role,parent_bot_id FROM bots WHERE id != ? ORDER BY id').all(bot.id);
   let sharedFacts='';try{sharedFacts=fs.readFileSync(path.join(DATA_DIR,'shared','HOMELAB.md'),'utf8').trim();}catch{}
-  fs.writeFileSync(path.join(dir,'AGENTS.md'),buildWorkerBrief({bot,team,sharedFacts,workspace:dir}));
+  fs.writeFileSync(path.join(dir,'AGENTS.md'),buildWorkerBrief({bot,team,sharedFacts,workspace:dir,permissionMode:config().workers.permissionMode}));
   return dir;
 }
 
@@ -139,6 +144,7 @@ addColumns('runs', [['requested_model', 'TEXT'], ['actual_model', 'TEXT'], ['rou
   ['backend', 'TEXT'], ['input_tokens', 'INTEGER DEFAULT 0'], ['output_tokens', 'INTEGER DEFAULT 0'], ['checkpoint', 'TEXT'],
   ['last_error', 'TEXT'], ['source', "TEXT DEFAULT 'user'"], ['quiet', 'INTEGER DEFAULT 0'], ['depth', 'INTEGER DEFAULT 0']]);
 addColumns('runs',[['origin_message_id','INTEGER'],['origin_request_id','TEXT']]);
+ensureDelegationScopeSchema(db);
 db.exec(`
 CREATE TABLE IF NOT EXISTS task_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, type TEXT NOT NULL, body TEXT NOT NULL,
@@ -157,4 +163,11 @@ CREATE TABLE IF NOT EXISTS task_requests (
   request_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, run_id INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS message_requests (request_key TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,message_id INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS run_context (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL, prompt TEXT NOT NULL,
+  UNIQUE(run_id,message_id)
+);
+CREATE INDEX IF NOT EXISTS run_context_run ON run_context(run_id,id);
 `);
+ensureJournalIndexes(db);

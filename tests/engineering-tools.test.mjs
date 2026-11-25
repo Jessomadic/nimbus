@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { capture } from '../runtime/process.js';
+import { installedRipgrepBins } from '../runtime/ripgrep.js';
 import { execute, tools, roleTools, policyCommand } from '../runtime/toolsets/engineering.js';
 
 function fixture(t) {
@@ -43,6 +44,21 @@ test('code search finds literal source lines, excludes credentials/dependencies 
   await assert.rejects(execute('code_search',{query:'alpha.beta',path:'deep/node_modules/ignore.js'},ctx),/Git\/dependency metadata/);
   write('data/verification/project/sample.js','SCOPED_PROJECT_OK');
   const explicit=await execute('code_search',{query:'SCOPED_PROJECT_OK',path:'data/verification/project'},ctx);assert.equal(explicit.matches.length,1);
+});
+test('Windows sign-in code search uses installed ripgrep when its session-only PATH entry is absent',{skip:process.platform!=='win32'},async t=>{
+  const companions=installedRipgrepBins();
+  if(!companions.length)return t.skip('No installed Codex ripgrep companion on this host');
+  const {write,ctx}=fixture(t);write('src/visible.js','SIGNIN_SEARCH_VISIBLE');write('.env','SIGNIN_SEARCH_VISIBLE');
+  const saved=Object.entries(process.env).filter(([key])=>key.toLowerCase()==='path');
+  try{
+    for(const [key] of saved)delete process.env[key];
+    process.env.Path=path.join(process.env.SystemRoot||'C:\\Windows','System32');
+    const result=await execute('code_search',{query:'SIGNIN_SEARCH_VISIBLE'},ctx);
+    assert.equal(result.available,true,JSON.stringify(result));assert.equal(result.matches.length,1);assert.match(result.matches[0].path,/visible\.js$/);
+  }finally{
+    for(const key of Object.keys(process.env))if(key.toLowerCase()==='path')delete process.env[key];
+    for(const [key,value] of saved)process.env[key]=value;
+  }
 });
 test('static dependencies and reverse impact follow real local imports and retain unresolved evidence',async t=>{
   const {write,ctx}=fixture(t);write('package.json','{"type":"module","dependencies":{"some-lib":"1.0.0"}}');

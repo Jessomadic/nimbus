@@ -1,0 +1,117 @@
+[
+  {
+    "relative": "LICENSE",
+    "sha256": "e3cbb473240e1d307d61809891b26ae8956e401d39ad2ea5e2c407d69298dbc5",
+    "bytes": 1091
+  },
+  {
+    "relative": "SKILL.md",
+    "sha256": "d1a0c49454958f118701a33f856a99025473b75c27c3504574a3902fcf2219aa",
+    "bytes": 15465
+  },
+  {
+    "relative": "references/forms.md",
+    "sha256": "471517e0b154fb765d04416f089b7e999103804b964a84675af49e2d53ee8da0",
+    "bytes": 3950
+  },
+  {
+    "relative": "references/nano-pdf-editing.md",
+    "sha256": "2f0b15bd1ebbd45cf37ed257723ad63aa70b623b97f5242c886c14f8968cd773",
+    "bytes": 1342
+  },
+  {
+    "relative": "references/ocr-extraction.md",
+    "sha256": "1bba1451fbaa50842890e7b75a1ad226dfe9791619cb4df3d705e2a38b606da6",
+    "bytes": 5615
+  },
+  {
+    "relative": "runtime/environment-manifest.json",
+    "sha256": "6348a8f3261ba9a17c1e1017479cb1114263154e8416e1f9c5c3a4726ab4af2c",
+    "bytes": 87837
+  },
+  {
+    "relative": "runtime/run_resource.py",
+    "sha256": "53af122beee6241298548e19b3bccb129b5be4926e56543b20ce2e2520ebfcad",
+    "bytes": 6155
+  },
+  {
+    "relative": "scripts/_raster.py",
+    "sha256": "17ecfb8dd78b006e904d0f29e28172ce308a34588db99ec80b0f085d2a37b518",
+    "bytes": 2614
+  },
+  {
+    "relative": "scripts/extract_marker.py",
+    "sha256": "a115ee1da5b88f7ab61c480ef9efb2b371350bed8f1cface7668898ba80aae38",
+    "bytes": 3458
+  },
+  {
+    "relative": "scripts/extract_pymupdf.py",
+    "sha256": "784d233ee9849ce78cddc8253c87172c06a0b62c41aff7215fd97b77766babc8",
+    "bytes": 3671
+  },
+  {
+    "relative": "scripts/pdf_create.py",
+    "sha256": "2a7a7c06c608e82cc11684bb67ff9cdb3bf8cbe6df38c6f4b1096dd2686f993c",
+    "bytes": 4562
+  },
+  {
+    "relative": "scripts/pdf_fill_form.py",
+    "sha256": "d66d504d7f7fcb85c28881065c47dfbc6ac9b47294471531a7f013178c72a1ad",
+    "bytes": 3887
+  },
+  {
+    "relative": "scripts/pdf_form_layout.py",
+    "sha256": "f654e386a8b1e5a26a1530b16d36177310dd48c6cb589ec6cf3dc1898a8ccdf9",
+    "bytes": 7131
+  },
+  {
+    "relative": "scripts/pdf_make_form.py",
+    "sha256": "a194791f2d6504da9e629976620ac227a18a6ea14784d428c4cf4f57fafd6c3d",
+    "bytes": 5988
+  },
+  {
+    "relative": "scripts/pdf_merge.py",
+    "sha256": "c1cf231f73b02790069227a4f711475b4b329c91e30e77826f24c05935674248",
+    "bytes": 1686
+  },
+  {
+    "relative": "scripts/pdf_meta.py",
+    "sha256": "989c2564bb31d8b20abd53a4d7f86a603c930bd868e0201ad4cdec92d5487460",
+    "bytes": 4458
+  },
+  {
+    "relative": "scripts/pdf_page_image.py",
+    "sha256": "40ad843fd50bd6bd91af1fd53de1cff1faf885921294afd304d0abf0fe93e4e2",
+    "bytes": 3589
+  },
+  {
+    "relative": "scripts/pdf_read.py",
+    "sha256": "7d623cbbb6319f9f161dd769972250b08c426c291ed0af1a8304bec20437bfb2",
+    "bytes": 5895
+  },
+  {
+    "relative": "scripts/pdf_secure.py",
+    "sha256": "65d0ba6733cb945e6147e4b46e0b6db0816096440b0f4fe24cc953307805e01b",
+    "bytes": 2679
+  },
+  {
+    "relative": "scripts/pdf_split.py",
+    "sha256": "1e3d8f8e9aa8aa5445f8587e402e3bab65c785eb5b4aea120bc5b6216cb57cba",
+    "bytes": 3045
+  },
+  {
+    "relative": "scripts/pdf_stamp.py",
+    "sha256": "acadb1368de637cb0c78c67c8383daf34902396611f2f9d30476cbd50b3988ca",
+    "bytes": 5900
+  },
+  {
+    "relative": "scripts/pdf_watermark.py",
+    "sha256": "d903977ee37194ad18bba205d2d96eefbbe6670519bcd8ae285f619645005ae2",
+    "bytes": 1852
+  },
+  {
+    "relative": "tests/test_pdf_skill.py",
+    "sha256": "a2f6dd5be18f4c63a90fe4688d717145e74821d83afdd9e781adc815806a9119",
+    "bytes": 17433
+  }
+]

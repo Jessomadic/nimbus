@@ -1,0 +1,50 @@
+[
+  {
+    "target": "integrations/knowledge_tools/run.py",
+    "source": "knowledge_tools/run.py",
+    "before": "133ccf31440fac959be9c1acaaeacc50e6a6451a8043bb378f75da415e7fd972",
+    "after": "0d11d9bd6836e3162073bffac62c6eaa2116932c87a35684d2563bf6d9ecbc06"
+  },
+  {
+    "target": "integrations/knowledge_tools/kb/query.py",
+    "source": "knowledge_tools/kb/query.py",
+    "before": "dc830aaf3d2da277a16af9d5dd46a2e12e1f3a79c073879bf59962f7da6d96df",
+    "after": "4a0f8aaf5c1f243779d8aebe7c4a96e34dd3d4ce025d062c02ff281cb25a82c5"
+  },
+  {
+    "target": "integrations/knowledge_tools/kb/store.py",
+    "source": "knowledge_tools/kb/store.py",
+    "before": "dbc6433e8626d0b302a071499d1df76c3871d11a19abb6db6eb4cf20a8744d72",
+    "after": "98582256a10c357d4b66a9486fd1ce5592f879aea160f17442b2f0029c48f763"
+  },
+  {
+    "target": "integrations/knowledge_tools/mcp_server.py",
+    "source": "knowledge_tools/mcp_server.py",
+    "before": "0961e5bcf6d4a06a6dde2f4e99ee416462818bbc43091b176d98004806073c04",
+    "after": "2e34ae29c3c0893856192f8a51b0e3983c1447beeae8ef6f586c88144ddc5fe7"
+  },
+  {
+    "target": "brain_viewer/data.py",
+    "source": "brain_viewer/data.py",
+    "before": "8acba23f89d6d9e3aa5ddaf8da8812b9ca622b4e5e9cf4d4460f27ae46c7ee10",
+    "after": "505e115ce5e59d2f7272cfc04daed8503b4854f63df315eb2162edf5e4425f73"
+  },
+  {
+    "target": "integrations/knowledge_tools/kb/publication.py",
+    "source": "knowledge_tools/kb/publication.py",
+    "before": null,
+    "after": "338e291e282bba069c0604d8e4ffaff2b61c22ed1eabe24f4349b2f4e9c13136"
+  },
+  {
+    "target": "integrations/knowledge_tools/kb/publication_cli.py",
+    "source": "knowledge_tools/kb/publication_cli.py",
+    "before": null,
+    "after": "2bb8c75d9acf5bc7107e6141c64c0b36fb62cce42dd1dfc3066e80991d9e219a"
+  },
+  {
+    "target": "integrations/knowledge_tools/kb/brain_reads.py",
+    "source": "knowledge_tools/kb/brain_reads.py",
+    "before": null,
+    "after": "d7e2737c496a4dd54c9403e89f4f27b8ea9116301fd4bf7e495b3e0c4ffe0093"
+  }
+]

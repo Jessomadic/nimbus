@@ -1,5 +1,9 @@
 # Nimbus for Windows
 
+Messages default to **Add context**: while a user task is active in that chat, new text and attachments join the same run at its next model step without stopping the current tool. Nimbus shows when context is queued and received. Context survives checkpoint recovery, and late context is handled before the final answer is published. Choose **New task** beside the composer to queue a separate assignment. When no user task is active, either choice starts a task. Group chats route context to the mentioned worker or group lead; delegated and scheduled jobs keep their own inputs. Adding context does not answer a pending question or approve an action.
+
+Activity rows describe recorded actions in plain language, with task references, handoff context, worker names and progress marks. Expand an action to inspect its original tool call. This display also applies to retained history; it does not change the recorded actions. Opening a chat on desktop or mobile starts at its newest messages after history loads. Incoming updates keep following the latest messages until you scroll up to read earlier work.
+
 A team of independent AI workers with a shared local inference pool and OpenAI subscription execution through the Codex CLI. Workers have their own instructions, working memory, task histories, artifacts and browser groups. They share model capacity, rather than loading a model for every worker.
 
 This replaces the original execution backend. Nimbus runs independently. **Lumos integration is deliberately disconnected.**
@@ -52,12 +56,12 @@ node bin/ui-password.mjs
 
 Alternatively, in shared-password mode, `node --env-file-if-exists=.env bin/nimbus.mjs OPEN` issues a one-time local sign-in link. It expires after one minute and is accepted once. Email-account mode requires signing in with an account password. Setup and startup restrict Windows file access to the checkout owner, SYSTEM and administrators; see [security details](docs/SECURITY.md).
 
-`Start-Nimbus.ps1` starts the hidden Windows supervisor. Logs live under `data/`. `Stop-Nimbus.ps1` drains and stops the runtime through its authenticated local endpoint. Optional sign-in startup is installed by `Install-NimbusStartup.ps1`; it uses the current Windows account and does not require administrator rights.
+`Start-Nimbus.ps1` starts the hidden Windows supervisor. Logs live under `data/`. `Stop-Nimbus.ps1` drains and stops the runtime through its authenticated local endpoint. `Install-NimbusStartup.ps1` installs current-account sign-in startup, failure retries, and a one-minute missed-start recovery trigger. Task Scheduler owns the foreground supervisor independently of Codex; duplicate starts are ignored and there is no execution time limit or battery stop. Automatic starts honor `data/stop.request`; run `Start-Nimbus.ps1` after an intentional stop to resume. Startup requires this Windows account to be signed in so its protected credentials and model login remain available.
 
 ## Requirements
 
 - Windows with Node.js 22.13 or newer and npm.
-- Codex CLI available on PATH, or an absolute `cloud.codexBin` in `nimbus.config.json`.
+- Codex CLI installed locally or available on PATH. `cloud.codexBin: "auto"` selects the newest working installed CLI by version; an explicit path pins the executable.
 - A ChatGPT subscription login for cloud workers: run `codex login` as the Windows account that runs Nimbus. Nimbus verifies the native account type and does not switch to API-key billing.
 - LM Studio and its `lms` CLI for local inference. Start its loopback API server on port 1234. The managed Nimbus pool uses port 12438.
 - A local model capable of structured tool calls. The default cold-load model is `google/gemma-4-e4b`.
@@ -93,11 +97,12 @@ Copy `nimbus.config.example.json` to `nimbus.config.json` if setup has not alrea
 
 Important fields:
 
-- `cloud.models`: family-to-model mappings; `auto` resolves against the native Codex catalogue.
+- `cloud.models`: family-to-model mappings; `auto` selects the highest numeric GPT version advertised for that family by the signed-in Codex account, independent of catalogue order. Runtime and catalogue discovery refresh every 30 seconds; new tasks use the updated selection. Explicit model mappings remain pins. Running tasks retain their current model. Update the installed Codex runtime when a release is not yet advertised by any installed version.
 - `local.baseUrl`, `local.model`, `local.approvedModels`, `local.reuseLoaded`.
 - `local.managed`: the standalone pool's LM Studio executable, upstream URL, model key, GPU ratio and conservative load forecasts. Set `enabled: false` to use an independently managed compatible endpoint instead.
 - `local.tokenDpapiFile`: an existing Windows-DPAPI-protected UTF-8 local-server token; alternatively use the environment variable named by `local.tokenEnv`.
 - `workers.maxConcurrent`, `cloud.maxConcurrent`, `workers.maxSteps` and task timeout.
+- `workers.permissionMode`: `rules` follows each worker's approval rules; `all` gives the whole team **All permissions**, so enabled tools run without approval prompts. Change it in **Server settings → Permissions**. It takes effect immediately, approves actions currently waiting for permission, and persists across restarts. Switching back restores the saved rules. Workers can still ask for missing task information.
 - `browser.headless`, group limit and per-worker tab limit. Browser mode changes require restarting Nimbus.
 
 The managed local service binds only to loopback. The dashboard also defaults to loopback. Set a deliberate host binding and configure TLS/reverse proxy before network access. HTTPS is optional; an externally supplied TLS proxy is appropriate for server deployment.

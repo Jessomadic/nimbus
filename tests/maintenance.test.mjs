@@ -32,6 +32,20 @@ test('validation executes behavior tests and rejects a syntactically valid regre
   assert.equal(manager.load(snapshot.id).state,'validation_failed');
   assert.throws(()=>manager.apply(snapshot.id),/Validate/);
 });
+test('validation preserves early failure diagnostics beyond the bounded receipt tail, with separate logs for every attempt',async t=>{
+  const {manager,write}=fixture(t),snapshot=manager.snapshot();
+  write('tests/smoke.test.mjs',"import test from 'node:test'; import assert from 'node:assert/strict'; test('EARLY_FAILURE_DIAGNOSTIC',()=>assert.fail('retain exact failure')); for(let i=0;i<300;i++)test('subsequent passing test '+i,()=>assert.ok(true));");
+  await assert.rejects(manager.validate(snapshot.id));
+  const failure=manager.load(snapshot.id).checks.find(check=>check.pass===false);
+  assert.ok(!failure.output.includes('EARLY_FAILURE_DIAGNOSTIC'));
+  assert.match(fs.readFileSync(failure.outputLog,'utf8'),/EARLY_FAILURE_DIAGNOSTIC/);
+  assert.ok(fs.existsSync(failure.stderrLog));
+  write('tests/smoke.test.mjs',"import test from 'node:test'; test('repaired fixture',()=>{});");
+  const repaired=await manager.validate(snapshot.id),success=repaired.checks.find(check=>check.name==='Nimbus tests');
+  assert.equal(repaired.state,'validated');assert.notEqual(success.outputLog,failure.outputLog);
+  assert.match(fs.readFileSync(failure.outputLog,'utf8'),/EARLY_FAILURE_DIAGNOSTIC/);
+  assert.match(fs.readFileSync(success.outputLog,'utf8'),/repaired fixture/);
+});
 test('syntax failure and source drift cannot be applied',async t=>{
   const {manager,write}=fixture(t),snapshot=manager.snapshot();
   write('server.js','export const version = ;');

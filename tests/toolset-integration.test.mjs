@@ -23,6 +23,7 @@ test('every specialist tool publishes one unique schema and every built-in role 
 });
 test('real worker tool building preserves role limits and routes tools through the shared dispatcher',async()=>{
   const profile=ROLE_PROFILES.find(p=>p.id==='researcher'),bot={...profile,id:981,tools:JSON.stringify(profile.tools)};
+  db.prepare('INSERT INTO bots(id,name,template,tools) VALUES(?,?,?,?)').run(bot.id,bot.name,profile.id,bot.tools);
   const available=await buildTools(bot);assert.ok(available.tools.some(t=>t.function.name==='source_register'));assert.ok(!available.tools.some(t=>t.function.name==='shell'));
   const result=await executeTool(bot,'tool_catalog',{query:'source register'},{availableTools:available.tools,bindings:available.bindings});assert.ok(result.tools.some(t=>t.name==='source_register'));
 });

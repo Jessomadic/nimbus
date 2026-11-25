@@ -1,0 +1,52 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
+import {createHash} from 'node:crypto';
+const runtime=new URL('../runtime/',import.meta.url);
+async function fixture(t,override){
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'nimbus-identity-'));
+ t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ fs.mkdirSync(path.join(root,'runtime'));
+ for(const name of ['config.js','mcp-scope.js'])fs.copyFileSync(new URL(name,runtime),path.join(root,'runtime',name));
+ fs.writeFileSync(path.join(root,'package.json'),'{"type":"module"}');
+ const old=process.env.NIMBUS_CONFIG;
+ t.after(()=>{if(old===undefined)delete process.env.NIMBUS_CONFIG;else process.env.NIMBUS_CONFIG=old;});
+ if(override===undefined)delete process.env.NIMBUS_CONFIG;
+ else process.env.NIMBUS_CONFIG=override==='external'?path.join(root,'other.json'):override;
+ const mod=await import(pathToFileURL(path.join(root,'runtime/config.js')));
+ return {root,mod};
+}
+for(const override of [undefined,'','external'])test('identity default/empty/override '+String(override),async t=>{
+ const {root,mod}=await fixture(t,override);
+ assert.equal(mod.CONFIG_FILE,path.join(root,override==='external'?'other.json':'nimbus.config.json'));
+ const raw=Buffer.from('{"password":"SYNTHETIC_PRIVATE_MARKER"}\r\n ');
+ fs.writeFileSync(mod.CONFIG_FILE,raw);
+ const value=mod.configIdentity();
+ assert.deepEqual(Object.keys(value).sort(),['resolvedPath','overridePresent','rawFileSha256','readState','pid'].sort());
+ assert.equal(value.overridePresent,override!==undefined);
+ assert.equal(value.rawFileSha256,createHash('sha256').update(raw).digest('hex'));
+ assert.equal(value.pid,process.pid);assert.equal(value.readState,'ok');
+ assert.ok(!JSON.stringify(value).includes('SYNTHETIC_PRIVATE_MARKER'));
+ process.env.NIMBUS_CONFIG='SYNTHETIC_ENV_SECRET';
+ assert.deepEqual(mod.configIdentity(),value);
+ fs.appendFileSync(mod.CONFIG_FILE,' ');
+ assert.notEqual(mod.configIdentity().rawFileSha256,value.rawFileSha256);
+ fs.unlinkSync(mod.CONFIG_FILE);
+ assert.equal(mod.configIdentity().readState,'missing');
+ assert.equal(mod.configIdentity().rawFileSha256,null);
+ fs.mkdirSync(mod.CONFIG_FILE);
+ assert.equal(mod.configIdentity().readState,'unreadable');
+ assert.equal(mod.configIdentity().rawFileSha256,null);
+});
+test('existing status branch preserves fields and snapshot argument',()=>{
+ const source=fs.readFileSync(new URL('tools.js',runtime),'utf8');
+ assert.match(source,/import \{ config, configIdentity, ROOT \} from '.\/config.js'/);
+ const branch=source.split('\n').find(line=>line.includes("if (args.action === 'status')"));
+ const prior={root:'fixture',sourceHash:'pin',supervised:false,pending:null,snapshot:{id:'x'},workflow:'unchanged'};
+ const invoke=new Function('args','maintenance','configIdentity',branch);
+ const identity={pid:123};
+ assert.deepEqual(invoke({action:'status',snapshotId:'x'},{status(id){assert.equal(id,'x');return prior;}},()=>identity),{...prior,configIdentity:identity});
+});

@@ -1,3 +1,4 @@
+import {artifactDirectory} from './helpers/artifact-directory.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -7,7 +8,7 @@ import {sidebarFixture,repository} from './helpers/sidebar-fixture.mjs';
 
 test('real browser sidebar supports cross-group agents, nested groups, keyboard moves and mobile touch', {timeout:90000},async t=>{
   const fixture=await sidebarFixture(t),{api,bots,snapshot}=fixture,baseline=snapshot();
-  const artifacts=path.join(repository,'.dev','sidebar-verification');fs.mkdirSync(artifacts,{recursive:true});
+  const artifacts=artifactDirectory('sidebar-drag');
   const browser=await chromium.launch({headless:true});t.after(()=>browser.close());
   const context=await browser.newContext({viewport:{width:1280,height:1100}}),page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
   await context.route(/https:\/\/fonts\.(?:googleapis|gstatic)\.com\//,route=>route.abort());

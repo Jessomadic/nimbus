@@ -1,0 +1,212 @@
+/* Keep Nimbus tokens, hierarchy and desktop density; adapt the device shell. */
+/* App-only scroll ownership; login and desktop remain unchanged. Directional
+   panning stays native; pinch/double-tap whole-app zoom is excluded on phones.
+   Never disable text selection or use touch-action:none. */
+@media (max-width:760px), (max-width:960px) and (max-height:500px) and (orientation:landscape) {
+ html:has(body > .app), body:has(> .app) { overflow: hidden; overscroll-behavior: none; }
+ body:has(> .app) { position: fixed; inset: 0; width: 100%; touch-action: pan-x pan-y; }
+ .app, .thread, .side-list, .aside, .modal, .popover,
+ .phone-context-items, .md pre, .md table, textarea {
+  overscroll-behavior: none; -webkit-overflow-scrolling: touch;
+ }
+}
+
+/* Clamp stale visualViewport samples during rotation to the live layout viewport.
+   Keyboard sizing can still reduce this height; the thread remains the scroll region. */
+.app { height: min(var(--app-height, 100dvh), 100dvh); position: relative; top: var(--app-top, 0px);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left); }
+.main, .thread, .side-list { min-height: 0; }
+/* Flex children must shrink; short landscape empty states scroll, not clip under the composer. */
+.main > .thread { flex: 1 1 0; min-height: 0; }
+.composer, .main > .phone-dock { flex-shrink: 0; }
+.thread .empty { flex-shrink: 0; }
+.scrim { top: var(--app-top, 0px); bottom: auto; height: var(--app-height, 100dvh); }
+/* Reserve an action row so identity is not squeezed at 320px. */
+@media (max-width: 360px) {
+  .head { flex-wrap: wrap; padding-top: 4px; padding-bottom: 4px; }
+  .head .title { flex: 1 1 calc(100% - 60px); }
+  .head .actions { margin-left: auto; }
+}
+.composer { padding-bottom: max(18px, env(safe-area-inset-bottom)); }
+.composer textarea { min-width: 0; }
+.side-foot { padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+.aside { top: var(--app-top, 0px); bottom: auto; height: var(--app-height, 100dvh);
+  padding-top: env(safe-area-inset-top); padding-right: max(16px, env(safe-area-inset-right));
+  padding-bottom: max(20px, env(safe-area-inset-bottom)); }
+.mobile-backdrop[hidden] { display: none; }
+.mobile-backdrop { position: fixed; inset: 0; z-index: 39; background: rgb(0 0 0 / .5); }
+body:has([data-nimbus-login]) { height: auto; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+@media (max-width: 760px), (max-width: 960px) and (max-height: 500px) and (orientation: landscape) {
+  .side { top: var(--app-top, 0px); bottom: auto; height: var(--app-height, 100dvh);
+    padding-top: env(safe-area-inset-top); padding-left: env(safe-area-inset-left); }
+  .composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+  .composer textarea, .field input, .field select, .field textarea, input, select, textarea { font-size: 16px; }
+  .head .icon-btn, .composer .plus, .composer .send { min-width: 44px; min-height: 44px; }
+  .head .actions { gap: 0; }
+  .head { min-height: 52px; height: auto; }
+  .modal { max-height: calc(var(--app-height, 100dvh) - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+}
+@media (pointer: coarse) {
+  input, select, textarea, .composer textarea { font-size: 16px; }
+}
+@media (max-height: 600px) {
+  body:has([data-nimbus-login]) { place-items: start center; }
+  [data-nimbus-login] > img { width: 80px !important; height: 80px !important; }
+}
+@media (prefers-reduced-motion: reduce) { .side, .aside { transition: none; } }
+
+/* iPhone-first Nimbus: conversation above a quiet, thumb-reachable destination bar.
+   Existing dark/light tokens and desktop layout remain authoritative. */
+.phone-dock { display: none; }
+@media (max-width: 760px), (max-width: 960px) and (max-height: 500px) and (orientation: landscape) {
+  .app { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+  .phone-dock { display: flex; position: absolute; bottom: 0; left: 0; right: 0;
+    height: calc(64px + env(safe-area-inset-bottom)); padding: 4px 8px max(4px, env(safe-area-inset-bottom));
+    background: var(--side); border-top: 1px solid var(--line); z-index: 20; }
+  .phone-dock button { flex: 1; min-width: 0; min-height: 48px; display: flex;
+    flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+    font-size: 11px; font-weight: 600; color: var(--muted); border-radius: 14px; }
+  .phone-dock button span { font-size: 22px; line-height: 24px; }
+  .phone-dock button[aria-current] { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .main .head { min-height: 64px; flex-wrap: nowrap; padding: 8px 12px; gap: 6px; }
+  .main .head .title { padding: 4px 0; }
+  .head .title b { font-size: 18px; letter-spacing: -.035em; }
+  .head .title .avatar { display: none; }
+  .main .head .menu-btn, .main .head .actions > .icon-btn { display: none; }
+  .head .actions { margin-left: auto; }
+  .head .effort-btn { min-height: 44px; }
+  .head .title .status { max-width: 70px; overflow: hidden; text-overflow: ellipsis; }
+  .thread { padding: 18px 16px 12px; overscroll-behavior: contain; }
+  .thread-inner { gap: 14px; }
+  .msg { max-width: 100%; min-width: 0; }
+  .msg.user .bubble { border-radius: 20px 20px 5px 20px; padding: 12px 16px; }
+  .msg.bot .bubble { font-size: 16px; line-height: 1.65; }
+  .msg-actions { opacity: 1; min-height: 32px; flex-wrap: wrap; }
+  .msg-actions button { min-height: 32px; padding: 4px 8px; }
+  .bubble, .trace, .approval { overflow-wrap: anywhere; }
+  .bubble pre { max-width: 100%; overflow-x: auto; }
+  .composer { padding: 8px 12px 10px; border-top: 1px solid var(--line); background: var(--bg); }
+  .composer-context { margin-bottom: 8px; gap: 6px; }
+  .composer-context label { display: flex; align-items: center; gap: 8px; }
+  .composer-context select { border-radius: 999px; min-height: 36px; padding: 5px 12px; }
+  #context-hint { flex: 1 1 100%; font-size: 11px; line-height: 1.4; }
+  .composer form { border-radius: 22px; flex-wrap: wrap; padding: 6px; gap: 2px; }
+  .composer textarea { order: -1; flex: 1 1 100%; width: 100%; padding: 8px 10px; max-height: 120px; }
+  .composer .send { margin-left: auto; background: var(--accent); color: white; }
+  .side { width: min(100%, 430px); border-radius: 0 24px 24px 0; }
+  .side-top { padding: 18px 16px 12px; }
+  .side-top .search { height: 44px; border-radius: 14px; }
+  .side-list { padding: 6px 12px; }
+  .side-item { min-height: 66px; padding: 10px 12px; border-radius: 16px; }
+  .side-item .name { font-size: 16px; }
+  .side-item.active { background: color-mix(in srgb, var(--accent) 14%, var(--side)); }
+  .side-foot { padding: 10px 12px max(12px, env(safe-area-inset-bottom)); }
+  .foot-item { min-height: 44px; }
+  .aside { width: 100%; border: 0; box-shadow: none; }
+  .aside-head { min-height: 64px; font-size: 22px; letter-spacing: -.035em; }
+  .aside .card-item { padding: 14px 10px; }
+  .trace { border-radius: 16px; border: 1px solid var(--line); }
+  .trace summary { min-height: 48px; padding: 12px; flex-wrap: wrap; }
+  .trace .stop, .approval .btn { min-height: 44px; }
+  .task-plan { padding: 12px; line-height: 1.6; }
+  .scrim { padding: 0; align-items: end; }
+  .scrim .modal { width: 100%; max-height: calc(var(--app-height, 100dvh) - 16px);
+    border-radius: 24px 24px 0 0; padding: 22px 20px max(22px, env(safe-area-inset-bottom)); gap: 20px; }
+  .modal-head { position: sticky; top: -22px; background: var(--side); padding: 8px 0; z-index: 2; }
+  .modal h2 { font-size: 24px; letter-spacing: -.04em; }
+  .modal .field { gap: 8px; }
+  .modal input, .modal select, .modal textarea { min-height: 44px; }
+  .modal .btn, .modal .icon-btn, .modal-foot button { min-height: 44px; }
+  .modal-foot { flex-wrap: wrap; }
+}
+@media (max-height: 500px) and (orientation: landscape) {
+  .app { padding-bottom: 0; }
+  .phone-dock { position: relative; flex-direction: column; width: 72px; height: 100%; order: -1;
+    padding: 4px; border-top: 0; border-right: 1px solid var(--line); }
+  .main .head { min-height: 48px; padding: 2px 12px; }
+  #context-hint { display: none; }
+  .composer textarea { max-height: 64px; }
+}
+@media (prefers-reduced-motion: reduce) { .scrim .modal { animation: none; } }
+
+/* Repair: navigation belongs to composer flow, never a reserved gap or overlay. */
+.phone-context { display: contents; }
+.phone-context > summary { display: none; }
+.phone-context-items { display: contents; }
+@media (max-width: 760px), (max-width: 960px) and (max-height: 500px) and (orientation: landscape) {
+ .app { padding-bottom: 0; }
+ .phone-dock { position: relative; inset: auto; margin: 8px -12px -10px; width: auto; order: 0; flex-direction: row; height: 56px; padding: 4px 8px; border-right: 0; border-top: 1px solid var(--line); }
+ /* Entry dock has no padded composer to cancel the conversation dock margins. */
+ .main > .phone-dock { margin: 8px 0 0; width: 100%; }
+ .main .head .menu-btn { display: grid; }
+ .phone-context { display: block; position: relative; }
+ .phone-context > summary { display: grid; place-items: center; cursor: pointer; min-width: 44px; min-height: 44px; }
+ .phone-context > summary:focus-visible { outline: 2px solid var(--accent); }
+ .phone-context-items { display: none; }
+ .phone-context[open] .phone-context-items { display: flex; flex-direction: column; position: absolute; right: 0; top: 48px; z-index: 35; width: 190px; max-height: calc(var(--app-height, 100dvh) - 120px); overflow: auto; padding: 8px; background: var(--side); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 12px 32px #0006; }
+ /* Overflow replaces the legacy narrow-header hiding rules, including Memory/New chat. */
+ .head .actions .phone-context-items .icon-btn { display: flex; width: 100%; justify-content: flex-start; align-items: center; gap: 10px; min-height: 44px; }
+ .phone-context-items .icon-btn::after { content: attr(aria-label); font-size: 14px; }
+ .phone-keyboard .phone-dock { display: none; }
+}
+@media (max-height: 500px) and (orientation: landscape) {
+ .phone-dock { height: 44px; padding: 0 8px; }
+ .phone-dock button { min-height: 40px; flex-direction: row; gap: 6px; }
+ .composer-context { margin-bottom: 2px; }
+ .composer form { flex-wrap: nowrap; }
+ .composer textarea { order: 0; flex: 1; width: auto; }
+ /* Keep the identity and subtitle inside short phone threads without hiding content. */
+ @media (max-width: 960px) {
+  .thread .empty { padding: 4px 24px; gap: 2px; }
+  .thread .empty h2 { margin: 4px 0 0; }
+  .thread .empty p { margin-bottom: 0; }
+ }
+}
+
+/* Physical-iPhone feedback: intrinsic shrink boundaries, not viewport clipping. */
+.thread-inner, .msg, .bubble, .trace, .trace .steps, .trace .step,
+.side-top, .side-list, .side-item, .side-item .row1 { min-width: 0; }
+.thread-inner { width: 100%; }
+/* Assignment notes also need an intrinsic shrink boundary on desktop. */
+.thread-inner > .note { min-width: 0; max-width: 100%; flex-wrap: wrap; overflow-wrap: anywhere; }
+.thread-inner > .note > * { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+@media (max-height: 500px) and (orientation: landscape) {
+ /* Allow the thread to yield its decorative padding to a very short keyboard viewport. */
+ .phone-keyboard .thread { padding-top: 0; padding-bottom: 0; }
+}
+.bubble, .trace { max-width: 100%; }
+.trace .step > :last-child { min-width: 0; }
+.md pre { width: 100%; max-width: 100%; white-space: pre; overflow: auto; }
+.md :not(pre) > code { white-space: break-spaces; overflow-wrap: anywhere; }
+.md table { display: block; max-width: 100%; overflow: auto; }
+@media (max-width:760px), (max-width:960px) and (max-height:500px) and (orientation:landscape) {
+ .side { width: 100%; max-width: 430px; border-radius: 0; }
+ .side-top .search input, .search input, .search.big input { font-size: 16px; }
+ /* Directory summaries are previews; complete messages remain in the conversation. */
+ .side-item .sub { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; white-space: normal; overflow: hidden; overflow-wrap: anywhere; line-height: 1.35; }
+ .side-parent-context { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+ .side-item .row1 { flex-wrap: nowrap; gap: 6px; }
+ .side-item .name { flex: 1; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+ .thread-inner > .note { min-width: 0; max-width: 100%; flex-wrap: wrap; overflow-wrap: anywhere; }
+ .thread-inner > .note > * { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+ .msg-actions { min-width: 0; max-width: 100%; flex-wrap: wrap; }
+ .side-item { border-radius: 12px; align-items: flex-start; }
+ .side-item .avatar { flex-shrink: 0; }
+ .side-group-children, .side-orchestrator-branch { margin-left: 4px; padding-left: 4px; }
+ .trace { min-width: 0; width: 100%; }
+ .trace summary .sp { margin-left: 0; overflow-wrap: anywhere; min-width: 0; }
+ .trace .step { flex-wrap: wrap; }
+ .main .thread > .empty { align-items: flex-start; text-align: left; margin: 20px auto; padding: 16px 8px; width: 100%; }
+ .thread > .empty .logo-art { width: 72px; height: 72px; border-radius: 20px; }
+ .thread > .empty h2 { font-size: 28px; line-height: 1.15; margin-top: 20px; }
+ .thread > .empty p { font-size: 16px; max-width: 34ch; }
+ .thread > .empty .row { justify-content: flex-start; margin-top: 12px; }
+ .thread > .empty .btn { min-height: 48px; }
+ .phone-dock svg { flex-shrink: 0; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+ /* Account options must wrap rather than collide at large text/phone widths. */
+ .popover button { display: flex; align-items: center; gap: 12px; white-space: normal; height: auto; min-height: 44px; padding: 12px 16px; line-height: 1.4; text-align: left; }
+ .popover button svg { flex-shrink: 0; }
+ .composer-context { min-width: 0; flex-wrap: wrap; }
+ .composer-context label { min-width: 0; }
+ .composer-context select { max-width: 100%; }
+}

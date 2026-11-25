@@ -25,6 +25,13 @@ export async function chooseRoute({ task, role, preferredTier='', pinned = '', e
   cloudAvailable=cloudAvailable&&c.cloud.enabled;
   effort=effort==='max'?'xhigh':effort;
   if(preferredTier&&!ROUTE_SCHEMA.properties.tier.enum.includes(preferredTier))throw new Error('Unknown role model preference');
+  if (!c.local.enabled) {
+    if (!cloudAvailable) throw Object.assign(new Error('No model provider available: local models are disabled and OpenAI is unavailable'),{pause:true});
+    const explicit=pinned&&pinned!=='auto'&&pinned!=='local'&&pinned!==c.local.model;
+    const tier=explicit?Object.keys(c.cloud.models).find(k=>k===pinned||c.cloud.models[k]===pinned):cloudFallbackTier(preferredTier,c);
+    if(!tier)throw new Error(`Unknown model override: ${pinned}`);
+    return {tier,effort,reason:'Local models disabled; using OpenAI',fallbackTier:tier,router:'availability'};
+  }
   if (pinned && pinned !== 'auto') {
     const tier = pinned === c.local.model || pinned === 'local' ? 'local' : Object.keys(c.cloud.models).find(k => k === pinned || c.cloud.models[k] === pinned);
     if (!tier) throw new Error(`Unknown model override: ${pinned}`);

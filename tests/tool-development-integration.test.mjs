@@ -22,7 +22,7 @@ test('provider request is journaled before parking and notifies its exact API so
   const call=q("SELECT * FROM tool_calls WHERE run_id=? AND name='request_tool'").get(runId);assert.equal(call.state,'done');assert.equal(JSON.parse(call.result).requestId,request.id);
   const checkpoint=JSON.parse(q('SELECT checkpoint FROM runs WHERE id=?').get(runId).checkpoint);assert.equal(checkpoint.awaitingToolRequest,request.id);assert.ok(checkpoint.messages.some(message=>message.role==='tool'));
   assert.ok(q("SELECT * FROM task_events WHERE run_id=? AND type='tool.development'").all(runId).length>=1);assert.ok(q("SELECT * FROM messages WHERE thread=? AND kind='capability'").all('bot:'+botId).length>=1);
-  assert.equal(stopRun(runId),true);assert.equal(taskResult(runId).status,'stopped');assert.equal(toolDevelopment.get(request.id).status,'cancelled');
+  assert.deepEqual(stopRun(runId),{changed:true,reasonCode:'stopped'});assert.equal(taskResult(runId).status,'stopped');assert.equal(toolDevelopment.get(request.id).status,'cancelled');
 });
 
 test('restart reconciles a committed request before its tool journal completed without replaying a build',()=>{

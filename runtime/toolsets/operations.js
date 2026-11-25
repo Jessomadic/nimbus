@@ -1,3 +1,4 @@
+import {historyPageGuidance} from '../read-guidance.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -5,7 +6,7 @@ import {createHash} from 'node:crypto';
 import {capture} from '../process.js';
 import {resources} from '../resources.js';
 import {isValidCron,nextRun} from '../cron.js';
-import {cleanConnectorError} from '../mcp.js';
+import {cleanConnectorError,connectorAllowed} from '../mcp.js';
 
 const text={type:'string'},integer=(minimum,maximum)=>({type:'integer',minimum,maximum});
 const spec=(name,description,properties={},required=[])=>({type:'function',function:{name,description,parameters:{type:'object',properties,required,additionalProperties:false}}});
@@ -19,7 +20,7 @@ export const tools=[
   spec('log_read','Read the tail of a local text log without loading the whole file. Optional literal contains filter. Reports byte offsets, truncation and line numbers relative to the tail.',{path:text,lines:integer(1,500),maxBytes:integer(1024,1048576),contains:text},['path']),
   spec('file_manifest','Inventory regular files with sizes, timestamps and optional SHA-256, bounded recursion/visited entries and explicit skipped-file reasons. Does not follow symlinks or alter files. Useful for migration/integrity evidence.',{path:text,recursive:{type:'boolean'},hash:{type:'boolean'},maxFiles:integer(1,1000),maxHashBytes:integer(1,67108864),maxEntries:integer(1,20000)},['path']),
   spec('artifact_inventory','Find this worker\'s saved artifacts, including paths, sizes and SHA-256 hashes. Keeps inspection within the worker workspace. No files are created or deleted.',{path:text,maxFiles:integer(1,500)}),
-  spec('task_history','Inspect this worker\'s own recent tasks, status/usage, and optional bounded event evidence for one owned run. Does not resume, stop or replay actions.',{runId:integer(1,2147483647),limit:integer(1,50)}),
+  spec('task_history','Inspect this worker\'s own recent tasks and bounded event evidence. With runId and view:"calls", page the complete retained action index using offset/limit; follow nextOffset until null. This index omits arguments/results and is independent of truncated event previews. Use an indexed callId with offset/maxChars to retrieve exact archived arguments/results. Does not resume, stop or replay actions.',{runId:integer(1,2147483647),view:{type:'string',enum:['events','calls']},limit:integer(1,50),callId:text,offset:integer(0,2147483647),maxChars:integer(256,8000)}),
   spec('automation_schedule','Preview, list, create, enable or disable this worker\'s own Nimbus cron routines. workerId, if provided, must equal your ID. Five-field cron uses the reported host timezone. Creation stays DISABLED; enabling requires explicit action/host approval. Duplicate definitions are retained once. No deletion or automatic run.',{action:{type:'string',enum:['list','preview','create','enable','disable']},workerId:integer(1,2147483647),scheduleId:integer(1,2147483647),cron:text,task:text,quiet:{type:'boolean'}},['action']),
 ];
 export const roleTools={
@@ -93,13 +94,15 @@ function manifest(target,{recursive=true,hash=true,maxFiles=250,maxHashBytes=167
 }
 export async function execute(name,args={},ctx={}){
   ctx.signal?.throwIfAborted();
+  ctx={...ctx,availableTools:(ctx.availableTools||[]).filter(t=>!t.function.name.startsWith('mcp__')||connectorAllowed(ctx.bindings?.get(t.function.name),ctx.bot?.id)),connectorErrors:[]};
+  const connectorMetadata=tool=>{const b=ctx.bindings?.get(tool.function.name);return b?{descriptor:b.descriptor,provenance:b.provenance}:{};};
   if(name==='tool_catalog'){
     const query=String(args.query||'').toLowerCase(),limit=bounded(args.limit,40,1,100);
     const matching=(ctx.availableTools||[]).filter(tool=>(tool.function.name+' '+tool.function.description).toLowerCase().includes(query));
-    return{enabledToolCount:(ctx.availableTools||[]).length,matching:matching.length,tools:matching.slice(0,limit).map(tool=>({name:tool.function.name,description:tool.function.description,...(args.details?{parameters:tool.function.parameters}:{})})),truncated:matching.length>limit};
+    return{enabledToolCount:(ctx.availableTools||[]).length,matching:matching.length,tools:matching.slice(0,limit).map(tool=>({name:tool.function.name,description:tool.function.description,...(args.details?{parameters:tool.function.parameters,...connectorMetadata(tool)}:{})})),truncated:matching.length>limit};
   }
   if(name==='connector_inventory'){
-    const connectors=(ctx.availableTools||[]).filter(tool=>tool.function.name.startsWith('mcp__')).map(tool=>({name:tool.function.name,description:tool.function.description,readOnly:ctx.bindings?.get(tool.function.name)?.readOnly===true}));
+    const connectors=(ctx.availableTools||[]).filter(tool=>tool.function.name.startsWith('mcp__')).map(tool=>({name:tool.function.name,description:tool.function.description,readOnly:ctx.bindings?.get(tool.function.name)?.readOnly===true,...connectorMetadata(tool)}));
     return{tools:connectors,discoveryErrors:(ctx.connectorErrors||[]).map(error=>({server:error.server,error:cleanConnectorError(error.error)})),connectedTools:connectors.length,note:connectors.length?'Transport discovery is not proof of account authorization for every operation.':'No connector tools were discovered for this worker.'};
   }
   if(name==='host_snapshot')return{platform:process.platform,os:os.type(),release:os.release(),architecture:os.arch(),hostname:os.hostname(),node:process.version,uptimeSeconds:os.uptime(),cpuCount:os.cpus().length,workspace:ctx.workspace,resources:await resources({fresh:true})};
@@ -153,8 +156,27 @@ export async function execute(name,args={},ctx={}){
   }
   if(name==='task_history'){
     if(!ctx.query)throw new Error('Task database is unavailable');
+    if(args.view!==undefined&&!['events','calls'].includes(args.view))throw new Error('Task history view must be events or calls');
+    if(args.view==='calls'&&(args.runId===undefined||args.callId!==undefined))throw new Error('The calls index requires runId and no callId');
+    if(args.callId!==undefined){
+      if(typeof args.callId!=='string'||!args.callId||args.callId.length>256)throw new Error('Provide a valid retained call ID');
+      const call=ctx.query('SELECT t.id,t.run_id,t.name,t.args,t.result,t.state FROM tool_calls t JOIN runs r ON r.id=t.run_id WHERE r.bot_id=? AND (t.id=? OR substr(t.id,instr(t.id,\':\')+1)=?) ORDER BY t.run_id DESC LIMIT 1').get(ctx.botId,args.callId,args.callId);
+      if(!call)throw new Error('Retained action is not owned by this worker');
+      if(args.runId!==undefined&&Number(args.runId)!==call.run_id)throw new Error('Retained action belongs to a different run');
+      const text=JSON.stringify({arguments:JSON.parse(call.args),result:call.result?JSON.parse(call.result):null}),offset=bounded(args.offset,0,0,2147483647),maxChars=bounded(args.maxChars,4000,256,8000);
+      return{id:call.id,runId:call.run_id,name:call.name,state:call.state,offset,totalCharacters:text.length,text:text.slice(offset,offset+maxChars),nextOffset:offset+maxChars<text.length?offset+maxChars:null,readOnly:true,readGuidance:historyPageGuidance(args,offset+maxChars<text.length?offset+maxChars:null)};
+    }
     if(args.runId!==undefined){
       const run=ctx.query('SELECT id,bot_id,status,source,requested_model,actual_model,last_error,input_tokens,output_tokens,started_at,ended_at FROM runs WHERE id=? AND bot_id=?').get(args.runId,ctx.botId);if(!run)throw new Error('Task is not owned by this worker');
+      if(args.view==='calls'){
+        const offset=bounded(args.offset,0,0,2147483647),limit=bounded(args.limit,20,1,50);
+        const total=ctx.query('SELECT count(*) AS n FROM tool_calls WHERE run_id=?').get(run.id).n;
+        // Host insertion order is stable even when timestamps tie or a running
+        // task appends calls while a reader pages. Never include private payloads.
+        const actions=ctx.query('SELECT id,name,state FROM tool_calls WHERE run_id=? ORDER BY rowid LIMIT ? OFFSET ?').all(run.id,limit,offset);
+        const nextOffset=actions.length&&offset+actions.length<total?offset+actions.length:null;
+        return{runId:run.id,view:'calls',offset,limit,total,actions,nextOffset,hasMore:nextOffset!==null,readOnly:true,readGuidance:historyPageGuidance(args,nextOffset)};
+      }
       const events=ctx.query('SELECT id,type,body,created_at FROM task_events WHERE run_id=? ORDER BY id DESC LIMIT 50').all(args.runId).reverse().map(row=>({...row,data:row.body.length>4000?{preview:row.body.slice(0,4000),truncated:true}:JSON.parse(row.body),body:undefined}));return{run,events};
     }
     return{runs:ctx.query('SELECT id,status,source,actual_model,last_error,input_tokens,output_tokens,started_at,ended_at FROM runs WHERE bot_id=? ORDER BY id DESC LIMIT ?').all(ctx.botId,bounded(args.limit,20,1,50))};

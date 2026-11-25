@@ -1,4 +1,15 @@
 .runtime-resources { display:grid;grid-template-columns:1fr 1fr;gap:30px;margin:8px 0 28px; }
+/* Local inference switch: keep the native checkbox and its enclosing label. */
+.toggle-row:has(> #rt-local-enabled[role="switch"]) { min-height:52px;justify-content:space-between; }
+.toggle-row:has(> #rt-local-enabled:disabled) { cursor:wait; }
+#rt-local-enabled[role="switch"] { -webkit-appearance:none;appearance:none;position:relative;flex:0 0 51px;box-sizing:border-box;width:51px;height:31px;min-height:31px;margin:0;padding:0;border:1px solid var(--line-strong);border-radius:999px;background:var(--muted);cursor:pointer;transition:background-color 160ms ease; }
+#rt-local-enabled[role="switch"]::before { content:'';position:absolute;top:2px;left:2px;width:25px;height:25px;border-radius:50%;background:var(--primary);box-shadow:0 1px 3px #0003;transition:transform 160ms ease; }
+#rt-local-enabled[role="switch"]:checked { background:var(--accent);border-color:var(--accent); }
+#rt-local-enabled[role="switch"]:checked::before { transform:translateX(20px); }
+#rt-local-enabled[role="switch"]:focus-visible { outline:3px solid var(--accent);outline-offset:4px; }
+#rt-local-enabled[role="switch"]:disabled { opacity:.5;cursor:wait; }
+@media(prefers-reduced-motion:reduce) { #rt-local-enabled[role="switch"],#rt-local-enabled[role="switch"]::before { transition:none; } }
+@media(forced-colors:active) { #rt-local-enabled[role="switch"] { appearance:auto;-webkit-appearance:auto; } #rt-local-enabled[role="switch"]::before { display:none; } }
 .runtime-resources section { min-width:0; }
 .runtime-resources h3,.runtime-resources p { margin:8px 0; }
 .runtime-resources b,.runtime-models span { overflow-wrap:anywhere; }
@@ -22,6 +33,7 @@
 .runtime-task small { display:block;color:var(--muted);overflow-wrap:anywhere; }
 .runtime-task-id { color:var(--muted); }
 .task-status { display:inline-flex;font-size:12px;align-items:center;gap:6px;white-space:nowrap; }
+.runtime-attention-link:hover { text-decoration:underline;text-underline-offset:3px; }
 .task-status:before { content:'';width:6px;height:6px;border-radius:50%;background:var(--muted); }
 .task-status.done:before { background:var(--ok); }
 .task-status.error:before,.task-status.needs_review:before { background:var(--bad); }
@@ -87,6 +99,18 @@
 .runtime-capability-card.compact { padding:14px 16px;margin:10px 0; }
 .runtime-capability-card.compact .runtime-capability-message { margin:8px 0;font-size:13px; }
 .runtime-capability-open { padding:0;font:inherit;font-size:12px;color:var(--accent);text-decoration:underline;text-underline-offset:3px; }
+.runtime-capability-history { margin-top:14px;border-top:1px solid var(--line);padding-top:12px; }
+.runtime-capability-history>summary { cursor:pointer;color:var(--muted);font-size:12px;width:fit-content; }
+.runtime-capability-history>summary:focus-visible { outline:2px solid var(--accent);outline-offset:4px;border-radius:3px; }
+.runtime-capability-history>summary>span { margin-left:5px;font-variant-numeric:tabular-nums; }
+.runtime-capability-history>ol { list-style:none;margin:14px 0 0 5px;padding:0 0 0 16px;border-left:1px solid var(--line); }
+.runtime-capability-history li { position:relative;padding:0 0 15px; }
+.runtime-capability-history li:last-child { padding-bottom:0; }
+.runtime-capability-history li:before { content:'';position:absolute;left:-20px;top:6px;width:6px;height:6px;border-radius:50%;background:var(--muted); }
+.runtime-capability-history li>div { display:flex;align-items:center;justify-content:space-between;gap:12px; }
+.runtime-capability-history p { margin:5px 0 0;color:var(--muted);font-size:12px;line-height:1.55;overflow-wrap:anywhere; }
+.runtime-capability-history time,.runtime-capability-meta>time { color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums; }
+.runtime-capability-meta>time { margin-left:auto; }
 .runtime-capability-empty { color:var(--muted);line-height:1.55;max-width:70ch;margin:12px 0; }
 .runtime-budget { display:flex;flex-wrap:wrap;gap:8px 20px;color:var(--muted);font-size:12px; }
 .runtime-budget b { color:var(--text);font-weight:550; }

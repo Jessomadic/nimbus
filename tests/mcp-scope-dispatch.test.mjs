@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+const temp=fs.mkdtempSync(path.join(os.tmpdir(),'nimbus-scope-dispatch-'));
+process.env.NIMBUS_DATA=path.join(temp,'data');process.env.NIMBUS_CONFIG=path.join(temp,'config.json');
+const {executeTool}=await import('../runtime/tools.js');
+const {journalTool}=await import('../runtime/journal.js');
+const {q,db}=await import('../db.js');
+const {registeredConnector}=await import('./helpers/registered-connector.mjs');
+const {dynamicToolNames}=await import('../runtime/codex.js');
+test.after(()=>{db.close();fs.rmSync(temp,{recursive:true,force:true});});
+test('real dispatcher denies guessed names and stolen bindings; catalog filters revocation',async()=>{
+ let count=0;const bot={id:22,tools:'[]'},name='mcp__fixture__read';
+ const ctx=await registeredConnector(22,name,{tool:'read',readOnly:true,client:{callTool:async()=>{count++;return {content:[],structuredContent:{ok:true}};}}},{type:'object',properties:{},additionalProperties:false});
+ assert.equal((await executeTool(bot,name,{},ctx)).structuredContent.ok,true);
+ await assert.rejects(executeTool({id:3},name,{},ctx),/authorization denied/);
+ await assert.rejects(executeTool(bot,'mcp__fixture__guessed',{},ctx),/authorization denied/);
+ const catalog=await executeTool(bot,'tool_catalog',{details:true},ctx);
+ assert.equal(catalog.tools[0].descriptor.name,'read');
+ assert.deepEqual(dynamicToolNames(ctx.availableTools).definitions[0].inputSchema,ctx.availableTools[0].function.parameters);
+ ctx.state.mcpServers.fixture.scope.allow.workerIds=[];
+ assert.equal((await executeTool(bot,'tool_catalog',{},ctx)).enabledToolCount,0);
+ await assert.rejects(executeTool(bot,name,{},ctx),/authorization denied/);assert.equal(count,1);
+});
+test('submitted uncertain connector result persists and same call ID cannot replay',async()=>{
+ let count=0;const name='mcp__fixture__write',bot={id:22};
+ const ctx=await registeredConnector(22,name,{tool:'write',readOnly:false,client:{callTool:async()=>{count++;return {isError:true,content:[{type:'text',text:'failed after write'}],structuredContent:{receipt:7},_meta:{retained:true}};}}},{type:'object'});
+ const call={id:'uncertain-scope',runId:1,name,args:{},execute:()=>executeTool(bot,name,{},ctx)};
+ await assert.rejects(journalTool(call),e=>e.name==='UncertainAction'&&e.evidence.result.structuredContent.receipt===7);
+ const saved=q('SELECT * FROM tool_calls WHERE id=?').get('1:uncertain-scope');
+ assert.equal(saved.state,'uncertain');assert.equal(JSON.parse(saved.result).evidence.result._meta.retained,true);
+ await assert.rejects(journalTool(call),/not been replayed/);assert.equal(count,1);
+});

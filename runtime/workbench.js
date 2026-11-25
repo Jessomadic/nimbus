@@ -69,7 +69,8 @@ export function applyEdits(edits,cwd) {
   return {files:changes.map(item=>({path:item.file,operation:item.before===null?'added':item.after===null?'deleted':'updated',sha256:item.after===null?null:hash(item.after)}))};
 }
 
-export function listSkills(roots) {
+export { discoverSkills as listSkills } from './skills.js';
+function legacyListSkills(roots) {
   const skills=[];
   for(const root of roots){
     if(!fs.existsSync(root))continue;

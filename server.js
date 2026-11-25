@@ -1,4 +1,9 @@
 import http from 'node:http';
+import {schedulerHost} from './scheduler-host.mjs';
+import {createPrivateSchedulerPort} from './runner.js';
+import {composeMemoryRoute} from './runtime/memory-private/server-composition.mjs';
+import {configureMemoryWorkers} from './runtime/memory-private/worker-binding.mjs';
+import { restartDrainStatus, restartDrainTick } from './runtime/restart-drain.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,8 +16,11 @@ import os from 'node:os';
 import { redact, encodeRedacted } from './redact.js';
 import { addClient, broadcast, revokeClients, revalidateClients } from './events.js';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { runBot, stopRun, resumeRun, taskResult, runtimeQueues, drainRuntime, addMessage, updateMessage, botStatus, roomMembers, findMentions, markTraceWaiting, recoverRuns,startToolDevelopment } from './runner.js';
-import { config, saveConfig } from './runtime/config.js';
+import { runBot, stopRun, resumeRun, taskResult, runtimeQueues, drainRuntime, addMessage, updateMessage, botStatus, roomMembers, findMentions, markTraceWaiting, recoverRuns,startToolDevelopment,configureSuccessorHost,reconcileProjectSuccessorHandoffs,projectSuccessorHandoffs,projectContinuation,projectLifecycleOwnership,toolDevelopment,questionRouter } from './runner.js';
+import { config, saveConfig, ROOT } from './runtime/config.js';
+import {BranchHostSnapshot,branchHostApi} from './runtime/branch-host-snapshot.js';
+import {configureBranchHost,enqueueCommittedRun} from './runner.js';
+import {compactConversation} from './runtime/compact.js';
 import { cloudStatus, CodexClient } from './runtime/codex.js';
 import { localCatalog } from './runtime/local.js';
 import { resources } from './runtime/resources.js';
@@ -20,17 +28,19 @@ import { browsers, connectors, migrateConnectorSecrets, coreTools, maintenance, 
 import { protect, unprotect } from './runtime/credentials.js';
 import { events as taskEvents, event as taskEvent } from './runtime/journal.js';
 import { registerRuntimeRoutes } from './runtime/http.js';
-import { startLocalService } from './runtime/local-service.js';
+import { startLocalService, closeLocalService } from './runtime/local-service.js';
 import {validateParentLink} from './runtime/hierarchy.js';
+import {resolveOrchestrator} from './runtime/orchestrator.js';
 import {directLocal,secureRequest,requestIp,sameOriginRequest} from './runtime/network.js';
 import {SessionStore,LoginThrottle} from './runtime/auth.js';
 import {PasskeyStore} from './runtime/passkeys.js';
-import { answerQuestion } from './runtime/questions.js';
+import {registerQuestionRoutes} from './runtime/question-http.js';
 import { capabilities } from './runtime/capabilities.js';
 import {roleToolCoverage} from './runtime/toolsets/index.js';
 import { TEMPLATES, PLUGINS, publicPlugin } from './catalog.js';
 import { startScheduler, nextRun, isValidCron } from './scheduler.js';
 import { getPlanUsage } from './planusage.js';
+import {contextTarget,queueRunContext,queueExplicitRunContext} from './runtime/run-context.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(HERE, 'public');
@@ -49,8 +59,8 @@ const bootSourceHash = maintenance.inventory().hash;
 const startedAt = new Date().toISOString();
 
 await migrateConnectorSecrets();
-const localService=await startLocalService();
-recoverRuns();
+await startLocalService();
+// Recovery is deferred until host grant resolver exists (no handoff queue escape).
 startScheduler();
 
 // ---------- approvals ----------
@@ -114,12 +124,27 @@ function state(req) {
   return { sideOrder, sidebarLayout:readSidebarLayout(), bots, rooms, approvals, routines, upNext, learned, last, installed, user: req?.user || null, computers: false, toolCatalog:coreTools.filter(tool=>tool.function.name!=='worker_result').map(tool=>({name:tool.function.name,description:tool.function.description})),queues: runtimeQueues(), usage: { windowCost, budget: WINDOW_BUDGET, running, byBot } };
 }
 
-function postToThread(thread, text, files = []) {
+function postToThread(thread, text, files = [], mode='context') {
+  if(!/^(bot|room):\d+$/.test(thread))throw Object.assign(new Error('Unknown chat'),{statusCode:400});
+  if(/^\/compact\s*$/i.test(text)){
+    if(files.length)throw Object.assign(new Error('Send /compact without attachments.'),{statusCode:400});
+    const result=compactConversation({query:q,botId:Number(thread.slice(4)),thread,dataDir:DATA_DIR,settings:config().context});
+    const message=addMessage(thread,'user','text',text);
+    addMessage(thread,'system','note',result.changed?`Context compacted: ${result.beforeCharacters.toLocaleString()} → ${result.afterCharacters.toLocaleString()} characters. All user instructions remain. Full history and retained checkpoints were archived; exact tool evidence remains retrievable. Archive: ${result.archive}`:'Context already fits the configured budget. No history was removed.');
+    return message;
+  }
   const msg = addMessage(thread, 'user', 'text', text, null, files);
   // Attachments are shared host paths available through Nimbus tools.
   if (files.length) text = `${text || 'See the attached files.'}\n\nAttached files (use view_image for pixels; read_file or shell for other formats):\n` + files.map((f) => `- ${uploadPath(f)} (${f.type || 'file'}, ${f.size} bytes)`).join('\n');
+  const dispatch=(botId,source='user')=>{
+    const target=mode==='context'&&contextTarget(botId,thread);
+    if(target){
+      queueRunContext(target.id,msg.id,text);
+      addMessage(thread,'system','note',`Context added to task #${target.id}. It will be read at the next model step; current work continues.`,target.id);
+    }else runBot({botId,thread,prompt:text,source,originMessageId:msg.id});
+  };
   if (thread.startsWith('bot:')) {
-    runBot({ botId: Number(thread.slice(4)), thread, prompt: text,originMessageId:msg.id });
+    dispatch(Number(thread.slice(4)));
   } else if (thread.startsWith('room:')) {
     const roomId = Number(thread.slice(5));
     const room = q('SELECT * FROM rooms WHERE id=?').get(roomId);
@@ -127,7 +152,7 @@ function postToThread(thread, text, files = []) {
     let targets = findMentions(text, members);
     if (!targets.length) targets = members.filter((m) => m.id === room.lead_bot_id);
     if (!targets.length && members[0]) targets = [members[0]];
-    for (const t of targets) runBot({ botId: t.id, thread, prompt: text, source: 'the user',originMessageId:msg.id });
+    for (const t of targets) dispatch(t.id,'the user');
   }
   return msg;
 }
@@ -135,12 +160,35 @@ function postToThread(thread, text, files = []) {
 // ---------- routes ----------
 const routes = [];
 const route = (method, pattern, fn) => routes.push({ method, re: new RegExp('^' + pattern.replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$'), fn });
-registerRuntimeRoutes({route,body,json});
+registerRuntimeRoutes({route,body,json,reviewAuthority:(req,res)=>{
+  const url=new URL(req.url,'http://localhost');
+  if(!checkAuth(req,res,url))return null;
+  if(!sameOriginRequest(req)){json(res,403,{error:'Same origin required'});return null;}
+  if(!adminAuth(req)&&!loggedIn(req)){json(res,401,{error:'Authentication required'});return null;}
+  return {authenticated:true,principal:adminAuth(req)?'local-admin':req.user?.username||req.user?.email||'local-owner',sameOrigin:true,sourceOwner:bootSourceHash+':'+maintenance.inventory().hash};
+}});
+const {registerDocumentRoutes}=await import('./runtime/documents.js');
+const {workspaceDownload}=await import('./runtime/download-path.js');
+registerDocumentRoutes({route,body,json,db});
+route('GET','/api/bots/:id/download',(req,res,p,url)=>{
+  if(!/^\d+$/.test(p.id)||!q('SELECT id FROM bots WHERE id=?').get(p.id))return json(res,404,{error:'not found'});
+  const file=workspaceDownload(botDir(Number(p.id)),url.searchParams.get('path')||'');
+  if(!file)return json(res,404,{error:'not found'});
+  const name=path.basename(file).replace(/[\x00-\x1f\x7f]/g,'')||'download';
+  res.writeHead(200,{'content-type':'application/octet-stream','content-length':fs.statSync(file).size,
+    'content-disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(name),
+    'cache-control':'no-store','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; sandbox"});
+  const stream=fs.createReadStream(file);stream.on('error',()=>res.destroy());stream.pipe(res);
+});
 route('GET','/health',(req,res)=>json(res,200,directLocal(req)?{ok:true,version:'0.2.0',pid:process.pid,startedAt,sourceHash:bootSourceHash,lumosConnected:false}:{ok:true}));
 route('GET','/api/updates',(req,res,p,url)=>json(res,200,maintenance.status(url.searchParams.get('snapshotId')||undefined)));
 route('GET','/api/capabilities',(req,res)=>json(res,200,{fullCodexParity:false,capabilities,roleTools:roleToolCoverage(TEMPLATES),tools:coreTools.map(t=>({name:t.function.name,description:t.function.description}))}));
-route('GET','/api/questions',(req,res)=>json(res,200,q("SELECT id,run_id,questions,status FROM task_questions WHERE status='pending' ORDER BY id").all().map(row=>({...row,questions:JSON.parse(row.questions)}))));
-route('POST','/api/questions/:id/answer',async(req,res,p)=>{const b=await body(req);const result=answerQuestion(p.id,b.answers);broadcast('state_changed',{});json(res,200,{id:result.id,status:result.status});});
+registerQuestionRoutes({route,router:questionRouter,body,json,broadcast,
+  authenticate:(req,res)=>{if(!sameOriginRequest(req)){json(res,403,{error:'Question replies require the same origin'});return false;}if(adminAuth(req)||loggedIn(req))return true;json(res,401,{error:'Sign in to answer this question'});return false;},
+  rebindOwner:continuationOwner,
+  principal:req=>adminAuth(req)?'local-admin':req.user?.username||req.user?.email||'local-owner',
+  listPending:()=>q("SELECT id FROM task_questions WHERE status='pending' ORDER BY id").all().map(row=>row.id)
+});
 route('POST','/api/updates',async(req,res)=>{
   const b=await body(req);
   if(b.action==='snapshot')return json(res,200,maintenance.snapshot());
@@ -168,17 +216,24 @@ route('GET', '/api/threads/:thread/messages', (req, res, p, url) => {
   json(res, 200, rows);
 });
 
+route('POST','/api/admin/runs/:id/context',async(req,res,p)=>{
+  if(!sameOriginRequest(req))return json(res,403,{error:'Same origin required'});
+  if(!adminAuth(req))return json(res,403,{error:'Local administration required'});
+  json(res,200,queueExplicitRunContext(p.id,await body(req)));
+});
+
 route('POST', '/api/threads/:thread/messages', async (req, res, p) => {
-  const { text = '', files: ids = [],requestId } = await body(req);
+  const { text = '', files: ids = [],requestId,mode='context' } = await body(req);
+  if(!['context','task'].includes(mode))return json(res,400,{error:'Choose context or task message mode'});
   const files = (Array.isArray(ids) ? ids : []).slice(0, 10).map(readUpload).filter(Boolean);
   if (!String(text).trim() && !files.length) return json(res, 400, { error: 'empty' });
   const thread=decodeURIComponent(p.thread),key=requestId==null?null:String(requestId);
   if(key&&key.length>200)return json(res,400,{error:'requestId is too long'});
-  const fingerprint=crypto.createHash('sha256').update(JSON.stringify({thread,text:String(text).trim(),files:files.map(f=>f.id)})).digest('hex');
+  const fingerprint=crypto.createHash('sha256').update(JSON.stringify({thread,text:String(text).trim(),files:files.map(f=>f.id),...(mode==='task'?{mode}: {})})).digest('hex');
   const previous=key&&q('SELECT * FROM message_requests WHERE request_key=?').get(key);
   if(previous){if(previous.fingerprint!==fingerprint)return json(res,409,{error:'requestId was used for different instructions'});return json(res,200,{...q('SELECT * FROM messages WHERE id=?').get(previous.message_id),replayed:true});}
   db.exec('BEGIN IMMEDIATE');let message;
-  try{message=postToThread(thread,String(text).trim(),files);if(key)q('INSERT INTO message_requests VALUES (?,?,?)').run(key,fingerprint,message.id);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
+  try{message=postToThread(thread,String(text).trim(),files,mode);if(key)q('INSERT INTO message_requests VALUES (?,?,?)').run(key,fingerprint,message.id);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
   json(res,200,message);
 });
 
@@ -217,17 +272,24 @@ route('GET', '/api/files/:id/:name', (req, res, p) => {
 
 // Restart the service once no bot is mid-run (a restart kills running bots, including one that asked for it).
 // Windows supervisor restarts on exit code 75 after the worker queue drains.
-let restartWait;
+let restartWait, restartHold;
 function requestRestart() {
   if(!maintenance.supervised())throw new Error('Start Nimbus with Start-Nimbus.ps1 before requesting a restart');
   if(restartWait)return;
   restartWait = setInterval(() => {
-    // Per-worker promises can still be queued before acquiring a shared slot.
-    const outstanding=q("SELECT count(*) AS n FROM runs WHERE status IN ('queued','routing','running','waiting_local','waiting_cloud','waiting_approval','waiting_input')").get().n;
-    if (!outstanding && !runtimeQueues().workers.active && !runtimeQueues().workers.queued && !terminals.active().length) {
-      clearInterval(restartWait);restartWait=null;
-      try{maintenance.assertPendingSource();shutdown(75);}
-      catch(error){maintenance.failPending(error.message);console.error('Restart cancelled:',error.message);}
+    try {
+      restartDrainTick({
+        read: () => restartDrainStatus({ q, queues: runtimeQueues, terminals }),
+        assertSource: () => maintenance.assertPendingSource(),
+        hold: counts => {
+          const signature = JSON.stringify(counts);
+          if (signature !== restartHold) { restartHold = signature; console.info('Restart held:', signature); }
+        },
+        restart: () => { clearInterval(restartWait); restartWait=null; shutdown(75); }
+      });
+    } catch(error) {
+      clearInterval(restartWait); restartWait=null;
+      maintenance.failPending(error.message); console.error('Restart cancelled: drain/source check failed');
     }
   }, 500);
 }
@@ -252,9 +314,7 @@ function cleanBot(b) {
   return out;
 }
 function coordinatorParent(){
-  const roots=q("SELECT id FROM bots WHERE template='orchestrator' ORDER BY id LIMIT 2").all();
-  if(roots.length>1)throw Object.assign(new Error('Multiple Orchestrator agents require setup review; no parent was selected'),{statusCode:409});
-  return roots[0]?.id||null;
+  return resolveOrchestrator(q('SELECT id,name,template,parent_bot_id FROM bots').all(),{required:false})?.id||null;
 }
 function validateCoordinatorFields(id,fields){
   const current=id==null?null:q('SELECT id,template,parent_bot_id FROM bots WHERE id=?').get(Number(id));
@@ -262,8 +322,11 @@ function validateCoordinatorFields(id,fields){
   if(current?.template==='orchestrator'&&profile!=='orchestrator')throw Object.assign(new Error('The designated Orchestrator must retain its coordinator profile'),{statusCode:400});
   if(profile!=='orchestrator')return;
   const parent=Object.hasOwn(fields,'parent_bot_id')?fields.parent_bot_id:current?.parent_bot_id;
-  if(parent!=null)throw Object.assign(new Error('The Orchestrator is the top-level agent and cannot have a parent'),{statusCode:400});
-  if(q("SELECT id FROM bots WHERE template='orchestrator' AND id!=? LIMIT 1").get(Number(id)||-1))throw Object.assign(new Error('An Orchestrator already exists; use the existing coordinator'),{statusCode:409});
+  if(current?.template==='orchestrator'&&current.parent_bot_id==null&&parent!=null)throw Object.assign(new Error('The canonical Orchestrator must remain the top-level agent'),{statusCode:400});
+  const bots=q('SELECT id,name,template,parent_bot_id FROM bots').all();
+  validateParentLink(id==null?null:Number(id),parent??null,bots);
+  const candidate={...current,...fields,id:id==null?-1:Number(id),template:profile,parent_bot_id:parent??null};
+  resolveOrchestrator([...bots.filter(bot=>Number(bot.id)!==candidate.id),candidate]);
 }
 function saveBot(id, fields) {
   validateCoordinatorFields(id,fields);
@@ -294,6 +357,8 @@ route('PATCH', '/api/bots/:id', async (req, res, p) => {
   return json(res,200,saveBot(Number(p.id),cleanBot(input)));
 });
 route('DELETE', '/api/bots/:id', (req, res, p) => {
+  const coordinator=q("SELECT id FROM bots WHERE id=? AND template='orchestrator'").get(Number(p.id));
+  if(coordinator&&q('SELECT id FROM bots WHERE parent_bot_id=? LIMIT 1').get(coordinator.id))return json(res,409,{error:'Reassign this coordinator’s team before deleting it'});
   q('UPDATE bots SET parent_bot_id=NULL WHERE parent_bot_id=?').run(p.id);
   q('DELETE FROM bots WHERE id=?').run(p.id);
   q('DELETE FROM room_members WHERE bot_id=?').run(p.id);
@@ -312,9 +377,14 @@ route('GET', '/api/bots/:id/files', (req,res,p) => {
   }} walk(root); json(res,200,{files});
 });
 route('GET','/api/bots/:id/file',(req,res,p,url)=>{
-  const root=botDir(p.id), file=path.resolve(root,url.searchParams.get('path')||'');
-  if(!file.startsWith(root+path.sep)||!fs.existsSync(file)||!fs.statSync(file).isFile())return json(res,404,{error:'File not found'});
-  res.writeHead(200,{'content-type':'application/octet-stream','content-disposition':'attachment; filename="'+path.basename(file).replace(/["\\]/g,'_')+'"'});fs.createReadStream(file).pipe(res);
+  if(!/^\d+$/.test(p.id)||!q('SELECT id FROM bots WHERE id=?').get(p.id))return json(res,404,{error:'not found'});
+  const file=workspaceDownload(botDir(Number(p.id)),url.searchParams.get('path')||'');
+  if(!file)return json(res,404,{error:'not found'});
+  const name=path.basename(file).replace(/[\x00-\x1f\x7f]/g,'')||'download';
+  res.writeHead(200,{'content-type':'application/octet-stream','content-length':fs.statSync(file).size,
+    'content-disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(name),
+    'cache-control':'no-store','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; sandbox"});
+  const stream=fs.createReadStream(file);stream.on('error',()=>res.destroy());stream.pipe(res);
 });
 
 route('GET', '/api/bots/:id/memory', (req, res, p) => json(res, 200, { text: fs.readFileSync(path.join(botDir(p.id), 'MEMORY.md'), 'utf8') }));
@@ -339,10 +409,12 @@ route('GET', '/api/marketplace', (req,res) => {
   json(res,200,{templates:TEMPLATES.map(t=>({...t,display_group:defaultDisplayGroup(t.id),added:added.has(t.id)})),
     plugins:PLUGINS.map(p=>({...publicPlugin(p),installed:p.kind==='builtin'||installed.has(p.id)})),connectors:[]});
 });
-route('POST', '/api/templates/:id/add', (req, res, p) => {
+route('POST', '/api/templates/:id/add', async (req, res, p) => {
   const t = TEMPLATES.find((x) => x.id === p.id);
   if (!t) return json(res, 404, { error: 'not found' });
-  const parent=t.parent_profile==='orchestrator'?{id:coordinatorParent()}:t.parent_profile?q('SELECT id FROM bots WHERE template=? ORDER BY id LIMIT 1').get(t.parent_profile):null;
+  const input=await body(req),specified=Object.hasOwn(input,'parent_bot_id')?cleanBot({parent_bot_id:input.parent_bot_id}).parent_bot_id:undefined;
+  const parent=specified!==undefined?{id:specified}:t.parent_profile==='orchestrator'?{id:coordinatorParent()}:t.parent_profile?q('SELECT id FROM bots WHERE template=? ORDER BY id LIMIT 1').get(t.parent_profile):null;
+  validateParentLink(null,parent?.id??null,q('SELECT id,parent_bot_id FROM bots').all());
   validateCoordinatorFields(null,{template:t.id,parent_bot_id:parent?.id||null});
   const r = q('INSERT INTO bots (name, role, instructions, color, effort, shape, template, approval_rules, model, default_model, tools,parent_bot_id,display_group) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
     .run(t.name, t.role, t.instructions, t.color, t.effort, t.shape, t.id, JSON.stringify(t.approval_rules),t.model||'auto',t.default_model||'',JSON.stringify(t.tools),parent?.id||null,defaultDisplayGroup(t.id));
@@ -426,7 +498,72 @@ route('DELETE', '/api/rooms/:id', (req, res, p) => {
 });
 
 // Runs
-route('POST', '/api/runs/:id/stop', (req, res, p) => { stopRun(p.id); json(res, 200, { ok: true }); });
+function continuationOwner(req,res){
+  if(!sameOriginRequest(req)){json(res,403,{error:'Cross-origin request rejected'});return false;}
+  if(adminAuth(req)||(OWNER_MODE&&loggedIn(req)&&req.user?.username===OWNER_USERNAME))return true;
+  json(res,403,{error:'Named owner or local administration required'});return false;
+}
+function handoffPrincipal(req){return adminAuth(req)?{kind:'local-admin',id:'local-admin',binding:crypto.createHash('sha256').update(ADMIN_TOKEN).digest('hex')}:{kind:'named-owner',id:req.user.username,binding:credentialBinding(''),sessionHash:crypto.createHash('sha256').update(cookieToken(req)).digest('hex')};}
+route('POST','/api/project-successor-handoffs',async(req,res)=>{
+ if(!continuationOwner(req,res))return;
+ try{const input=await body(req,65536);if(!continuationOwner(req,res))return;json(res,200,projectSuccessorHandoffs.authorize(input,handoffPrincipal(req)));}
+ catch(error){json(res,error.statusCode||400,{error:redact(error.message)});}
+});
+route('GET','/api/project-successor-handoffs/:id',(req,res,p)=>{
+ if(!continuationOwner(req,res))return;
+ try{json(res,200,projectSuccessorHandoffs.status(p.id,null,{principal:handoffPrincipal(req)}));}catch(error){json(res,error.statusCode||400,{error:redact(error.message)});}
+});
+route('POST','/api/project-successor-handoffs/:id/cancel',async(req,res,p)=>{
+ if(!continuationOwner(req,res))return;
+ try{const input=await body(req,4096);if(!continuationOwner(req,res))return;
+ if(!input||Array.isArray(input)||Object.keys(input).some(k=>k!=='reason')||(input.reason!==undefined&&(typeof input.reason!=='string'||input.reason.length>2000)))throw new Error('Invalid cancellation fields');
+ json(res,200,projectSuccessorHandoffs.command({action:'cancel',reservationId:p.id,reason:input.reason},null,{principal:handoffPrincipal(req)}));}
+ catch(error){json(res,error.statusCode||400,{error:redact(error.message)});}
+});
+route('POST','/api/runs/:id/continuation',async(req,res,p)=>{
+  if(!continuationOwner(req,res))return;
+  try{const input=await body(req);if(!continuationOwner(req,res))return;json(res,200,projectContinuation.arm(p.id,input));}
+  catch(error){json(res,400,{error:redact(error.message)});}
+});
+route('GET','/api/runs/:id/continuation',(req,res,p)=>{if(continuationOwner(req,res))json(res,200,projectContinuation.get(p.id));});
+route('POST','/api/runs/:id/continuation/stop',(req,res,p)=>{if(!continuationOwner(req,res))return;projectContinuation.stop(Number(p.id));json(res,200,{ok:true});});
+route('POST','/api/tool-requests/:id/adopt',async(req,res,p)=>{
+  if(!continuationOwner(req,res))return;
+  try {
+    const input=await body(req);if(!continuationOwner(req,res))return;
+    const principal=adminAuth(req)?'local-admin':req.user.username;
+    json(res,200,projectLifecycleOwnership.adopt(p.id,input,{authenticated:true,principal}));
+  } catch(error){json(res,400,{error:redact(error.message)});}
+});
+route('GET','/api/tool-requests/:id/ownership',(req,res,p)=>{
+  if(continuationOwner(req,res))json(res,200,projectLifecycleOwnership.get(p.id));
+});
+route('POST','/api/tool-requests/:id/continue-incomplete',async(req,res,p)=>{
+  if(!continuationOwner(req,res))return;
+  try {
+    const input=await body(req);if(!continuationOwner(req,res))return;
+    json(res,200,await toolDevelopment.continueIncompleteStage(p.id,input));
+  } catch(error){json(res,400,{error:redact(error.message)});}
+});
+route('POST','/api/tool-requests/:id/resume-reviewed',async(req,res,p)=>{
+  if(!continuationOwner(req,res))return;
+  try {
+    const input=await body(req);if(!continuationOwner(req,res))return;
+    json(res,200,await toolDevelopment.resumeReviewedStage(p.id,input));
+  } catch(error){json(res,400,{error:redact(error.message)});}
+});
+route('POST','/api/tool-requests/:id/review-source',async(req,res,p)=>{
+  if(!continuationOwner(req,res))return;
+  try {
+    const input=await body(req);if(!continuationOwner(req,res))return;
+    json(res,200,await (input.action==='initiate_source_review'?toolDevelopment.initiateSourceReview(p.id,input):toolDevelopment.reviewSource(p.id,input)));
+  } catch(error){json(res,400,{error:redact(error.message)});}
+});
+route('POST','/api/runs/:id/resume',async(req,res,p)=>{
+  try{json(res,200,{runId:resumeRun(p.id,await body(req))});}
+  catch(error){json(res,400,{error:redact(error.message)});}
+});
+route('POST', '/api/runs/:id/stop', (req, res, p) => { const outcome=stopRun(p.id); json(res,outcome.reasonCode==='not_found'?404:outcome.reasonCode==='reconciliation_required'||outcome.reasonCode==='state_changed'?409:200,{ok:!!(outcome.changed||outcome.requested||outcome.reasonCode==='already_terminal'),...outcome}); });
 
 // Approvals (user side)
 route('POST', '/api/approvals/:id', async (req, res, p) => {
@@ -475,7 +612,7 @@ route('POST', '/api/messages/:id/redact', async (req, res, p) => {
     }
   }
   let files = 0;
-  for(const [table,column,idColumn] of [['runs','checkpoint','id'],['task_events','body','id'],['tool_calls','args','id'],['tool_calls','result','id']]) {
+  for(const [table,column,idColumn] of [['runs','checkpoint','id'],['run_context','prompt','id'],['task_events','body','id'],['tool_calls','args','id'],['tool_calls','result','id']]) {
     for(const row of q(`SELECT ${idColumn} AS id,${column} AS value FROM ${table} WHERE ${column} LIKE ? ESCAPE '\\'`).all(like))
       q(`UPDATE ${table} SET ${column}=? WHERE ${idColumn}=?`).run(row.value.split(secret).join(MASK).split(JSON.stringify(secret).slice(1,-1)).join(MASK),row.id);
   }
@@ -498,9 +635,9 @@ route('POST','/api/sidebar/move',async(req,res)=>{
     if(input.kind!=='agents')throw new Error('Choose a group or agents to move');
     const ids=input.ids;
     if(!Array.isArray(ids)||!ids.length||ids.length>100||ids.some(id=>!Number.isSafeInteger(id)||id<1)||new Set(ids).size!==ids.length)throw new Error('Choose valid, unique agent IDs');
-    const destination=validateDisplayGroup(input.group),rows=q(`SELECT id,template,display_group FROM bots WHERE id IN (${ids.map(()=>'?').join(',')})`).all(...ids);
+    const destination=validateDisplayGroup(input.group),rows=q(`SELECT id,template,parent_bot_id,display_group FROM bots WHERE id IN (${ids.map(()=>'?').join(',')})`).all(...ids);
     if(rows.length!==ids.length)throw new Error('An agent was removed; refresh and try again');
-    if(rows.some(row=>row.template==='orchestrator'))throw new Error('The root Orchestrator stays above the display groups');
+    if(rows.some(row=>row.template==='orchestrator'&&row.parent_bot_id==null))throw new Error('The root Orchestrator stays above the display groups');
     if(Object.hasOwn(input,'expectedGroup')){
       validateDisplayGroup(input.expectedGroup);
       if(rows.some(row=>row.display_group!==input.expectedGroup))return json(res,409,{error:'An agent moved on another device; refresh and try again'});
@@ -508,8 +645,8 @@ route('POST','/api/sidebar/move',async(req,res)=>{
     const before=input.before??null,moving=ids.map(id=>'bot:'+id);
     if(before!==null){
       if(typeof before!=='string'||!/^bot:[1-9]\d*$/.test(before)||moving.includes(before))throw new Error('Choose another agent as the insertion point');
-      const anchor=q('SELECT display_group,template FROM bots WHERE id=?').get(Number(before.slice(4)));
-      if(!anchor||anchor.display_group!==destination||anchor.template==='orchestrator')throw new Error('The insertion point is no longer in that group');
+      const anchor=q('SELECT display_group,template,parent_bot_id FROM bots WHERE id=?').get(Number(before.slice(4)));
+      if(!anchor||anchor.display_group!==destination||anchor.template==='orchestrator'&&anchor.parent_bot_id==null)throw new Error('The insertion point is no longer in that group');
     }
     const known=[...q('SELECT id FROM bots ORDER BY id').all().map(row=>'bot:'+row.id),...q('SELECT id FROM rooms ORDER BY id').all().map(row=>'room:'+row.id)];
     const allowed=new Set(known),stored=normalizeSidebarOrder(JSON.parse(getSetting('side_order')||'null'));
@@ -676,6 +813,48 @@ function credentialBinding(email=''){
 }
 const passkeys=OWNER_MODE?new PasskeyStore({db,rpOrigin:PASSKEY_ORIGIN,username:OWNER_USERNAME,binding:()=>credentialBinding('')}):null;
 const sessions=new SessionStore({db,binding:credentialBinding});
+const ownedScheduler=schedulerHost({db,
+ port:config().scheduler?.ownedEnabled===true?createPrivateSchedulerPort('nimbus-owned'):null,
+ enabled:config().scheduler?.ownedEnabled===true,
+ authorize:req=>sameOriginRequest(req)===true && (adminAuth(req)===true || (OWNER_MODE && loggedIn(req)===true && req.user?.username===OWNER_USERNAME))===true,
+ onError:()=>console.error('Owned scheduler pump held')});
+for(const endpoint of ['create','tick'])route('POST','/private/scheduler/'+endpoint,ownedScheduler.handler);
+const memoryPins={
+    "home/state/brain-links/links.sqlite3":  "8a27698145538700a73a79f9970a22842f6214b39e5d68da3883942579af6e13",
+    "integrations/openhuman_memory/chunks.db":  "10272d4e4d4aadc8c7360d5328a0d26052a6b1a182e5a2f1c44b0344075fe248",
+    "home/memory_store.db":  "88c0940e091f1191359017fb810fb412bbd4382f6098c4f314630c038183ba96",
+    "home/state.db":  "ec229fcde7f5ae372d18136a602fcf49a5bb08bf10e518520f7f1564d36b65d2",
+    "integrations/openhuman_memory/memory.db":  "94fabec8a39eaae12e7b7a9000acedc369a22706bdb8ca53dd0c426b4be5aea0"
+};
+const memoryScopes=['memory:read','copied-attachment:read',...['brain','archive','sessions','relationships','chunks','topics','attachments'].map(s=>'memory:'+s+':read')];
+const memoryEnabled=()=>OWNER_MODE&&!!credentialBinding('');
+const memoryIntegration=OWNER_MODE?composeMemoryRoute({sessions,ownerId:OWNER_USERNAME,scopes:memoryScopes,pins:memoryPins,secureRequest,sameOriginRequest}):null;
+configureMemoryWorkers({ownerId:OWNER_USERNAME,pins:memoryPins,scopes:memoryScopes,enabled:memoryEnabled,
+ workerAllowed:(botId,runId)=>{
+ const bot=q('SELECT * FROM bots WHERE id=?').get(botId),run=q('SELECT * FROM runs WHERE id=?').get(runId);
+ return !!bot&&!!run&&run.bot_id===botId&&run.delegation_scope!=='conversation'&&JSON.parse(bot.tools||'[]').includes('memory_recall');
+ }});
+for(const operation of ['get','search','recall'])route('POST','/api/memory/'+operation,async(req,res)=>{
+ if(!memoryIntegration||!memoryEnabled())return json(res,403,{error:'FORBIDDEN'});
+ const original=req.url;req.url='/memory/'+operation;
+ try{return await memoryIntegration(req,res);}finally{req.url=original;}
+});
+const branchHostSnapshots=new BranchHostSnapshot({db,sessions,sourceRoot:ROOT,checkpointRoot:path.join(DATA_DIR,'project-checkpoints'),ownerEmail:''});
+configureBranchHost(branchHostSnapshots);
+const branchHostHttp=branchHostApi(branchHostSnapshots,{sessionToken:cookieToken,sameOrigin:sameOriginRequest});
+route('POST','/api/project-branch-scopes',async(req,res)=>{
+ if(!OWNER_MODE)return json(res,403,{error:'Named authenticated owner session required'});
+ if(!continuationOwner(req,res))return;
+ try{
+  const input=await body(req,32768);
+  if(!continuationOwner(req,res))return;
+  const result=branchHostHttp(req,input);
+  // Commit precedes enqueue; dispatch revalidates all bindings. On an enqueue
+  // error retain the single durable successor instead of creating another one.
+  if(input.action==='activate')try{enqueueCommittedRun(result.runId);}catch(error){return json(res,409,{...result,held:true,error:redact(error.message)});}
+  json(res,200,result??{ok:true});
+ }catch(error){json(res,409,{error:redact(error.message)});}
+});
 const throttle=new LoginThrottle({db});
 const clientIp=requestIp;
 function cookie(req, name) {
@@ -1068,13 +1247,22 @@ if (HTTPS_PORT) {
   } catch (e) { console.error(`HTTPS not started: ${e.message}`); }
 }
 server.listen(PORT, HOST, () => {
+  configureSuccessorHost(principal=>{
+    if(principal?.kind==='local-admin')return principal.id==='local-admin'&&principal.binding===crypto.createHash('sha256').update(ADMIN_TOKEN).digest('hex');
+    if(!OWNER_MODE||principal?.kind!=='named-owner'||principal.id!==OWNER_USERNAME||principal.binding!==credentialBinding(''))return false;
+    const session=q('SELECT * FROM auth_sessions WHERE token=?').get(principal.sessionHash),now=Math.floor(Date.now()/1000);
+    return !!session&&session.binding===principal.binding&&now-session.created_at<sessions.absoluteSeconds&&now-session.last_seen<sessions.idleSeconds;
+  });
+  recoverRuns();
+  ownedScheduler.start();
   maintenance.confirmBoot(bootSourceHash);
+  reconcileProjectSuccessorHandoffs(bootSourceHash);
   startToolDevelopment(bootSourceHash);
   const shown = ['0.0.0.0', '::'].includes(HOST) ? 'localhost' : HOST;
   console.log(`Nimbus running at http://${shown}:${PORT}${shown !== HOST ? ` (listening on all interfaces, ${HOST})` : ''}`);
 });
 
 let closing=false;
-async function shutdown(code=0) { if(closing)return;closing=true;server.close();await drainRuntime();await terminals.close();localService?.closeAllConnections();localService?.close();await connectors.close();await browsers.close();db.close();process.exit(code); }
+async function shutdown(code=0) { if(closing)return;closing=true;server.close();await ownedScheduler.stop();await drainRuntime();await terminals.close();await closeLocalService();await connectors.close();await browsers.close();db.close();process.exit(code); }
 process.on('SIGTERM',()=>shutdown());
 process.on('SIGINT',()=>shutdown());

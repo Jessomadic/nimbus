@@ -60,7 +60,19 @@ function Set-NimbusPrivateAcl([string]$nimbusAclPath,[bool]$nimbusDirectory){
   }
 }
 function Test-NimbusPrivateAcl([string]$nimbusAclPath){
-  $nimbusAcl=Get-Acl -LiteralPath $nimbusAclPath
+  try{
+    $nimbusAcl=Get-Acl -LiteralPath $nimbusAclPath -ErrorAction Stop
+  }catch{
+    # The tree is snapshotted before ACL verification. Git and other tools can
+    # remove transient directories (for example turn-diff captures) meanwhile.
+    # Treat only a path now proven absent as gone; preserve access and ACL errors.
+    try{
+      Get-Item -LiteralPath $nimbusAclPath -Force -ErrorAction Stop | Out-Null
+    }catch [System.Management.Automation.ItemNotFoundException]{return $true}
+    catch [System.IO.FileNotFoundException]{return $true}
+    catch [System.IO.DirectoryNotFoundException]{return $true}
+    throw
+  }
   $nimbusFullControlSids=[Collections.Generic.HashSet[string]]::new()
   foreach($nimbusRule in $nimbusAcl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])){
     if($nimbusRule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $nimbusRule.IdentityReference.Value -notin $nimbusTrustedSids){return $false}

@@ -68,11 +68,15 @@ export class Maintenance {
     if (this.inventory().hash !== source.hash) throw new Error('Source changed while taking the snapshot; retry before editing');
     // Freeze a standalone recovery runner outside application source. Recovery
     // must still work if the candidate breaks maintenance.js or package.json.
-    const recovery = path.join(this.dir, id, 'recovery'); fs.mkdirSync(recovery, { recursive: true });
-    for (const name of ['maintenance.js','process.js']) fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(recovery,name));
+    const recovery = path.join(this.dir, id, 'recovery');
+    const recoveryRuntime=path.join(recovery,'runtime');fs.mkdirSync(recoveryRuntime,{recursive:true});
+    // Preserve the runtime layout for process -> diagnostics -> ../redact.
+    // Recovery must not import any mutable source from the failed candidate.
+    for (const name of ['maintenance.js','process.js','diagnostics.js']) fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(recoveryRuntime,name));
+    fs.copyFileSync(new URL('../redact.js',import.meta.url),path.join(recovery,'redact.js'));
     fs.writeFileSync(path.join(recovery,'package.json'),'{"type":"module"}\n');
     const recoveryScript=path.join(recovery,'restore.mjs');
-    fs.writeFileSync(recoveryScript,`import fs from 'node:fs';\nimport path from 'node:path';\nimport {Maintenance} from './maintenance.js';\nconst root=${JSON.stringify(this.root)},dataDir=${JSON.stringify(this.data)};\nfor(const name of ['supervisor.lock','server.pid']){\n const file=path.join(dataDir,name);if(!fs.existsSync(file))continue;\n const value=fs.readFileSync(file,'utf8'),pid=name==='supervisor.lock'?JSON.parse(value).pid:Number(value);\n let alive=false;try{process.kill(pid,0);alive=true;}catch(error){if(error.code==='EPERM')alive=true;}\n if(alive)throw new Error('Stop Nimbus before offline source recovery');\n}\nconst manager=new Maintenance({root,dataDir});manager.failPending('Stopped for offline source recovery');\nconsole.log(JSON.stringify(manager.restore(${JSON.stringify(id)})));\n`);
+    fs.writeFileSync(recoveryScript,`import fs from 'node:fs';\nimport path from 'node:path';\nimport {Maintenance} from './runtime/maintenance.js';\nconst root=${JSON.stringify(this.root)},dataDir=${JSON.stringify(this.data)};\nfor(const name of ['supervisor.lock','server.pid']){\n const file=path.join(dataDir,name);if(!fs.existsSync(file))continue;\n const value=fs.readFileSync(file,'utf8'),pid=name==='supervisor.lock'?JSON.parse(value).pid:Number(value);\n let alive=false;try{process.kill(pid,0);alive=true;}catch(error){if(error.code==='EPERM')alive=true;}\n if(alive)throw new Error('Stop Nimbus before offline source recovery');\n}\nconst manager=new Maintenance({root,dataDir});manager.failPending('Stopped for offline source recovery');\nconsole.log(JSON.stringify(manager.restore(${JSON.stringify(id)})));\n`);
     return this.save({ id, root: this.root, createdAt: new Date().toISOString(), state: 'snapshot', baseline: source,recoveryScript,
       note: 'Source snapshot includes existing uncommitted edits. Database, credentials, config and worker data are separate.' });
   }
@@ -82,6 +86,14 @@ export class Maintenance {
     this.busy = true;
     receipt.state = 'validating'; receipt.candidate = source; receipt.checks = []; delete receipt.error;
     this.save(receipt);
+    const attempt = randomUUID();
+    const keepOutput = (stdout = '', stderr = '') => {
+      const outputLog = path.join(this.dir, id, 'validation-' + attempt + '.stdout.log');
+      const stderrLog = path.join(this.dir, id, 'validation-' + attempt + '.stderr.log');
+      fs.writeFileSync(outputLog, stdout, 'utf8');
+      fs.writeFileSync(stderrLog, stderr, 'utf8');
+      return { outputLog, stderrLog };
+    };
     try {
       const js = Object.keys(source.files).filter(f => /\.(?:mjs|js)$/.test(f));
       for (const file of js) await capture(process.execPath, ['--check', file], { cwd: this.root, signal });
@@ -92,13 +104,16 @@ export class Maintenance {
       // Node propagates this internal flag and otherwise hides child failures.
       const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
       const output = await capture(process.execPath, ['--no-warnings', '--test', '--test-concurrency=1', ...tests],
-        { cwd: this.root, timeout: 180000, signal, env });
-      receipt.checks.push({ name: 'Nimbus tests', pass: true, output: output.slice(-12000) });
+        { cwd: this.root, timeout: 600000, signal, env, diagnosticTail:true });
+      receipt.checks.push({ name: 'Nimbus tests', pass: true, output: output.slice(-12000), ...keepOutput(output) });
       signal?.throwIfAborted();
       if (this.inventory().hash !== source.hash) throw new Error('Source changed during validation; validate again');
       receipt.state = 'validated'; receipt.validatedHash = source.hash; receipt.validatedAt = new Date().toISOString();
     } catch (error) {
-      if(error.stdout||error.stderr)receipt.checks.push({name:'Failed validation command',pass:false,output:(error.stdout||'').slice(-12000),stderr:(error.stderr||'').slice(-4000),exitCode:error.exitCode});
+      const withTail=(prefix='',tail='')=>prefix+(tail&&tail!==prefix?'\n--- Final bounded diagnostic lines; intervening output may be omitted ---\n'+tail:'');
+      const withFailures=(prefix,tail,failures)=>{const text=withTail(prefix,tail);return text+(failures&&!text.includes(failures.trim())?'\n--- Bounded failure diagnostics from throughout the command ---\n'+failures:'');};
+      const failureOut=withFailures(error.stdout,error.stdoutTail,error.evidence?.stdoutFailures),failureErr=withFailures(error.stderr,error.stderrTail,error.evidence?.stderrFailures);
+      if(failureOut||failureErr)receipt.checks.push({name:'Failed validation command',pass:false,output:failureOut.slice(-12000),stderr:failureErr.slice(-4000),exitCode:error.exitCode,processEvidence:error.evidence,...keepOutput(failureOut,failureErr)});
       receipt.state = 'validation_failed'; receipt.error = error.message; delete receipt.validatedHash;
       this.save(receipt); throw error;
     } finally { this.busy = false; }

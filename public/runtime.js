@@ -11,14 +11,16 @@ export function createRuntimeUI(ctx) {
   const phaseKey=value=>{const key=String(value||'').toLowerCase().replaceAll(' ','-');return phaseAliases[key]||key;};
   const terminalRequest=request=>['ready','cancelled'].includes(request.status);
   const requestNeedsAttention=request=>['blocked','needs_review'].includes(request.status);
+  const taskStatus=(run,requests=run.toolRequests||[])=>run.status==='done'&&requests.some(request=>requestNeedsAttention(request)&&request.stages?.some(stage=>Number(stage.runId||stage.run_id)===Number(run.id)))?'<span class="task-status blocked">Worker finished · Build needs attention</span>':status(run.status);
   function replaceProgress(target,markup) {
     const active=document.activeElement,attribute=target.contains(active)?['data-tool-request','data-stage-task','data-task','data-group','data-chat'].find(name=>active.hasAttribute?.(name)):null,value=attribute?active.getAttribute(attribute):null;
     target.innerHTML=markup;
     if(attribute)[...target.querySelectorAll('button')].find(button=>button.getAttribute(attribute)===value)?.focus({preventScroll:true});
   }
   function requestCard(request,{compact=false,detail=false}={}) {
-    const id=String(request.id),stages=Array.isArray(request.stages)?request.stages:[],current=phaseKey(request.phase||request.status),attention=requestNeedsAttention(request);
-    const completed=new Set(stages.filter(stage=>stage.status==='done').map(stage=>phaseKey(stage.role)));
+    const id=String(request.id),stages=Array.isArray(request.stages)?request.stages:[],attention=requestNeedsAttention(request),current=phaseKey(attention?(request.error_metadata?.phase||request.error_metadata?.stage||request.phase||request.status):(request.phase||request.status));
+    const completed=new Set(stages.filter(stage=>stage.status==='done').map(stage=>phaseKey(stage.phase||stage.role)));
+    if(request.validated_hash&&['deploying','ready'].includes(request.status))completed.add('validating');
     const rail=compact?'':`<ol class="runtime-capability-phases" aria-label="Tool creation stages">${requestPhases.map(([key,label])=>{
       const done=request.status==='ready'||completed.has(key),active=!done&&current===key,state=done?'complete':active?attention?'attention':'current':'pending';
       return `<li class="${state}" ${active?'aria-current="step"':''}><span class="runtime-capability-phase-mark" aria-hidden="true">${done?'✓':active?'•':''}</span><span>${label}<span class="sr-only">: ${done?'complete':active?'current stage':'pending'}</span></span></li>`;
@@ -27,8 +29,11 @@ export function createRuntimeUI(ctx) {
       <div class="runtime-capability-heading"><div>${detail?`<h3 class="runtime-capability-title">${esc(request.title||request.tool_name||'New tool request')}</h3>`:`<button class="runtime-capability-title" data-tool-request="${esc(id)}">${esc(request.title||request.tool_name||'New tool request')}</button>`}${request.tool_name?`<small class="runtime-capability-name">${esc(request.tool_name)}</small>`:''}</div>${status(request.status||'queued')}</div>
       <p class="runtime-capability-message">${esc(request.message||(request.status==='ready'?'The tool is ready.':request.status==='queued'?'Waiting for an available worker.':request.status==='cancelled'?'This request was cancelled.':attention?'This request needs attention before work can continue.':'Preparing the next stage.'))}</p>
       ${rail}
-      ${!compact&&stages.length?`<div class="runtime-capability-stages" aria-label="Worker task details">${stages.map(stage=>{const runId=positiveId(stage.runId);return `<div><span><b>${esc(stageRole(stage.role))}</b>${status(stage.status||'queued')}</span>${runId?`<button class="btn small" data-stage-task="${runId}">Open task #${runId}</button>`:'<small>Task not assigned yet</small>'}</div>`;}).join('')}</div>`:''}
+      ${!compact&&stages.length?`<div class="runtime-capability-stages" aria-label="Worker task details">${stages.map(stage=>{const runId=positiveId(stage.runId);return `<div><span><b>${esc(stageRole(stage.worker_name||stage.template||stage.role))}</b>${status(stage.status||'queued')}</span>${runId?`<button class="btn small" data-stage-task="${runId}">Open task #${runId}</button>`:'<small>Task not assigned yet</small>'}</div>`;}).join('')}</div>`:''}
+      ${!compact&&request.recoveries?.length?`<details class="runtime-capability-history"><summary>Recovery history <span>${request.recoveries.length}</span></summary><ol>${[...request.recoveries].reverse().map(item=>`<li><div><b>${esc(item.kind==='continuation'?'Checkpoint continuation':item.kind==='investigation'?'Evidence investigation':'Builder repair')} ${fmt(item.attempt)}</b><span>${esc(item.phase)}</span></div><p>${esc(item.reason)}</p></li>`).join('')}</ol></details>`:''}
       ${request.error?`<p class="runtime-capability-error"><b>${request.status==='needs_review'?'Review needed':'Build details'}</b> ${esc(request.error)}</p>`:''}
+      ${attention&&request.error_metadata?.priorRequestId&&request.error_metadata.priorRequestId!==id?`<div class="runtime-review"><h3>Blocking request needs review</h3><p>Open the earlier request to inspect its retained work and worker tasks.</p><button type="button" class="btn small" data-tool-request="${esc(request.error_metadata.priorRequestId)}">Open blocking request</button></div>`:''}
+      ${request.recovery?.canContinue?`<p class="runtime-capability-message">The build checkpoint is retained. Continue with another bounded action budget; QA and review will still run afterward.</p><button class="btn small" data-continue-build="${esc(id)}">Continue build</button>`:''}
       ${compact?`<button class="runtime-capability-open" data-tool-request="${esc(id)}">View progress</button>`:''}
     </section>`;
   }
@@ -45,13 +50,13 @@ export function createRuntimeUI(ctx) {
     }
     render(request);
     async function refresh(){if(!document.body.contains(el))return;try{const current=await api(`/api/tool-requests/${encodeURIComponent(id)}`);if(!document.body.contains(el))return;el.querySelector('[data-request-refresh-error]')?.remove();render(current);if(terminalRequest(current))return;}catch(error){if(!document.body.contains(el))return;const target=el.querySelector('[data-tool-request-body]');let note=target.querySelector('[data-request-refresh-error]');if(!note){note=document.createElement('p');note.className='runtime-warning';note.dataset.requestRefreshError='';target.append(note);}note.textContent='Progress could not be refreshed: '+error.message;}if(document.body.contains(el))setTimeout(refresh,4000);}
-    el.addEventListener('click',async event=>{const button=event.target.closest('button');if(!button)return;try{if(button.hasAttribute('data-close'))return closeModal();if(button.dataset.stageTask)return await task(button.dataset.stageTask);}catch(error){toast(error.message);}});
+    el.addEventListener('click',async event=>{const button=event.target.closest('button');if(!button)return;try{if(button.hasAttribute('data-close'))return closeModal();if(button.dataset.toolRequest)return await toolRequest(button.dataset.toolRequest);if(button.dataset.stageTask)return await task(button.dataset.stageTask);if(button.dataset.continueBuild){button.disabled=true;try{render(await api(`/api/tool-requests/${encodeURIComponent(button.dataset.continueBuild)}/continue`,{method:'POST',body:{reason:'Owner continued the retained build checkpoint from the tool-request window.'}}));}finally{button.disabled=false;}}}catch(error){toast(error.message);}});
     if(!terminalRequest(request))setTimeout(refresh,4000);
   }
   async function task(id) {
     const [run,detail]=await Promise.all([api(`/api/runs/${id}`),api(`/api/runs/${id}/events`)]);
     const el=modal(`<div class="modal-head"><h2>Task ${run.id}</h2><button class="icon-btn" data-close aria-label="Close">×</button></div>
-      <div class="runtime-task-heading"><span data-run-status>${status(run.status)}</span><b>${esc(bot(run.bot_id)?.name||'Worker')}</b><span>${esc(run.actual_model||'Awaiting model selection')}</span></div>
+      <div class="runtime-task-heading"><span data-run-status>${taskStatus(run)}</span><b>${esc(bot(run.bot_id)?.name||'Worker')}</b><span>${esc(run.actual_model||'Awaiting model selection')}</span></div>
       ${run.route_reason?`<p>${esc(run.route_reason)}</p>`:''}${run.fallback_reason?`<p class="runtime-warning">Fallback: ${esc(run.fallback_reason)}</p>`:''}
       <div data-run-error>${run.last_error?`<p class="runtime-warning">${esc(run.last_error)}</p>`:''}</div>
       <div data-run-budget>${budgetSection(run.budget)}</div>
@@ -74,14 +79,14 @@ export function createRuntimeUI(ctx) {
     async function refreshRequests(){if(!document.body.contains(el))return;try{
       const [current,response]=await Promise.all([api(`/api/runs/${id}`),api(`/api/tool-requests?runId=${encodeURIComponent(id)}`)]);
       if(!document.body.contains(el))return;const requests=requestArray(response),next=JSON.stringify([current.status,current.reply,current.last_error,current.budget,current.delegations,requests]);latestRequests=requests;latestStatus=current.status;
-      if(next!==requestFingerprint){requestFingerprint=next;el.querySelector('[data-run-status]').innerHTML=status(current.status);replaceProgress(el.querySelector('[data-tool-requests]'),requestsSection(requests,current.status));el.querySelector('[data-run-budget]').innerHTML=budgetSection(current.budget);replaceProgress(el.querySelector('[data-run-delegations]'),delegationsSection(current.delegations));el.querySelector('[data-run-error]').innerHTML=current.last_error?`<p class="runtime-warning">${esc(current.last_error)}</p>`:'';el.querySelector('[data-run-result]').innerHTML=current.reply?`<h3>Result</h3><pre class="runtime-result">${esc(current.reply)}</pre>`:'';}
+      if(next!==requestFingerprint){requestFingerprint=next;el.querySelector('[data-run-status]').innerHTML=taskStatus(current,requests);replaceProgress(el.querySelector('[data-tool-requests]'),requestsSection(requests,current.status));el.querySelector('[data-run-budget]').innerHTML=budgetSection(current.budget);replaceProgress(el.querySelector('[data-run-delegations]'),delegationsSection(current.delegations));el.querySelector('[data-run-error]').innerHTML=current.last_error?`<p class="runtime-warning">${esc(current.last_error)}</p>`:'';el.querySelector('[data-run-result]').innerHTML=current.reply?`<h3>Result</h3><pre class="runtime-result">${esc(current.reply)}</pre>`:'';}
       if(!['queued','routing','running','waiting_local','waiting_cloud','waiting_approval','waiting_input','waiting_tool'].includes(current.status)&&requests.every(terminalRequest))return;
     }catch(error){if(document.body.contains(el)&&latestStatus==='waiting_tool')replaceProgress(el.querySelector('[data-tool-requests]'),requestsSection(latestRequests,latestStatus,error.message));}
       if(document.body.contains(el))setTimeout(refreshRequests,4000);
     }
     refreshRequests();
   }
-  function budgetSection(budget){return budget?`<p class="runtime-budget" aria-label="Tool budget"><span>Actions <b>${fmt(budget.actionsUsed)} / ${fmt(budget.actionLimit)}</b></span><span>Tool attempts <b>${fmt(budget.attemptsUsed)} / ${fmt(budget.attemptLimit)}</b></span>${budget.continuation?`<span>Continuation ${fmt(budget.continuation)}</span>`:''}</p>`:'';}
+  function budgetSection(budget){return budget?`<p class="runtime-budget" aria-label="Tool budget">${budget.executionMode==='progress'?'<span>Continue until complete</span>':''}<span>Actions <b>${fmt(budget.actionsUsed)}${budget.executionMode==='progress'?'':` / ${fmt(budget.actionLimit)}`}</b></span><span>Tool attempts <b>${fmt(budget.attemptsUsed)}${budget.executionMode==='progress'?'':` / ${fmt(budget.attemptLimit)}`}</b></span>${budget.continuation?`<span>Continuation ${fmt(budget.continuation)}</span>`:''}</p>`:'';}
   function delegationsSection(children){const rows=Array.isArray(children)?children:[];return `<section class="runtime-delegations"><h3>Delegated work</h3>${rows.length?rows.map(child=>`<div><span><b>${esc(child.worker_name||bot(child.bot_id)?.name||'Worker')}</b>${status(child.status)}</span><button class="btn small" data-stage-task="${positiveId(child.id)}">Open task #${positiveId(child.id)}</button></div>`).join(''):'<p class="muted">No specialist tasks have been assigned in this run.</p>'}</section>`;}
   async function group(id) {
     const r=await api('/api/browser-groups'),g=r.groups.find(g=>g.owner===Number(id));
@@ -119,19 +124,37 @@ export function createRuntimeUI(ctx) {
   async function settings() {
     const [c,s]=await Promise.all([api('/api/runtime/config'),api('/api/settings')]);
     const el=modal(`<div class="modal-head"><h2>Nimbus settings</h2><button class="icon-btn" data-close aria-label="Close">×</button></div>
-      <h3>Shared local inference</h3><label class="field">Endpoint<input id="rt-url" value="${esc(c.local.baseUrl)}"></label><label class="field">Default local model<input id="rt-model" value="${esc(c.local.model)}"></label>
+      <h3>Permissions</h3><label class="field">Permission mode<select id="rt-permissions"><option value="rules" ${c.workers.permissionMode!=='all'?'selected':''}>Approval rules</option><option value="all" ${c.workers.permissionMode==='all'?'selected':''}>All permissions</option></select><span class="hint">All permissions lets every worker use its enabled tools without approval prompts, including changes and connector actions. Applies immediately to the whole team and approves actions currently waiting for permission. Switching back restores each worker’s saved approval rules.</span></label>
+      <h3>Shared local inference</h3><label class="toggle-row"><span>Use local models</span><input id="rt-local-enabled" role="switch" type="checkbox" ${c.local.enabled?'checked':''}></label><p class="muted" id="rt-local-status" role="status">Changes save immediately.</p><label class="field">Endpoint<input id="rt-url" value="${esc(c.local.baseUrl)}"></label><label class="field">Default local model<input id="rt-model" value="${esc(c.local.model)}"></label>
       <div class="two"><label class="field">Maximum simultaneous workers<input id="rt-workers" type="number" min="1" max="32" value="${c.workers.maxConcurrent}"></label><label class="field">Maximum OpenAI tasks<input id="rt-cloud" type="number" min="1" max="16" value="${c.cloud.maxConcurrent}"></label></div>
       <p class="muted">Local inference is shared and serialized. Already loaded approved models are reused. Credential sources stay in the local configuration file.</p>
       <h3>OpenAI subscription</h3><button class="btn" data-login>Sign in with ChatGPT</button><p class="muted">Nimbus uses Codex’s native sign-in. You can also run <code>codex login</code> on this Windows account.</p>
+      <h3>Context and memory</h3><label class="toggle-row"><span>Automatically compress older tool exchanges</span><input id="rt-context-auto" type="checkbox" ${c.context?.automaticCompression!==false?'checked':''}></label>
+      <div class="two"><label class="field">Maximum history characters<input id="rt-context-history" type="number" min="24000" max="900000" step="1000" value="${c.context?.maxHistoryChars??240000}"></label><label class="field">Tool result preview characters<input id="rt-context-tool" type="number" min="256" max="32000" value="${c.context?.maxToolChars??12000}"></label></div>
+      <p class="muted">The loaded model’s capacity may lower this budget. Full canonical history and action evidence stay in storage. Use <code>/compact</code> in a paused or idle worker chat to archive and compact its context now. User instructions and durable memory are kept.</p>
       <h3>Browser groups</h3><label class="toggle-row"><span>Run worker browsers in the background</span><input id="rt-headless" type="checkbox" ${c.browser.headless?'checked':''}></label><p class="muted">Changing browser mode takes effect after a Nimbus restart. Group cookies and sign-ins are saved for this Windows account.</p>
       <h3>Backups</h3><label class="field">Additional local or UNC backup folder<input id="rt-backup-target" value="${esc(s.backup_target||'')}" placeholder="Optional"></label><button class="btn" data-backup>Back up now</button><p class="muted" data-backup-status>Encrypted backups include tasks, artifacts, worker memory, and configuration. Keep the recovery key separately for migration.</p>
       <div class="modal-foot"><button class="btn" data-close>Cancel</button><button class="btn primary" data-save>Save changes</button></div>`,{wide:true});
+    const localSwitch=el.querySelector('#rt-local-enabled'),localStatus=el.querySelector('#rt-local-status'),saveButton=el.querySelector('[data-save]');
+    let localSaved=c.local.enabled;
+    localSwitch.addEventListener('change',async()=>{
+      if(localSwitch.disabled)return;
+      localSwitch.disabled=true;saveButton.disabled=true;
+      localStatus.textContent='Saving…';
+      try{
+        const saved=await api('/api/runtime/config',{method:'PUT',body:{local:{enabled:localSwitch.checked}}});
+        if(typeof saved.local?.enabled!=='boolean')throw new Error('Invalid saved local-model state');
+        localSaved=saved.local.enabled;
+        localStatus.textContent=localSaved?'Local models on.':'Local models off.';
+      }catch(error){localStatus.textContent='Could not save: '+error.message;}
+      finally{localSwitch.checked=localSaved;localSwitch.disabled=false;saveButton.disabled=false;}
+    });
     el.addEventListener('click',async e=>{const t=e.target.closest('button');if(!t)return;try{
       if(t.hasAttribute('data-close'))return closeModal();
       if(t.hasAttribute('data-login')){const r=await api('/api/openai/login',{method:'POST'});if(r.authUrl)window.open(r.authUrl,'_blank','noopener');return;}
       if(t.hasAttribute('data-backup')){t.disabled=true;const r=await api('/api/backup',{method:'POST'});el.querySelector('[data-backup-status]').textContent=r.ok?'Backup saved: '+r.file:'Backup failed: '+r.error;t.disabled=false;return;}
       if(t.hasAttribute('data-save')){
-        await api('/api/runtime/config',{method:'PUT',body:{local:{baseUrl:el.querySelector('#rt-url').value,model:el.querySelector('#rt-model').value},workers:{maxConcurrent:Number(el.querySelector('#rt-workers').value)},cloud:{maxConcurrent:Number(el.querySelector('#rt-cloud').value)},browser:{headless:el.querySelector('#rt-headless').checked}}});
+        await api('/api/runtime/config',{method:'PUT',body:{context:{automaticCompression:el.querySelector('#rt-context-auto').checked,maxHistoryChars:Number(el.querySelector('#rt-context-history').value),maxToolChars:Number(el.querySelector('#rt-context-tool').value)},local:{baseUrl:el.querySelector('#rt-url').value,model:el.querySelector('#rt-model').value},workers:{maxConcurrent:Number(el.querySelector('#rt-workers').value),permissionMode:el.querySelector('#rt-permissions').value},cloud:{maxConcurrent:Number(el.querySelector('#rt-cloud').value)},browser:{headless:el.querySelector('#rt-headless').checked}}});
         await api('/api/settings',{method:'PUT',body:{backup_target:el.querySelector('#rt-backup-target').value}});closeModal();await refreshState();toast('Nimbus settings saved');
       }
     }catch(err){toast(err.message);}});

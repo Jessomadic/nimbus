@@ -311,6 +311,24 @@ test('real HTTP boundary protects APIs, app pages, browsers, files and execution
   }
 });
 
+test('continuation routes require named owner or local admin over actual HTTP',async t=>{
+ for(const mode of ['accounts','shared','owner']){
+  const server=await fixture(t,{accounts:mode==='accounts',username:mode==='owner'});
+  let cookie;
+  if(mode==='accounts'){seedMfaAccount(server,false);cookie=await signInAccount(server);}
+  else if(mode==='owner')cookie=(await bootstrapOwner(server)).cookie;
+  else cookie=sessionCookie(await server.request('/api/login',{method:'POST',headers:remoteHeaders,body:{password}}));
+  const token=fs.readFileSync(path.join(server.data,'admin.token'),'utf8').trim();
+  for(const [method,route] of [['GET','/api/runs/999999/continuation'],['POST','/api/runs/999999/continuation'],['POST','/api/runs/999999/continuation/stop']]){
+   const body=method==='POST'?{}:undefined;
+   assertDenied(await server.request(route,{method,headers:remoteHeaders,body}),'anonymous policy');
+   const response=await server.request(route,{method,headers:{...remoteHeaders,cookie},body});
+   if(mode==='owner')assert.notEqual(response.status,403);else assert.equal(response.status,403);
+   assert.equal((await server.request(route,{method,headers:{...remoteHeaders,cookie,origin:'https://evil.invalid'},body})).status,403);
+   assert.notEqual((await server.request(route,{method,headers:{'x-nimbus-admin':token},body})).status,403);
+  }
+ }
+});
 const ownerOrigin='https://nimbus.fixture.invalid';
 const ownerLogin={username:'Jessomadic',password};
 const browserCookie=response=>response.headers['set-cookie']?.find(value=>value.startsWith('__Host-nimbus_preauth='))?.split(';')[0];

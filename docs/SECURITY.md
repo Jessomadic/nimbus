@@ -13,6 +13,8 @@ The public deployment requires **Jessomadic, the existing password and a passkey
 
 ## HTTP boundary
 
+**Server settings → Permissions → All permissions** disables per-action approval prompts for every worker's enabled native and connector tools. The setting is saved as `workers.permissionMode: "all"`; new installations default to `"rules"`. Enabling it also approves pending permission requests for active waiting tasks, retaining each decision in the approval record and task events. Saved worker rules remain intact for switching back. Authentication, enabled-tool restrictions, resource limits, and review of uncertain execution outcomes still apply.
+
 Forwarded non-HTTPS requests are refused. Proxy protocol and client IP information are trusted only over loopback. Requests carrying forwarding headers cannot use `data/admin.token` or redeem localhost sign-in tickets. Cross-origin writes are rejected; no cross-origin API access is enabled.
 
 Responses include framing denial, MIME sniffing denial, a restrictive Content Security Policy, and HTTPS HSTS. Login/passkey scripts and QR generation are served locally rather than from script CDNs; inline scripts would require a per-response nonce. Untrusted HTML/SVG uploads download as attachments with a sandboxed policy and cannot execute as app pages. Login JSON is bounded to 16 KB; request/header timeouts bound incomplete requests. Cloudflare must continue to forward to loopback and must not cache authenticated responses.

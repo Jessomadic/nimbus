@@ -4,14 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
-import {execute} from '../runtime/toolsets/operations.js';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'nimbus-health-probe-'));
 const oldData=process.env.NIMBUS_DATA,oldConfig=process.env.NIMBUS_CONFIG;
 process.env.NIMBUS_DATA=path.join(directory,'data');process.env.NIMBUS_CONFIG=path.join(directory,'config.json');
 fs.writeFileSync(process.env.NIMBUS_CONFIG,'{}');
+const {execute}=await import('../runtime/toolsets/operations.js');
 const {journalTool,UncertainAction,events}=await import('../runtime/journal.js');
-const {db,q}=await import('../db.js');
+const {db,q,DATA_DIR}=await import('../db.js');
+assert.equal(path.resolve(DATA_DIR),path.resolve(directory,'data'),'Health fixtures must never use the production database');
 const botId=Number(q('INSERT INTO bots(name) VALUES(?)').run('Synthetic health test').lastInsertRowid);
 function newRun(){return Number(q('INSERT INTO runs(bot_id,thread,status) VALUES(?,?,?)').run(botId,'fixture','running').lastInsertRowid);}
 async function listen(t,handler){

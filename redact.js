@@ -10,7 +10,7 @@ const KNOWN = [
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\bGOCSPX-[A-Za-z0-9_-]{10,}/g,
   /\bsk-[A-Za-z0-9_-]{32,}/g,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g
+  /(?!) /g // PEM handled linearly below
 ];
 // NAME=value / "name": "value" where the name says it's a secret.
 const ASSIGN = /((?:password|passwd|secret|token|api[_-]?key|client[_-]?secret|access[_-]?key)[A-Za-z0-9_]*\\?["']?\s*[:=]\s*\\?["']?)([^\s"'\\&,;]{6,})/gi;
@@ -20,7 +20,21 @@ const CRED_WORDS = /\b(creds?|credentials?|secret|token|password|api key)\b/i;
 
 export function redact(text) {
   if (typeof text !== 'string' || !text) return text;
-  let s = text;
+  let s = '', cursor = 0;
+  // Linear fail-closed scan. Missing END consumes the remaining capture prefix.
+  while (cursor < text.length) {
+    const begin = text.indexOf('-----BEGIN ', cursor);
+    if (begin < 0) { s += text.slice(cursor); break; }
+    const headerEnd = text.indexOf('-----', begin + 11);
+    const header = headerEnd < 0 ? '' : text.slice(begin + 11, Math.min(headerEnd, begin + 139));
+    if (headerEnd < 0 || headerEnd > begin + 139 || !/^[A-Z ]*PRIVATE KEY$/.test(header)) {
+      s += text.slice(cursor, begin + 11); cursor = begin + 11; continue;
+    }
+    s += text.slice(cursor, begin) + MASK;
+    const marker = '-----END ' + header + '-----';
+    const end = text.indexOf(marker, headerEnd + 5);
+    cursor = end < 0 ? text.length : end + marker.length;
+  }
   for (const re of KNOWN) s = s.replace(re, MASK);
   s = s.replace(PVE, `$1${MASK}`);
   s = s.replace(ASSIGN, (all, name, val) => (val === MASK || /^\$|^\[/.test(val) ? all : name + MASK));

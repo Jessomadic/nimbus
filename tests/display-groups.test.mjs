@@ -64,7 +64,7 @@ test('first display column migration initializes defaults while preserving every
   assert.equal(after.column.type,'TEXT');assert.equal(after.column.dflt_value,"''");
   assert.deepEqual(after.bots.map(({display_group,...bot})=>bot),f.before.bots);
   for(const bot of after.bots)assert.equal(bot.display_group,expected[bot.template]||'');
-  assert.deepEqual(after.rooms,f.before.rooms);assert.deepEqual(after.members,f.before.members);assert.deepEqual(after.plugins,f.before.plugins);assert.deepEqual(after.runs,f.before.runs);assert.deepEqual(after.history,f.before.history);
+  assert.deepEqual(after.rooms,f.before.rooms);assert.deepEqual(after.members,f.before.members);assert.deepEqual(after.plugins,f.before.plugins);assert.deepEqual(after.runs,f.before.runs.map(run=>({...run,delegation_scope:'legacy'})));assert.deepEqual(after.history,f.before.history);
 });
 test('repeated startup preserves user-selected groups including explicit Other instead of reseeding',async t=>{
   const f=fixture(t);await startup(f);const db=new DatabaseSync(f.file);db.prepare('UPDATE bots SET display_group=? WHERE template=?').run('operations','builder');db.prepare('UPDATE bots SET display_group=? WHERE template=?').run('','github-coordinator');db.prepare('UPDATE bots SET display_group=? WHERE template=?').run('quality','custom-fixture');const chosen=plain(db.prepare('SELECT * FROM bots ORDER BY id').all());db.close();

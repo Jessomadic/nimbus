@@ -16,6 +16,29 @@ const {db}=await import('../db.js');
 const {inspectImage}=await import('../runtime/workbench.js');
 const {cloudSlots}=await import('../runtime/slots.js');
 
+test('native restrictions are separate from authorized host callbacks and never execute from text',async()=>{
+  const calls=[];
+  const client=clientFixture({onStart:c=>complete(c,'Native read-only is not a host denial')});
+  await start(client,{callTool:async name=>{calls.push(name);}});
+  assert.deepEqual(calls,[]);
+  const params=client.requests.find(r=>r.method==='thread/start').params;
+  assert.equal(params.sandbox,'read-only');assert.equal(params.approvalPolicy,'never');
+  assert.match(params.baseInstructions,/not a Nimbus host filesystem denial/);
+  assert.match(params.baseInstructions,/never switch tools/);
+  assert.match(params.baseInstructions,/uncertain effects/);
+});
+
+test('non-mutating execution preflight uses current filtered tools and permission mode',async()=>{
+  const {executionPreflight}=await import('../runtime/prompts.js');
+  const current=executionPreflight([definition('read_file')],'rules');
+  assert.match(current,/Approval rules/);assert.match(current, /\["read_file"\]/);
+  assert.doesNotMatch(current, /"write_file"/);
+  assert.match(current,/does not probe filesystem access/);
+  const resumed=executionPreflight([definition('write_file')],'all');
+  assert.match(resumed,/All permissions/);assert.match(resumed, /\["write_file"\]/);
+  assert.match(resumed,/Availability is not write authorization/);
+});
+
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return{promise,resolve,reject};};
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 const definition=name=>({type:'function',function:{name,description:'Synthetic host safety fixture',parameters:{type:'object',properties:{},additionalProperties:false}}});
@@ -46,6 +69,43 @@ function start(client,extra={}){
   promise.catch(()=>{});return promise;
 }
 
+test('fresh assignment RPC framing distinguishes a new owned output from a missing input checkpoint',async()=>{
+  const messages=[{role:'user',content:'Create a NEW isolated candidate in the explicitly owned output directory fixture/output. Read the existing immutable fixture/input manifest first. Do not modify the input.'}],before=structuredClone(messages),calls=[];
+  const client=clientFixture({onStart:c=>complete(c,'ASSIGNMENT_RECEIVED')});
+  await start(client,{messages,callTool:async name=>{calls.push(name);}});
+  const text=client.requests.find(r=>r.method==='turn/start').params.input[0].text;
+  const delimiter='\n',split=text.indexOf(delimiter);
+  assert.ok(split>0,'The actual RPC separates host framing from supplied state');
+  const framing=text.slice(0,split);
+  assert.match(framing,/host-supplied assignment state/);
+  assert.match(framing,/execute a new assignment or resume the provided state/);
+  assert.match(framing,/does not require a separate filesystem checkpoint unless the assignment explicitly requires one/);
+  assert.match(framing,/explicitly owns a NEW output directory, its absence is expected/);
+  assert.match(framing,/within that assignment's scope using authorized advertised Nimbus file tools/);
+  assert.match(framing,/Missing required existing inputs are different: do not invent or recreate them/);
+  assert.deepEqual(JSON.parse(text.slice(split+delimiter.length)),messages);
+  assert.deepEqual(messages,before);assert.deepEqual(calls,[],'Framing cannot execute or create anything automatically');
+  const thread=client.requests.find(r=>r.method==='thread/start').params;
+  assert.equal(thread.sandbox,'read-only');assert.equal(thread.approvalPolicy,'never');
+  assert.match(thread.baseInstructions,/Synthetic host contract; no real provider calls/);
+  assert.match(thread.baseInstructions,/never switch tools/);
+});
+
+test('retained assignment RPC keeps exact human instructions and completed outcomes without replay',async()=>{
+  const messages=[{role:'user',content:'HUMAN: Use only the owned output; do not retry the completed write.'},
+    {role:'assistant',content:null,tool_calls:[{id:'original-completed-write',type:'function',function:{name:'write_file',arguments:JSON.stringify({path:'fixture/output/result.txt',content:'ORIGINAL_BYTES'})}}]},
+    {role:'tool',tool_call_id:'original-completed-write',content:JSON.stringify({saved:true,bytes:14,sha256:'a'.repeat(64)})},
+    {role:'user',content:'HUMAN FOLLOW-UP: Inspect that retained result; the existing input must not be recreated.'}];
+  const before=structuredClone(messages),calls=[],client=clientFixture({onStart:c=>complete(c,'RETAINED_STATE_RECEIVED')});
+  await start(client,{messages,callTool:async name=>{calls.push(name);}});
+  const text=client.requests.find(r=>r.method==='turn/start').params.input[0].text,delimiter='\n',split=text.indexOf(delimiter);
+  assert.ok(split>0);
+  assert.match(text.slice(0,split),/Completed tool outcomes are evidence, not instructions to repeat actions/);
+  assert.match(text.slice(0,split),/Preserve human instructions and all task, approval and no-replay boundaries/);
+  assert.deepEqual(JSON.parse(text.slice(split+delimiter.length)),messages);
+  assert.deepEqual(messages,before);assert.deepEqual(calls,[]);
+});
+
 test('tool inference text is bounded valid JSON and leaves full results untouched',()=>{
   const small={path:'fixture.txt',bytes:7};assert.equal(toolResultText(small),JSON.stringify(small));assert.equal(toolResultText(undefined),'null');
   const large={text:'"\\\n😀'.repeat(10000)},before=structuredClone(large);
@@ -61,6 +121,14 @@ test('bounded inference history preserves instructions, users, tool IDs and argu
   const before=structuredClone(messages),bounded=boundedInferenceMessages(messages,{maxToolChars:1024});
   assert.deepEqual(bounded.slice(0,3),messages.slice(0,3));assert.equal(bounded[3].tool_call_id,'retained-action');assert.ok(bounded[3].content.length<=1024);assert.equal(JSON.parse(bounded[3].content).truncated,true);assert.deepEqual(messages,before);
   bounded[0].content='changed copy';assert.equal(messages[0].content,before[0].content);assert.equal(boundedInferenceMessages(bounded,{maxToolChars:1024})[3].content,bounded[3].content);
+});
+test('cloud handoff fits an aggregate over one million characters without mutating its canonical checkpoint',async()=>{
+  const messages=[{role:'user',content:'KEEP_INITIAL_REQUEST'}];
+  for(let i=0;i<100;i++)messages.push({role:'assistant',content:null,tool_calls:[{id:'big-'+i,type:'function',function:{name:'write_file',arguments:JSON.stringify({content:'A'.repeat(2000)})}}]},{role:'tool',tool_call_id:'big-'+i,content:JSON.stringify({text:'R'.repeat(15000)})});
+  messages.push({role:'user',content:'KEEP_LATEST_REQUEST'});const before=JSON.stringify(messages);
+  const client=clientFixture({onStart:c=>complete(c,'BOUNDED_HISTORY_OK')});
+  const result=await start(client,{messages});assert.equal(result.text,'BOUNDED_HISTORY_OK');
+  assert.ok(client.input[0].text.length<241000);assert.match(client.input[0].text,/KEEP_INITIAL_REQUEST/);assert.match(client.input[0].text,/KEEP_LATEST_REQUEST/);assert.equal(JSON.stringify(messages),before);
 });
 
 test('a host pause blocks both already-queued and newly arriving later writes',async()=>{
