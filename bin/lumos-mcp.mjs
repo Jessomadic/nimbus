@@ -27,9 +27,11 @@ if(Number.isSafeInteger(botId)&&botId>0)hermes.memory={command:PY,args:['-B','F:
 // Desktop control, as Hermes's computer_use toolset: the same cua-driver binary
 // over MCP stdio, with its anonymous telemetry turned off.
 hermes.computer={command:'F:/Projects/Lumos/HermesPilot/home/tools/cua-driver-0.21.0-win32-x64/cua-driver.exe',args:['mcp'],env:{CUA_DRIVER_RS_TELEMETRY_ENABLED:'0'},timeout:60};
+// Keyless web search (Hermes used ddgs): integration/lumos-web-search on the Hermes runtime venv.
+hermes['web-search']={command:'F:/Projects/Lumos/HermesPilot/home/installs/197ef5a7e9425972/environments/06e28757f5964e7d872bb45914df9450/venv/Scripts/python.exe',args:['-B','F:/Nimbus/integration/lumos-web-search/server.py'],cwd:'F:/Nimbus/integration/lumos-web-search'};
 // Only these driver tools are offered (Hermes exposed a similar curated set).
 const ALLOW={'lumos-computer':['list_apps','list_windows','get_window_state','get_desktop_state','get_screen_size','get_cursor_position','get_accessibility_tree','zoom','verify_state','click','double_click','right_click','drag','type_text','press_key','hotkey','set_value','scroll','move_cursor','bring_to_front','launch_app']};
-const EFFECTS={'lumos-memory':{memory:'write',fact_store:'write',fact_feedback:'write',session_search:'read'}};
+const EFFECTS={'lumos-web-search':{web_search:'read'},'lumos-memory':{memory:'write',fact_store:'write',fact_feedback:'write',session_search:'read'}};
 for(const [name,d] of Object.entries(hermes)){
   if(SKIP[name]||d.url){report.push({name,skipped:SKIP[name]||'remote server'});continue;}
   const def={enabled:true,command:d.command,args:(d.args||[]).map(String),...(d.cwd?{cwd:String(d.cwd)}:{}),initTimeoutMs:Math.min(120000,Math.max(30000,(d.timeout||30)*1000)),
