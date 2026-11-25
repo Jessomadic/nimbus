@@ -16,6 +16,9 @@ export const LUMOS_DEFAULTS={
   schedulesEnabled:false,
   python:'',
   topicTimeoutSeconds:12,
+  reviewerBotId:null,
+  validatorBotId:null,
+  reviewEvery:3,
 };
 const loopback=(value,label)=>{
   let url;try{url=new URL(value);}catch{throw new Error(`Invalid Lumos ${label}`);}

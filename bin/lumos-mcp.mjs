@@ -28,7 +28,9 @@ const EFFECTS={'lumos-memory':{memory:'write',fact_store:'write',fact_feedback:'
 for(const [name,d] of Object.entries(hermes)){
   if(SKIP[name]||d.url){report.push({name,skipped:SKIP[name]||'remote server'});continue;}
   const def={enabled:true,command:d.command,args:(d.args||[]).map(String),...(d.cwd?{cwd:String(d.cwd)}:{}),initTimeoutMs:Math.min(120000,Math.max(30000,(d.timeout||30)*1000)),
-    env:{PYTHONDONTWRITEBYTECODE:'1',...Object.fromEntries(Object.entries(d.env||{}).map(([k,v])=>[k,String(v)]))},scope:{allow:{groups:['lumos']}}};
+    env:{PYTHONDONTWRITEBYTECODE:'1',...Object.fromEntries(Object.entries(d.env||{}).map(([k,v])=>[k,String(v)]))},
+    // The memory validator may use lumos-memory and nothing else.
+    scope:name==='memory'&&config().lumos.validatorBotId?{allow:{groups:['lumos'],workerIds:[config().lumos.validatorBotId]}}:{allow:{groups:['lumos']}}};
   let tools=[];
   const client=new Client({name:'nimbus-lumos-mcp-review',version:'1'});
   try{

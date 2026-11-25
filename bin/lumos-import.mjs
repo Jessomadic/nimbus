@@ -48,6 +48,10 @@ ${body.trim()}
 ## Nimbus notes
 - Your final answer is sent to Jesse as iMessage bubbles automatically (one bubble per paragraph). Use openbubbles_operation only for files (kind "attachments" with files:[{path}]), reactions, typing, edits, unsends or effects.
 - Do not ask questions through other channels; ask in your reply.
+- Voice memos and audio arrive as files: transcribe them with transcribe_local_audio (rich-tools) before answering. Images: inspect them with view_image.
+- Reminders and follow-up checks: use lumos_reminder (kind "message" for a reminder text, kind "task" for a check you should run later and report).
+- Web: research_search and research_fetch replace web_search and web_extract; code_search replaces search_files.
+- You may create or improve your own skills by editing files under the skills folder in your Lumos home with write_file or apply_patch, as skill_manage did in Hermes. Keep each skill's SKILL.md frontmatter.
 - Long work can be handed to Nimbus workers with ask_worker; keep Jesse informed in your reply.
 - Your long-term memory tools are memory, fact_store and fact_feedback (the lumos-memory connector). Save durable facts and preferences there.
 - Your Hermes skills are listed by the skills tool; skills-review.json in your Lumos home classifies each one. "ready": follow it. "adapt" or "review": follow its guidance with Nimbus tools after checking that the tools or commands it names exist here, translating Hermes tool names (terminal→shell, skill_view→read_file, web_extract→browser, vision→view_image); never run its scripts unchanged when they assume Hermes paths or tools. "unavailable": needs a Mac; do not use it.

@@ -16,15 +16,15 @@ const guid=n=>`aaaaaaaa-bbbb-4ccc-8ddd-${String(n).padStart(12,'0')}`;
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 
 async function listen(handler){const server=http.createServer(handler);await new Promise(r=>server.listen(0,'127.0.0.1',r));return {server,url:'http://127.0.0.1:'+server.address().port,close:()=>new Promise(r=>server.close(r))};}
-async function fixture(t,{enabled=true,bridgeFails=false,memory}={}){
+async function fixture(t,{enabled=true,bridgeFails=false,memory,review=false}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'nimbus-lumos-'));
   const db=new DatabaseSync(':memory:');
-  db.exec(`CREATE TABLE bots(id INTEGER PRIMARY KEY,name TEXT,tools TEXT,template TEXT);
+  db.exec(`CREATE TABLE bots(id INTEGER PRIMARY KEY,name TEXT,tools TEXT,template TEXT,model TEXT);
 CREATE TABLE rooms(id INTEGER PRIMARY KEY,name TEXT,lead_bot_id INTEGER,bots_can_talk INTEGER);
 CREATE TABLE room_members(room_id INTEGER,bot_id INTEGER);
-CREATE TABLE runs(id INTEGER PRIMARY KEY,bot_id INTEGER,thread TEXT,prompt TEXT,status TEXT,source TEXT,parent_run INTEGER,last_error TEXT,origin_request_id TEXT);
+CREATE TABLE runs(id INTEGER PRIMARY KEY,bot_id INTEGER,thread TEXT,prompt TEXT,status TEXT,source TEXT,parent_run INTEGER,last_error TEXT,origin_request_id TEXT,actual_model TEXT);
 CREATE TABLE messages(id INTEGER PRIMARY KEY,thread TEXT,author TEXT,kind TEXT,body TEXT,run_id INTEGER);`);
-  db.prepare("INSERT INTO bots VALUES(7,'Lumos',?,NULL)").run(JSON.stringify(['openbubbles_operation']));
+  db.prepare("INSERT INTO bots VALUES(7,'Lumos',?,NULL,'auto')").run(JSON.stringify(['openbubbles_operation']));
   const sent=[],completed=[],reads=[];let n=0;
   const bridge=await listen((req,res)=>{
     let raw='';req.on('data',c=>raw+=c);req.on('end',()=>{
@@ -38,11 +38,12 @@ CREATE TABLE messages(id INTEGER PRIMARY KEY,thread TEXT,author TEXT,kind TEXT,b
     });
   });
   const relay=await listen((req,res)=>{let raw='';req.on('data',c=>raw+=c);req.on('end',()=>{completed.push({...JSON.parse(raw),token:req.headers['x-lumos-relay-token']});res.writeHead(200);res.end('{}');});});
-  const config={lumos:{...LUMOS_DEFAULTS,enabled,botId:7,homeDir:dir,ingressPort:0,bridgeUrl:bridge.url,completeUrl:relay.url+'/complete',topicTimeoutSeconds:2}};
+  if(review){db.prepare("INSERT INTO bots VALUES(8,'Lumos memory reviewer','[]',NULL,'claude-sonnet')").run();db.prepare("INSERT INTO bots VALUES(9,'Lumos memory validator','[]',NULL,'terra')").run();}
+  const config={lumos:{...LUMOS_DEFAULTS,...(review?{reviewerBotId:8,validatorBotId:9}:{}),enabled,botId:7,homeDir:dir,ingressPort:0,bridgeUrl:bridge.url,completeUrl:relay.url+'/complete',topicTimeoutSeconds:2}};
   const runs=[];let classify=async()=>JSON.stringify({target:'CURRENT'});
   const lumos=createLumos({db,getConfig:()=>config,loadRoute:()=>({chat:CHAT,owner:OWNER,bot:BOT,token:TOKEN}),dataDir:dir,parseBot:b=>b,stopRun:id=>db.prepare("UPDATE runs SET status='stopped' WHERE id=?").run(id),
     insertRun:a=>Number(db.prepare("INSERT INTO runs(bot_id,thread,prompt,status,source,origin_request_id) VALUES(?,?,?,'queued',?,?)").run(a.botId,a.thread,a.prompt,a.source,a.originRequestId).lastInsertRowid),
-    enqueue:id=>runs.push(id),classify:(s,p)=>classify(s,p),...(memory?{memory}:{}),log:{error(){}},clock:{setInterval:()=>({unref(){}}),clearInterval(){}}});
+    enqueue:id=>runs.push(id),classify:(s,p)=>classify(s,p),planTiers:async()=>['terra','claude-sonnet','claude-opus'],...(memory?{memory}:{}),log:{error(){}},clock:{setInterval:()=>({unref(){}}),clearInterval(){}}});
   // Use a fixed port-0 listener: start() with port 0 binds an ephemeral port.
   await lumos.start();
   t.after(async()=>{await lumos.stop();await bridge.close();await relay.close();});
@@ -194,4 +195,60 @@ test('each turn gets remembered facts and the owner message is offered for learn
   assert.match(run.prompt,/Remembered facts that may be relevant[^]*oat-milk lattes/);
   f.finishRun(run.id,'done','Ordered.');await settle(f);
   assert.deepEqual(extracted,[[{role:'user',content:'Order my usual coffee'}]]);
+});
+
+test('reminders: a message fires once, a task becomes a Lumos run whose answer is delivered, cancel and list work',async t=>{
+  const f=await fixture(t);
+  f.post(f.webhook(1,'remind me later'));await settle(f);
+  const origin=f.db.prepare('SELECT * FROM runs').get();
+  assert.throws(()=>f.lumos.reminder({id:99},{action:'list'},origin.id),/only available to Lumos/);
+  assert.throws(()=>f.lumos.reminder({id:7},{action:'create',text:'x',at:'2000-01-01T00:00:00Z'},origin.id),/in the past/);
+  const soon=new Date(Date.now()+1500).toISOString();
+  const msg=f.lumos.reminder({id:7},{action:'create',kind:'message',text:'Get the Plaid credentials.',at:soon},origin.id);
+  const task=f.lumos.reminder({id:7},{action:'create',kind:'task',text:'Check whether the English audio is available.',at:soon},origin.id);
+  const later=f.lumos.reminder({id:7},{action:'create',kind:'message',text:'never',at:new Date(Date.now()+3600e3).toISOString()},origin.id);
+  assert.equal(f.lumos.reminder({id:7},{action:'list'},origin.id).reminders.length,3);
+  assert.deepEqual(f.lumos.reminder({id:7},{action:'cancel',id:later.created},origin.id),{cancelled:later.created});
+  await wait(1600);await f.lumos.fireReminders();await f.lumos.fireReminders();
+  assert.deepEqual(f.sent.map(s=>s.message),['Get the Plaid credentials.']);
+  const runs=f.db.prepare("SELECT * FROM runs WHERE origin_request_id LIKE 'lumos-reminder:%'").all();
+  assert.equal(runs.length,1);assert.equal(runs[0].thread,origin.thread,'task runs in the topic it came from');
+  assert.match(runs[0].prompt,/Check whether the English audio/);
+  f.finishRun(runs[0].id,'done','The English audio is out.');await settle(f);
+  assert.equal(f.sent.at(-1).message,'The English audio is out.');
+  assert.ok(!f.completed.some(c=>String(c.guid).startsWith('reminder:')),'reminders never touch the relay ledger');
+  assert.deepEqual(f.db.prepare("SELECT state FROM lumos_reminders ORDER BY created_at,id").all().map(r=>r.state).sort(),['cancelled','done','done']);
+  void msg;void task;
+});
+
+test('iMessage /model, /resume and /help run without a model and respect the plans',async t=>{
+  const f=await fixture(t);
+  f.post(f.webhook(1,'/model claude-fable'));f.post(f.webhook(2,'/model claude-opus'));f.post(f.webhook(3,'/help'));await settle(f);
+  assert.match(f.sent[0].message,/not available on your plans/);assert.match(f.sent[1].message,/pinned to claude-opus/);assert.ok(f.sent[2].message.includes('/resume'));
+  assert.equal(f.db.prepare('SELECT model FROM bots WHERE id=7').get().model,'claude-opus');
+  f.post(f.webhook(4,'Plan my trip to Ohio'));await settle(f);
+  f.setClassify(async()=>JSON.stringify({target:'NEW',label:'Fix the printer'}));
+  f.post(f.webhook(5,'Fix the printer'));await settle(f);
+  f.post(f.webhook(6,'/resume'));await settle(f);
+  assert.ok(f.sent.at(-1).message.includes('1. Fix the printer (current)\n2. Plan my trip'),f.sent.at(-1).message);
+  f.post(f.webhook(7,'/resume 2'));await settle(f);
+  assert.match(f.sent.at(-1).message,/Switched to: Plan my trip/);
+  assert.equal(f.runs.length,2,'commands never start runs');
+});
+
+test('every third reply starts a quiet review: proposals go to a validator on a different model, nothing goes to Jesse',async t=>{
+  const f=await fixture(t,{review:true});
+  for(let n=1;n<=3;n++){f.post(f.webhook(n,'I always want metric units, turn '+n));await settle(f);
+    const run=f.db.prepare('SELECT id FROM runs WHERE bot_id=7 ORDER BY id DESC').get();f.finishRun(run.id,'done','Noted '+n);await settle(f);}
+  const reviewer=f.db.prepare('SELECT * FROM runs WHERE bot_id=8').get();
+  assert.ok(reviewer,'reviewer run started');assert.equal(reviewer.source,'schedule');assert.match(reviewer.prompt,/metric units, turn 3/);
+  f.db.prepare("UPDATE runs SET actual_model='claude-sonnet-5-5' WHERE id=?").run(reviewer.id);
+  f.finishRun(reviewer.id,'done','{"proposals":[{"target":"user","content":"Prefers metric units","category":"user_pref","evidence":"I always want metric units"}]}');
+  await settle(f);
+  const validator=f.db.prepare('SELECT * FROM runs WHERE bot_id=9').get();
+  assert.ok(validator,'validator run started');assert.match(validator.prompt,/Prefers metric units/);
+  assert.equal(f.db.prepare('SELECT model FROM bots WHERE id=9').get().model,'terra','validator pinned to a different model than the Claude reviewer');
+  f.db.prepare("UPDATE runs SET actual_model='gpt-5.6-terra' WHERE id=?").run(validator.id);f.finishRun(validator.id,'done','accepted');await settle(f);
+  assert.equal(f.db.prepare('SELECT state FROM lumos_reviews').get().state,'done');
+  assert.equal(f.sent.length,3,'review sends nothing to Jesse');
 });

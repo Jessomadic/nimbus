@@ -23,6 +23,7 @@ import {configureBranchHost,enqueueCommittedRun} from './runner.js';
 import {compactConversation} from './runtime/compact.js';
 import {isLocalSlash,runLocalSlash} from './runtime/slash.js';
 import {createLumos} from './runtime/lumos.js';
+import {setLumos} from './runtime/lumos-registry.js';
 import {createLumosSchedules} from './runtime/lumos-schedules.js';
 import {loadLumosRoute} from './runtime/lumos-config.js';
 import {insertQueuedRun} from './runtime/run-create.js';
@@ -846,6 +847,7 @@ for(const endpoint of ['create','tick'])route('POST','/private/scheduler/'+endpo
 const lumos=createLumos({db,getConfig:config,loadRoute:l=>loadLumosRoute(l),dataDir:DATA_DIR,parseBot,stopRun,
   insertRun:args=>insertQueuedRun(db,args,redact),enqueue:runId=>enqueueCommittedRun(runId),
   memory:lumosMemoryHooks(),
+  planTiers:async()=>{const [openai,claude]=await Promise.all([cloudStatus(),claudeStatus()]);return [...(openai.subscription?openaiCatalogTiers(openai,config()):[]),...(claude.ok?claude.allowedTiers||[]:[])];},
   classify:async(system,prompt)=>{
     const c=config();
     if(c.local.enabled)return (await localChat([{role:'system',content:system},{role:'user',content:prompt}],{c})).message.content;
@@ -857,6 +859,7 @@ const lumosSchedules=createLumosSchedules({db,getConfig:config,send:async(text,t
   const response=await fetch(l.bridgeUrl+'/api/v1/message/text',{method:'POST',headers:{authorization:'Bearer '+r.token,'content-type':'application/json'},body:JSON.stringify({chatGuid:r.chat,message:text.slice(0,3900),tempGuid})});
   const ack=await response.json().catch(()=>({}));if(!response.ok||ack.status!==200)throw new Error('Bridge did not confirm the scheduled message');
 }});
+setLumos(lumos);
 lumos.start().catch(error=>console.error('Lumos listener did not start:',error.message));
 lumosSchedules.start();
 route('GET','/api/lumos/status',(req,res)=>json(res,200,{...lumos.status(),schedules:lumosSchedules.list(),schedulesEnabled:config().lumos.schedulesEnabled}));
@@ -882,7 +885,7 @@ function setupLumosWorker(){
   if(!fs.existsSync(pointer))throw new Error('Import Lumos state first (bin/lumos-import.mjs)');
   const home=JSON.parse(fs.readFileSync(pointer,'utf8')).path;
   const persona=fs.readFileSync(path.join(home,'persona','LUMOS.md'),'utf8');
-  const tools=JSON.stringify([...new Set(['shell','exec_command','write_stdin','apply_patch','read_file','write_file','list_files','view_image','skills','update_plan','capabilities','request_tool','tool_request_status','browser','shared_note','ask_worker','memory_recall','openbubbles_operation'])].filter(n=>coreTools.some(t=>t.function.name===n)));
+  const tools=JSON.stringify([...new Set(['shell','exec_command','write_stdin','apply_patch','read_file','write_file','list_files','view_image','skills','update_plan','capabilities','request_tool','tool_request_status','browser','shared_note','ask_worker','memory_recall','openbubbles_operation','lumos_reminder','code_search','research_search','research_fetch','scholar_search','knowledge_search','project_map','file_manifest'])].filter(n=>coreTools.some(t=>t.function.name===n)));
   const role='Personal assistant for Jesse over iMessage: research, writing, scheduling, media and PC operations';
   let id=config().lumos.botId;
   if(id&&q('SELECT id FROM bots WHERE id=?').get(id))q('UPDATE bots SET name=?,role=?,instructions=?,tools=?,approval_rules=?,default_model=? WHERE id=?').run('Lumos',role,persona,tools,'[]','claude-sonnet',id);
@@ -896,8 +899,18 @@ function setupLumosWorker(){
   let jobs=[];try{jobs=JSON.parse(fs.readFileSync(path.join(home,'schedules.json'),'utf8'));}catch{}
   for(const job of jobs)lumosSchedules.upsert({...job,enabled:false});
   writeLumosSkillsReview(home);
+  // Quiet memory review: a reviewer with no tools and a validator that may only
+  // use lumos-memory (scoped by bin/lumos-mcp.mjs). Different models by design.
+  const helper=(key,name,role,model,instructions)=>{
+    let hid=config().lumos[key];
+    if(hid&&q('SELECT id FROM bots WHERE id=?').get(hid))q('UPDATE bots SET name=?,role=?,instructions=?,tools=?,approval_rules=?,model=?,default_model=? WHERE id=?').run(name,role,instructions,'[]','[]',model,model,hid);
+    else hid=Number(q("INSERT INTO bots (name, role, instructions, color, effort, shape, approval_rules, model, default_model, tools) VALUES (?,?,?,?,?,?,?,?,?,?)").run(name,role,instructions,'#b8c4d8','medium','blob','[]',model,model,'[]').lastInsertRowid);
+    writeBotBrief(parseBot(q('SELECT * FROM bots WHERE id=?').get(hid)));return hid;
+  };
+  const reviewerBotId=helper('reviewerBotId','Lumos memory reviewer','Quietly proposes durable memory updates from recent Lumos conversations','claude-sonnet','Propose memory updates only as JSON. Never message anyone. Never call tools.');
+  const validatorBotId=helper('validatorBotId','Lumos memory validator','Independently checks proposed Lumos memory updates and applies only supported ones','terra','Validate proposals strictly against the supplied exchanges. Apply accepted ones only with the Lumos memory tools. Never message anyone.');
   broadcast('state_changed',{});
-  return {botId:id,homeDir:home};
+  return {botId:id,homeDir:home,reviewerBotId,validatorBotId};
 }
 // Classify every imported Hermes skill so Lumos (and the Skills team) know which
 // can be followed as-is, which need Hermes tool names translated, and which need review.

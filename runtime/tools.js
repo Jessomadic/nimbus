@@ -5,6 +5,7 @@ import {conversationToolDefinitions,conversationToolError} from './delegation-sc
 import {readWorkerFile} from './file-read.js';
 import {missingPathGuidance} from './read-guidance.js';
 import {dispatchOpenBubbles,isHostAuthority} from './openbubbles-dispatch.js';
+import {getLumos} from './lumos-registry.js';
 import path from 'node:path';
 import { DATA_DIR, botDir, q } from '../db.js';
 import { config, configIdentity, ROOT } from './config.js';
@@ -35,6 +36,7 @@ export const coreTools = [
  {type:'function',function:{name:'memory_recall',description:'Read copied historical untrusted memory; get exact ID or substring search/recall, with citations and paging. Not ranked search.',parameters:{type:'object',properties:{surface:{type:'string',enum:['brain','archive','sessions','relationships','chunks','topics','attachments','attachment']},operation:{type:'string',enum:['recall','search','get']},query:text,id:text,sessionId:text,role:text,offset:{type:'integer'},limit:{type:'integer'},textOffset:{type:'integer'},textLimit:{type:'integer'}},required:['surface'],additionalProperties:false,allOf:[{if:{properties:{operation:{const:'get'}},required:['operation']},then:{required:['id']},else:{required:['query']}}]}}},
 
   spec('openbubbles_operation','iMessage actions for the owner’s current Lumos conversation only (available only in Lumos runs). Your final answer is sent automatically; use this for files (kind attachments, files:[{path}] for up to 4 local files of at most 25 MB: images, video, audio, PDF or text), reactions, typing, read receipts, edits, unsends or effects. Each call needs a new operationId. Sends are never repeated automatically.',{operationId:text,kind:{type:'string',enum:['text','attachments','reaction','typing','read','edit','unsend']},text,files:{type:'array'},active:{type:'boolean'},targetGuid:text,reaction:text,replyToMessageGuid:text,replyPartIndex:{type:'integer'},partIndex:{type:'integer'},effect:text},['operationId','kind']),
+  spec('lumos_reminder','Lumos only: schedule, list or cancel reminders for Jesse over iMessage. kind "message" sends your text at that time; kind "task" runs your text as a new request then and sends the answer (for follow-up checks). Give at (date and time with offset, e.g. 2026-11-26T09:00:00-05:00) for once, or cron (minute hour day month weekday, local time) to repeat.',{action:{type:'string',enum:['create','list','cancel']},kind:{type:'string',enum:['message','task']},text,at:text,cron:text,id:text},['action']),
   spec('request_tool','Report a genuinely missing reusable capability and request Nimbus agents to design, build, test and review a native tool. Inspect the catalogue first. Existing disabled tools, denied approvals, credentials, dependencies and outages are setup gaps, not reasons to build around restrictions. The host parks this task and publishes progress to its original source, resuming only after verified deployment.',
     {title:text,toolName:text,capability:text,domain:{type:'string',enum:['engineering','data','research','browser','operations','content']},acceptanceCriteria:{type:'array',minItems:1,maxItems:20,items:text},gapType:{type:'string',enum:['missing_tool','missing_connector','missing_credentials','missing_dependency','permission_denied','service_unavailable']},effects:{type:'string',enum:['read','local_write','host_execute','external_write']}},['title','toolName','capability','acceptanceCriteria']),
   spec('tool_request_status','Read status, assigned agents and verification for tool-development requests connected to your task. Does not build, approve, install or replay work.',{requestId:text}),
@@ -122,6 +124,7 @@ export async function executeTool(bot, name, args, { signal, bindings, askWorker
   }
   if(name==='send_child_context'){if(bot.template!=='orchestrator'||!sendChildContext)throw new Error('Owned coordinator context callback unavailable');return sendChildContext(args);}
   if(name==='openbubbles_operation')return dispatchOpenBubbles(bot,args,{runId,signal,openBubblesAuthority});
+  if(name==='lumos_reminder'){const lumos=getLumos();if(!lumos)throw new Error('Lumos is not running');return lumos.reminder(bot,args,runId);}
   if (bindings?.has(name)) {
     const binding = bindings.get(name);
     return invokeConnector(binding,bot.id,args,{signal});
