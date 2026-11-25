@@ -19,12 +19,15 @@ export const defaults = {
   version: 1,
   cloud: { enabled: true, codexBin: 'auto', maxConcurrent: 3,
     models: { luna: 'auto', terra: 'auto', sol: 'auto', astra: 'auto' } },
+  // Claude subscription through Claude Code, used beside Codex (never instead of it).
+  claude: { enabled: true, bin: 'auto', maxConcurrent: 2, disabledTiers: [],
+    models: { 'claude-haiku': 'auto', 'claude-sonnet': 'auto', 'claude-opus': 'auto', 'claude-fable': 'auto' } },
   local: { enabled: true, baseUrl: 'http://127.0.0.1:12438/v1', model: 'nimbus-local',
     approvedModels: ['nimbus-local', 'lumos-emergency-gemma', 'hermes-pilot-qwen'], reuseLoaded:true,
     managed:{enabled:true,lmsBin:'lms',modelKey:'google/gemma-4-e4b',gpuRatio:0.2,forecastGpuMB:6500,forecastRamMB:15625,upstreamUrl:'http://127.0.0.1:1234/v1'},
     contextTokens: 131072, maxConcurrent: 1, resourceCeiling: 90, timeoutSeconds: 240,
     tokenEnv: 'NIMBUS_LOCAL_TOKEN', tokenDpapiFile: '', healthUrl: 'http://127.0.0.1:12438/health' },
-  routing: { routerModel: '', cloudFallbackTier:'luna', maxAttempts: 3, localWaitSeconds: 300 },
+  routing: { routerModel: '', cloudFallbackTier:'luna', maxAttempts: 4, localWaitSeconds: 300, providerRanking: {} },
   workers: { maxConcurrent: 4, executionMode: 'bounded', maxSteps: 32, timeoutMinutes: 45, approvalPollMs: 500, permissionMode: 'rules' },
   toolDevelopment: { maxAutomaticContinuations: 3, maxAutomaticRepairs: 2 },
   context: { automaticCompression: true, maxHistoryChars: 240000, maxToolChars: 12000 },
@@ -62,6 +65,12 @@ export function validateConfig(c) {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid local inference URL');
   if (!Object.keys(c.cloud.models).every(k => ['luna', 'terra', 'sol', 'astra'].includes(k))) throw new Error('Unknown model tier');
   if(!['luna','terra','sol','astra'].includes(c.routing.cloudFallbackTier))throw new Error('Invalid cloud fallback tier');
+  if(typeof c.claude?.enabled!=='boolean')throw new Error('Claude enabled must be a boolean');
+  if(!Number.isInteger(c.claude.maxConcurrent)||c.claude.maxConcurrent<1||c.claude.maxConcurrent>16)throw new Error('Invalid Claude concurrency');
+  const claudeTiers=['claude-haiku','claude-sonnet','claude-opus','claude-fable'];
+  if(!Object.keys(c.claude.models||{}).every(k=>claudeTiers.includes(k))||!Array.isArray(c.claude.disabledTiers)||c.claude.disabledTiers.some(t=>!claudeTiers.includes(t)))throw new Error('Unknown Claude model tier');
+  const rankable=['luna','terra','sol','astra',...claudeTiers];
+  for(const [category,order] of Object.entries(c.routing.providerRanking||{}))if(!Array.isArray(order)||order.some(t=>!rankable.includes(t)))throw new Error(`Invalid provider ranking for ${category}`);
   if(!Array.isArray(c.local.approvedModels)||c.local.approvedModels.some(m=>typeof m!=='string'))throw new Error('Invalid local model allowlist');
   return c;
 }

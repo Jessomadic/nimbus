@@ -21,6 +21,8 @@ import { config, saveConfig, ROOT } from './runtime/config.js';
 import {BranchHostSnapshot,branchHostApi} from './runtime/branch-host-snapshot.js';
 import {configureBranchHost,enqueueCommittedRun} from './runner.js';
 import {compactConversation} from './runtime/compact.js';
+import {isLocalSlash,runLocalSlash} from './runtime/slash.js';
+import {claudeStatus} from './runtime/claude.js';
 import { cloudStatus, CodexClient } from './runtime/codex.js';
 import { localCatalog } from './runtime/local.js';
 import { resources } from './runtime/resources.js';
@@ -126,6 +128,18 @@ function state(req) {
 
 function postToThread(thread, text, files = [], mode='context') {
   if(!/^(bot|room):\d+$/.test(thread))throw Object.assign(new Error('Unknown chat'),{statusCode:400});
+  if(thread.startsWith('bot:')&&isLocalSlash(text)){
+    if(files.length)throw Object.assign(new Error('Send slash commands without attachments.'),{statusCode:400});
+    const bot=parseBot(q('SELECT * FROM bots WHERE id=?').get(Number(thread.slice(4))));
+    if(!bot)throw Object.assign(new Error('Unknown worker'),{statusCode:404});
+    const message=addMessage(thread,'user','text',text);
+    // The reply is posted after the request transaction commits; no model turn starts.
+    setImmediate(()=>runLocalSlash(text,{query:q,bot,thread,dataDir:DATA_DIR,settings:config().context,stopRun,
+      providerStatus:async()=>{const [openai,claude]=await Promise.all([cloudStatus(),claudeStatus()]);return {openai:{...openai,ok:openai.subscription},claude};}})
+      .then(note=>{addMessage(thread,'system','note',note);broadcast('state_changed',{});},
+        error=>{try{addMessage(thread,'system','error',error.message);}catch{}}));
+    return message;
+  }
   if(/^\/compact\s*$/i.test(text)){
     if(files.length)throw Object.assign(new Error('Send /compact without attachments.'),{statusCode:400});
     const result=compactConversation({query:q,botId:Number(thread.slice(4)),thread,dataDir:DATA_DIR,settings:config().context});
@@ -303,11 +317,11 @@ function cleanBot(b) {
   const out = {};
   if(Object.hasOwn(b,'display_group'))out.display_group=validateDisplayGroup(b.display_group);
   for (const k of ['name', 'role', 'instructions', 'color', 'model', 'default_model', 'shape', 'runtime', 'template']) if (b[k] !== undefined) out[k] = String(b[k]);
-  if(b.default_model!==undefined&&!['','local','luna','terra','sol','astra'].includes(b.default_model))throw new Error('Invalid role model preference');
+  if(b.default_model!==undefined&&!['','local','luna','terra','sol','astra','claude-haiku','claude-sonnet','claude-opus','claude-fable'].includes(b.default_model))throw new Error('Invalid role model preference');
   if(b.template!==undefined&&b.template!==''&&!TEMPLATES.some(t=>t.id===b.template))throw new Error('Unknown specialist profile');
   if(b.parent_bot_id!==undefined){const parent=b.parent_bot_id==null||b.parent_bot_id===''?null:Number(b.parent_bot_id);if(parent!==null&&(!Number.isSafeInteger(parent)||parent<=0))throw new Error('Invalid parent worker');out.parent_bot_id=parent;}
-  if (b.model !== undefined && !['', 'auto', 'local', 'luna', 'terra', 'sol', 'astra'].includes(b.model)) throw new Error('Choose Auto, Local, Luna, Terra, Sol or Astra');
-  if (b.runtime !== undefined && !['auto', 'local', 'luna', 'terra', 'sol', 'astra'].includes(b.runtime)) throw new Error('Invalid worker runtime');
+  if (b.model !== undefined && !['', 'auto', 'local', 'luna', 'terra', 'sol', 'astra', 'claude-haiku','claude-sonnet','claude-opus','claude-fable'].includes(b.model)) throw new Error('Choose Auto, Local, an OpenAI tier or a Claude tier');
+  if (b.runtime !== undefined && !['auto', 'local', 'luna', 'terra', 'sol', 'astra', 'claude-haiku','claude-sonnet','claude-opus','claude-fable'].includes(b.runtime)) throw new Error('Invalid worker runtime');
   if (b.tools !== undefined) { if (!Array.isArray(b.tools) || b.tools.some(n => !coreTools.some(t => t.function.name === n))) throw new Error('Invalid tool selection'); out.tools = JSON.stringify(b.tools); }
   if (b.effort !== undefined) { if (!EFFORTS.includes(b.effort)) throw new Error('bad effort'); out.effort = b.effort; }
   for (const k of ['approval_rules', 'allow_rules']) if (b[k] !== undefined) out[k] = JSON.stringify((b[k] || []).map(String).filter(Boolean));

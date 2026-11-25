@@ -81,6 +81,10 @@ When OpenAI is unavailable or exhausted, tasks use local capacity. When local ad
 
 Changing a local/cloud route preserves canonical task history and completed tool results. An action whose outcome is uncertain is held for review. Restarted active tasks are interrupted, not automatically replayed. Queued tasks survive restart.
 
+### Claude subscription
+
+Workers can also run on a Claude subscription through Claude Code, beside the OpenAI subscription (which is unchanged). Connect it in **Settings → Claude subscription** with a token from `claude setup-token`, or use the machine's `claude` login. With both connected, each task goes to the model ranked best for the worker's role and falls back to the next best. See [docs/CLAUDE-SUBSCRIPTION.md](docs/CLAUDE-SUBSCRIPTION.md) for the ranking, its evidence, the local chat commands (`/model`, `/effort`, `/providers`, `/usage`, `/context`, `/stop`, `/rename`) and the Codex memory and skill import (`node bin/import-codex.mjs`).
+
 ## Tools and browser groups
 
 Both local and cloud routes use Nimbus's own shell, files, shared notes, worker handoffs, browser and configured MCP tool layer. Cloud inference runs through Codex app-server with native side-effect tools disabled and a read-only native sandbox; Nimbus executes and journals the permitted dynamic tools.

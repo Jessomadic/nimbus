@@ -8,6 +8,7 @@ import { imageData, retainedImages } from './workbench.js';
 import {inferenceView,toolResultText} from './inference-context.js';
 import {codexRuntime} from './codex-runtime.js';
 import {HOST_EXECUTION_BOUNDARY} from './prompts.js';
+import {dynamicToolNames} from './tool-names.js';
 
 export class CodexClient extends EventEmitter {
   constructor({ bin = config().cloud.codexBin, cwd, spawnProcess = launch } = {}) {
@@ -54,15 +55,7 @@ export class CodexClient extends EventEmitter {
 }
 
 let catalogCache;
-export function dynamicToolNames(tools){
-  const aliases=new Map(),registered=new Set();
-  const definitions=tools.map(t=>{
-    const original=t.function.name;
-    const name=original.startsWith('mcp__')?'connector_'+createHash('sha256').update(original).digest('hex').slice(0,12)+'_'+original.split('__').at(-1).slice(0,35):original;
-    if(registered.has(name))throw new Error('Duplicate dynamic tool alias');registered.add(name);aliases.set(name,original);
-    return{type:'function',name,description:(name===original?'':original+': ')+(t.function.description||''),inputSchema:t.function.parameters};
-  });return{aliases,definitions};
-}
+export {dynamicToolNames};
 export async function cloudStatus({ fresh = false } = {}) {
   let client;
   try {

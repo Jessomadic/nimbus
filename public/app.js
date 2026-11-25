@@ -663,7 +663,10 @@ document.addEventListener('contextmenu', (e) => {
 });
 
 // ---------- slash commands in the message box ----------
-const SLASH = [['/new', 'Start a fresh chat with this bot (memory is kept)'],['/compact','Compress context and archive full history; keep instructions and memory']];
+const SLASH = [['/new', 'Start a fresh chat with this bot (memory is kept)'],['/compact','Compress context and archive full history; keep instructions and memory'],
+  ['/help','List the local commands'],['/model','Show or set the model (auto, local, OpenAI or Claude tier)'],['/effort','Show or set reasoning effort'],
+  ['/providers','Evidence-ranked models for this role, best first'],['/usage','OpenAI and Claude subscription status'],['/context','What is using this chat’s context'],
+  ['/stop','Stop the running task in this chat'],['/rename','Rename this worker']];
 function slashHint(v) {
   let box = $('#slash-hint');
   const show = S.current?.type === 'bot' && /^\/\w*$/.test(v);
@@ -674,7 +677,7 @@ function slashHint(v) {
 }
 document.addEventListener('click', (e) => {
   const b = e.target.closest('[data-slash]'); if (!b) return;
-  const ta = $('#msg'); ta.value = b.dataset.slash; $('#slash-hint')?.remove(); $('#composer').requestSubmit();
+  const ta = $('#msg'); $('#slash-hint')?.remove(); if (['/model','/effort','/rename'].includes(b.dataset.slash)) { ta.value = b.dataset.slash + ' '; ta.focus(); return; } ta.value = b.dataset.slash; $('#composer').requestSubmit();
 });
 
 // ---------- read aloud ----------
@@ -1099,7 +1102,7 @@ function botModal(b) {
       <label class="field">Effort<select id="f-effort">${EFFORTS.map(([v, l]) => `<option value="${v}" ${b.effort === v ? 'selected' : ''}>${l}</option>`).join('')}</select><span class="hint">Lower effort uses less of your plan.</span></label>
       <label class="field">Role model preference<select id="f-default-model">${[['','No preference'],['local','Shared local model'],['luna','Luna'],['terra','Terra'],['sol','Sol'],['astra','Astra']].map(([v,n])=>`<option value="${v}" ${(b.default_model||'')===v?'selected':''}>${n}</option>`).join('')}</select><span class="hint">The local router uses this starting point and chooses the model suited to each task.</span></label>
     </div>
-    <label class="field">Model override<select id="f-model">${[['auto','Automatic — use role preference and task needs'],['local','Use shared local model'],['luna','Use Luna'],['terra','Use Terra'],['sol','Use Sol'],['astra','Use Astra']].map(([v,n])=>`<option value="${v}" ${(b.model||'auto')===v?'selected':''}>${n}</option>`).join('')}</select><span class="hint">An explicit choice overrides automatic routing. Local and OpenAI outages can fall back to the other backend. Workers share local capacity.</span></label>
+    <label class="field">Model override<select id="f-model">${[['auto','Automatic — best model for the role across OpenAI and Claude, then next best'],['local','Use shared local model'],['luna','Use Luna'],['terra','Use Terra'],['sol','Use Sol'],['astra','Use Astra'],['claude-haiku','Use Claude Haiku'],['claude-sonnet','Use Claude Sonnet'],['claude-opus','Use Claude Opus'],['claude-fable','Use Claude Fable']].map(([v,n])=>`<option value="${v}" ${(b.model||'auto')===v?'selected':''}>${n}</option>`).join('')}</select><span class="hint">An explicit choice overrides automatic routing. Local and OpenAI outages can fall back to the other backend. Workers share local capacity.</span></label>
     <details class="adv"><summary>Worker tools · ${toolOptions.length} available</summary><label class="field">Find a tool<input data-tool-filter placeholder="Search names and descriptions"></label><div class="tool-picks specialist-picks">${toolOptions.map(tool=>`<label data-tool-option data-search="${esc((tool.name+' '+tool.description).toLowerCase())}" title="${esc(tool.description)}"><input type="checkbox" data-worker-tool="${esc(tool.name)}" ${(!b.tools||JSON.parse(b.tools).includes(tool.name))?'checked':''}><span><b>${esc(tool.name.replaceAll('_',' '))}</b><small>${esc(tool.description)}</small></span></label>`).join('')}</div><p class="hint">Each specialist receives tools for its role. Connector tools are configured in Plugins. Tool descriptions report supported workflows and limits.</p></details>
     <details class="adv"><summary>Approval rules</summary>
       <label class="field">Ask me before (one rule per line)<textarea id="f-rules" class="code" rows="5">${esc(b.approval_rules.join('\n'))}</textarea>

@@ -5,6 +5,7 @@ import { runBot, taskResult, resumeRun, runtimeQueues,toolDevelopment,approvePen
 import { config } from './config.js';
 import { updateRuntimeConfig } from './local-service-config.js';
 import { cloudStatus, CodexClient } from './codex.js';
+import { claudeStatus, setClaudeToken } from './claude.js';
 import { localCatalog } from './local.js';
 import { resources } from './resources.js';
 import { browsers } from './tools.js';
@@ -24,10 +25,11 @@ export function registerRuntimeRoutes({ route, body, json, reviewAuthority }) {
   route('POST','/api/tool-requests/:id/retry',async(req,res,p)=>json(res,200,await toolDevelopment.retry(p.id,await body(req))));
   route('POST','/api/tool-requests/:id/continue',async(req,res,p)=>json(res,200,await toolDevelopment.continueStage(p.id,await body(req))));
   route('GET','/api/runtime',async(req,res)=>{
-    const [cloud,local,hardware]=await Promise.all([cloudStatus(),localCatalog(),resources()]);
+    const [cloud,local,hardware,claude]=await Promise.all([cloudStatus(),localCatalog(),resources(),claudeStatus()]);
     const c=config();
     let contact;try{contact=orchestratorStatus(q('SELECT id,name,template,parent_bot_id,model,default_model,effort FROM bots ORDER BY id').all());}catch(error){contact={configured:false,error:error.message};}
-    json(res,200,{cloud:{ok:cloud.ok,subscription:cloud.subscription,plan:cloud.plan,models:cloud.models,runtime:cloud.runtime,error:cloud.error},local,hardware,
+    json(res,200,{cloud:{ok:cloud.ok,subscription:cloud.subscription,plan:cloud.plan,models:cloud.models,runtime:cloud.runtime,error:cloud.error},
+      claude:{ok:claude.ok,enabled:claude.enabled,subscription:claude.subscription,mode:claude.mode,plan:claude.plan,tokenAt:claude.tokenAt,limited:claude.limited,models:claude.models,error:claude.error},local,hardware,
       queues:runtimeQueues(),browserGroups:browsers.snapshot(),configuration:{localModel:c.local.model,routerModel:c.routing.routerModel||'shared loaded model',resourceCeiling:c.local.resourceCeiling},
       lumos:{connected:false,phase:contact.configured?'Orchestrator contact ready; Hermes/Lumos bridge is not configured':'Orchestrator setup required; Hermes/Lumos bridge is not configured',contactConfigured:contact.configured,taskEndpoint:'/api/orchestrator/tasks',orchestrator:contact.orchestrator||null,...(contact.error?{error:contact.error}:{})}});
   });
@@ -57,6 +59,16 @@ export function registerRuntimeRoutes({ route, body, json, reviewAuthority }) {
     if(!page)return json(res,404,{error:'This browser tab is not open in that worker group'});
     const bytes=await page.screenshot();res.writeHead(200,{'content-type':'image/png','cache-control':'no-store'});res.end(bytes);
   });
+  // Claude account: a token from `claude setup-token` (DPAPI-protected) or the
+  // server's own Claude Code login. The token wins when both exist. The token is
+  // never returned by any endpoint.
+  route('GET','/api/claude/status',async(req,res)=>{const s=await claudeStatus({fresh:true});json(res,200,{ok:s.ok,enabled:s.enabled,mode:s.mode,plan:s.plan,tokenAt:s.tokenAt,limited:s.limited,models:s.models,error:s.error});});
+  route('POST','/api/claude/token',async(req,res)=>{
+    const {token}=await body(req);
+    try{await setClaudeToken(token);}catch(error){return json(res,400,{error:error.message});}
+    broadcast('state_changed',{});const s=await claudeStatus({fresh:true});json(res,200,{ok:s.ok,mode:s.mode,error:s.error});
+  });
+  route('DELETE','/api/claude/token',async(req,res)=>{await setClaudeToken('');broadcast('state_changed',{});const s=await claudeStatus({fresh:true});json(res,200,{ok:s.ok,mode:s.mode});});
   let login=null;
   route('POST','/api/openai/login',async(req,res)=>{
     if(login)return json(res,409,{error:'A sign-in is already in progress'});

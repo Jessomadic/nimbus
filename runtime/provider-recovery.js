@@ -9,7 +9,7 @@ export function recoverySelection(bot){
   return {model:bot.model||bot.runtime||'',defaultModel:bot.default_model||'',effort:bot.effort||''};
 }
 export function retainedRecoveryRoute(recovery,route,selection){
-  if(!route||recovery.backend!=='codex'||recovery.provider!=='openai'||!recovery.selection||
+  if(!route||!(recovery.backend==='codex'&&recovery.provider==='openai'||recovery.backend==='claude'&&recovery.provider==='anthropic')||!recovery.selection||
     Object.keys(selection).some(key=>recovery.selection[key]!==selection[key]))throw held();
   // Use the retained route instead of asking a possibly different routing model.
   // An earlier fallback is historical evidence, not permission for another one.

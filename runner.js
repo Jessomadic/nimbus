@@ -19,6 +19,8 @@ import { broadcast } from './events.js';
 import { config,ROOT } from './runtime/config.js';
 import { workerSlots, localSlots, cloudSlots } from './runtime/slots.js';
 import { cloudStatus, codexTurn } from './runtime/codex.js';
+import { claudeStatus, claudeTurn, resolveClaudeModel, claudeModelAvailable } from './runtime/claude.js';
+import { isClaudeTier, providerOf, backendOf } from './runtime/provider-catalog.js';
 import {resolveCloudModel} from './runtime/model-selection.js';
 import { localChat } from './runtime/local.js';
 import { chooseRoute, cloudFallbackTier } from './runtime/router.js';
@@ -381,6 +383,15 @@ export function recoverRuns() {
   }
   for(const run of q("SELECT DISTINCT bot_id FROM runs WHERE status='waiting_tool'").all())if(!botStatus.has(run.bot_id))setStatus(run.bot_id,'waiting','Waiting for a new tool');
 }
+// Standing user guidance and memories imported from Codex (bin/import-codex.mjs).
+// The guidance is short and applies to every worker; memories stay in shared notes.
+export function importedCodexGuidance(dir=path.join(DATA_DIR,'shared','codex')){
+  let text='';
+  try{text=fs.readFileSync(path.join(dir,'AGENTS.md'),'utf8').trim().slice(0,8000);}catch{}
+  const memories=fs.existsSync(path.join(dir,'memory_summary.md'));
+  if(!text&&!memories)return '';
+  return '\nUser guidance imported from Codex (applies to every Nimbus worker):\n'+(text||'(none)')+(memories?'\nPrior Codex memories are in shared notes under codex/ (memory_summary.md first, then MEMORY.md and rollout_summaries/). Read them with shared_note when the task may relate to earlier work; recheck time-sensitive facts.':'');
+}
 function usableCloud(status,c) {
   if(!c.cloud.enabled || !status.subscription) return false;
   const limits=status.limits;
@@ -476,7 +487,7 @@ async function execute(runId,prompt) {
     // into a different request or redirect an upstream task's follow-up.
     const history=keepConversation?q('SELECT messages FROM worker_history WHERE bot_id=? AND thread=?').get(bot.id,run.thread):null;
     const memory=fs.readFileSync(path.join(cwd,'MEMORY.md'),'utf8');
-    state=existing?reconcileCheckpoint(runId,existing):{messages:history?JSON.parse(history.messages):[],instructions:fs.readFileSync(path.join(cwd,'AGENTS.md'),'utf8')+'\nPrivate working memory:\n'+memory,steps:0};
+    state=existing?reconcileCheckpoint(runId,existing):{messages:history?JSON.parse(history.messages):[],instructions:fs.readFileSync(path.join(cwd,'AGENTS.md'),'utf8')+importedCodexGuidance()+'\nPrivate working memory:\n'+memory,steps:0};
     hydrateCompletion(db,runId,state);
     if(existing&&successorRuntime){state=successorRuntime.initialize(runId,state,fs.readFileSync(path.join(cwd,'AGENTS.md'),'utf8')+'\nPrivate working memory:\n'+memory);save();}
     if(!existing) {
@@ -500,10 +511,13 @@ async function execute(runId,prompt) {
     timer=setInterval(()=>{const elapsed=Date.now()-body.started-trace.waited-(trace.waitStart?Date.now()-trace.waitStart:0);if(taskTimeExceeded(c.workers,elapsed))controller.abort(Object.assign(new Error('Task time limit reached; checkpoint retained'),{projectLimit:true}));},1000);
     setStatus(bot.id,'working','Local model choosing a route…');
     const status=await cloudStatus(); const cloudAllowed=usableCloud(status,c);
+    const claudeAccount=await claudeStatus(); const claudeAllowed=claudeAccount.ok===true;
+    const modelFor=tier=>tier==='local'?c.local.model:isClaudeTier(tier)?resolveClaudeModel(tier,c):resolveCloudModel(tier,status,c);
+    const tierAvailable=tier=>tier==='local'?c.local.enabled:isClaudeTier(tier)?claudeAllowed&&claudeModelAvailable(resolveClaudeModel(tier,c)):cloudAllowed;
     let route;
-    try{route=state.providerRecovery?retainedRecoveryRoute(state.providerRecovery,state.route,recoverySelection(bot)):await chooseRoute({task:prompt,role:bot.role,preferredTier:bot.default_model||'',pinned:bot.model||bot.runtime,effort:bot.effort,signal,cloudAvailable:cloudAllowed,c});}
+    try{route=state.providerRecovery?retainedRecoveryRoute(state.providerRecovery,state.route,recoverySelection(bot)):await chooseRoute({task:prompt,role:[bot.template,bot.name,bot.role].filter(Boolean).join(' — '),preferredTier:bot.default_model||'',pinned:bot.model||bot.runtime,effort:bot.effort,signal,cloudAvailable:cloudAllowed,claudeAvailable:claudeAllowed,tierAvailable,c});}
     catch(e){if(signal.aborted)throw e;throw Object.assign(new Error(`Could not choose an available model: ${e.message}. Task checkpoint retained.`),{pause:true});}
-    if(state.providerRecovery)assertRecoveryRoute(state.providerRecovery,{model:route.tier==='local'?c.local.model:resolveCloudModel(route.tier,status,c),backend:route.tier==='local'?'local':'codex',provider:route.tier==='local'?'local':'openai',fallback:!!route.fallbackReason});
+    if(state.providerRecovery)assertRecoveryRoute(state.providerRecovery,{model:modelFor(route.tier),backend:backendOf(route.tier),provider:providerOf(route.tier),fallback:!!route.fallbackReason});
     state.route=route; save();
     q('UPDATE runs SET requested_model=?,route_reason=?,effort=? WHERE id=?').run(bot.model||route.tier,route.reason,route.effort,runId);
     event(runId,'route.selected',route); body.route=route; updateMessage(trace.id,body);
@@ -633,9 +647,9 @@ async function execute(runId,prompt) {
       signal.throwIfAborted();attempted.add(tier);
       let model=tier==='local'?c.local.model:tier;
       try {
-        if(tier!=='local')model=resolveCloudModel(tier,status,c);
-        assertRecoveryRoute(state.providerRecovery,{model,backend:tier==='local'?'local':'codex',provider:tier==='local'?'local':'openai'});
-        q("UPDATE runs SET status='running',backend=?,actual_model=? WHERE id=?").run(tier==='local'?'local':'codex',model,runId);
+        model=modelFor(tier);
+        assertRecoveryRoute(state.providerRecovery,{model,backend:backendOf(tier),provider:providerOf(tier)});
+        q("UPDATE runs SET status='running',backend=?,actual_model=? WHERE id=?").run(backendOf(tier),model,runId);
         body.model=model;setStatus(bot.id,'working',`Working with ${model}`);updateMessage(trace.id,body);event(runId,'model.started',{tier,model});
         if(tier==='local') {
           for(;;) {
@@ -666,8 +680,8 @@ async function execute(runId,prompt) {
           takeContext();
           q("UPDATE runs SET status='waiting_cloud' WHERE id=?").run(runId);
           scopedDispatch(runId);
-          const r=await codexTurn({model,effort:route.effort,instructions:state.instructions+'\n'+currentExecutionPreflight(),messages:state.messages,tools:available.tools,callTool,contextFeedback:takeContext,toolFeedback:()=>{const note=pendingToolFeedback;pendingToolFeedback='';return note;},cwd,signal,
-            onThread:id=>{q('UPDATE runs SET session_id=? WHERE id=?').run(id,runId);event(runId,'codex.thread',{id});},
+          const r=await (isClaudeTier(tier)?claudeTurn:codexTurn)({model,effort:route.effort,instructions:state.instructions+'\n'+currentExecutionPreflight(),messages:state.messages,tools:available.tools,callTool,contextFeedback:takeContext,toolFeedback:()=>{const note=pendingToolFeedback;pendingToolFeedback='';return note;},cwd,signal,
+            onThread:id=>{q('UPDATE runs SET session_id=? WHERE id=?').run(id,runId);event(runId,isClaudeTier(tier)?'claude.session':'codex.thread',{id});},
             onEvent:(name,data)=>{if(name==='provider_error')event(runId,'provider.error',data);else if(name==='provider_activity')event(runId,'provider.activity',{phase:data.phase,kind:data.kind,activitySequence:data.activitySequence,activityAtMs:data.activityAtMs});else if(name==='provider_silence')event(runId,'provider.silence',{code:data.code,phase:data.phase,silentMs:data.silentMs});}});
           signal.throwIfAborted();
           if(q("UPDATE runs SET status='running' WHERE id=? AND status IN ('waiting_cloud','running')").run(runId).changes!==1)throw Object.assign(new Error('Provider completed after a terminal state change; retained for review'),{pause:true});
@@ -690,8 +704,11 @@ async function execute(runId,prompt) {
         save();if(signal.aborted||e instanceof UncertainAction||e.pause)throw e;
         if(state.providerRecovery)throw Object.assign(e,{pause:true});
         event(runId,'model.failed',{tier,model,error:e.message});
-        const next=tier!=='local'?'local':route.fallbackTier!=='local'?route.fallbackTier:cloudFallbackTier(bot.default_model||'',c);
-        if(attempted.has(next)||next==='local'&&!c.local.enabled||next!=='local'&&!cloudAllowed)throw Object.assign(e,{pause:true});
+        // Next best: the evidence-ranked candidates when both subscriptions are in play,
+        // then the original local/cloud alternation.
+        const rankedNext=(route.candidates||[]).find(t=>!attempted.has(t)&&tierAvailable(t)&&!(isClaudeTier(t)&&e.code==='claude_limit'&&isClaudeTier(tier)));
+        const next=rankedNext||(tier!=='local'?'local':route.fallbackTier!=='local'?route.fallbackTier:cloudFallbackTier(bot.default_model||'',c));
+        if(attempted.has(next)||!tierAvailable(next))throw Object.assign(e,{pause:true});
         q('UPDATE runs SET fallback_reason=? WHERE id=?').run(redact(e.message),runId);
         body.fallback=e.message;const from=tier;tier=next;event(runId,'model.fallback',{from,to:tier,phase:'execution',reason:e.message,completedTools:state.steps});
       }
@@ -716,7 +733,7 @@ async function execute(runId,prompt) {
     if(state){
       state.projectLimit=projectLimit;
       if(e.code==='provider_inference_silence'&&!signal.aborted&&!uncertain&&!e.hostDenied)
-        state.providerRecovery={code:e.code,...q('SELECT actual_model AS model,backend FROM runs WHERE id=?').get(runId),provider:'openai',selection:recoverySelection(bot)};
+        {const retained=q('SELECT actual_model AS model,backend FROM runs WHERE id=?').get(runId);state.providerRecovery={code:e.code,...retained,provider:retained.backend==='claude'?'anthropic':'openai',selection:recoverySelection(bot)};}
       else delete state.providerRecovery;
       if(e.hostDenied)state.hostDenied=true;
       save();
