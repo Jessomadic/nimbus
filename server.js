@@ -22,6 +22,13 @@ import {BranchHostSnapshot,branchHostApi} from './runtime/branch-host-snapshot.j
 import {configureBranchHost,enqueueCommittedRun} from './runner.js';
 import {compactConversation} from './runtime/compact.js';
 import {isLocalSlash,runLocalSlash} from './runtime/slash.js';
+import {createLumos} from './runtime/lumos.js';
+import {createLumosSchedules} from './runtime/lumos-schedules.js';
+import {loadLumosRoute} from './runtime/lumos-config.js';
+import {insertQueuedRun} from './runtime/run-create.js';
+import {claudeQuick} from './runtime/claude-quick.js';
+import {discoverSkills} from './runtime/skills.js';
+import {localChat} from './runtime/local.js';
 import {claudeStatus} from './runtime/claude.js';
 import {openaiCatalogTiers} from './runtime/plan-models.js';
 import { cloudStatus, CodexClient } from './runtime/codex.js';
@@ -195,7 +202,7 @@ route('GET','/api/bots/:id/download',(req,res,p,url)=>{
     'cache-control':'no-store','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; sandbox"});
   const stream=fs.createReadStream(file);stream.on('error',()=>res.destroy());stream.pipe(res);
 });
-route('GET','/health',(req,res)=>json(res,200,directLocal(req)?{ok:true,version:'0.2.0',pid:process.pid,startedAt,sourceHash:bootSourceHash,lumosConnected:false}:{ok:true}));
+route('GET','/health',(req,res)=>json(res,200,directLocal(req)?{ok:true,version:'0.2.0',pid:process.pid,startedAt,sourceHash:bootSourceHash,lumosConnected:lumos.status().ready}:{ok:true}));
 route('GET','/api/updates',(req,res,p,url)=>json(res,200,maintenance.status(url.searchParams.get('snapshotId')||undefined)));
 route('GET','/api/capabilities',(req,res)=>json(res,200,{fullCodexParity:false,capabilities,roleTools:roleToolCoverage(TEMPLATES),tools:coreTools.map(t=>({name:t.function.name,description:t.function.description}))}));
 registerQuestionRoutes({route,router:questionRouter,body,json,broadcast,
@@ -834,6 +841,102 @@ const ownedScheduler=schedulerHost({db,
  authorize:req=>sameOriginRequest(req)===true && (adminAuth(req)===true || (OWNER_MODE && loggedIn(req)===true && req.user?.username===OWNER_USERNAME))===true,
  onError:()=>console.error('Owned scheduler pump held')});
 for(const endpoint of ['create','tick'])route('POST','/private/scheduler/'+endpoint,ownedScheduler.handler);
+// Lumos (iMessage) on Nimbus. The listener always runs on loopback so the relay can
+// probe it; it accepts requests only while lumos.enabled is true.
+const lumos=createLumos({db,getConfig:config,loadRoute:l=>loadLumosRoute(l),dataDir:DATA_DIR,parseBot,stopRun,
+  insertRun:args=>insertQueuedRun(db,args,redact),enqueue:runId=>enqueueCommittedRun(runId),
+  memory:lumosMemoryHooks(),
+  classify:async(system,prompt)=>{
+    const c=config();
+    if(c.local.enabled)return (await localChat([{role:'system',content:system},{role:'user',content:prompt}],{c})).message.content;
+    if((await claudeStatus()).ok)return claudeQuick({system,prompt,c});
+    throw new Error('No topic classifier is available');
+  }});
+const lumosSchedules=createLumosSchedules({db,getConfig:config,send:async(text,tempGuid)=>{
+  const l=config().lumos,r=loadLumosRoute(l);
+  const response=await fetch(l.bridgeUrl+'/api/v1/message/text',{method:'POST',headers:{authorization:'Bearer '+r.token,'content-type':'application/json'},body:JSON.stringify({chatGuid:r.chat,message:text.slice(0,3900),tempGuid})});
+  const ack=await response.json().catch(()=>({}));if(!response.ok||ack.status!==200)throw new Error('Bridge did not confirm the scheduled message');
+}});
+lumos.start().catch(error=>console.error('Lumos listener did not start:',error.message));
+lumosSchedules.start();
+route('GET','/api/lumos/status',(req,res)=>json(res,200,{...lumos.status(),schedules:lumosSchedules.list(),schedulesEnabled:config().lumos.schedulesEnabled}));
+// The lumos-memory server's CLI modes (integration/lumos-memory/server.py).
+function lumosMemoryHooks(){
+  const py='F:/Projects/Lumos/HermesPilot/integrations/.venv/Scripts/python.exe',script=path.join(ROOT,'integration','lumos-memory','server.py'),home=path.join(DATA_DIR,'lumos','home');
+  const run=(args,input,timeout)=>new Promise((resolve,reject)=>{
+    if(!fs.existsSync(path.join(home,'current.json'))||!fs.existsSync(script))return resolve(null);
+    const child=spawn(py,['-B',script,'--home',home,...args],{windowsHide:true,stdio:['pipe','pipe','ignore']});
+    let out='';child.stdout.on('data',d=>{out+=d;});const timer=setTimeout(()=>{try{child.kill();}catch{}},timeout);
+    child.on('error',e=>{clearTimeout(timer);reject(e);});child.on('close',()=>{clearTimeout(timer);try{resolve(JSON.parse(out.trim().split(/\r?\n/).at(-1)));}catch{resolve(null);}});
+    child.stdin.on('error',()=>{});child.stdin.end(input||'');
+  });
+  return {
+    prefetch:async text=>((await run(['--prefetch',String(text).slice(0,2000)],'',6000))?.facts||[]).map(f=>f.content),
+    extract:async messages=>{await run(['--extract'],JSON.stringify(messages),12000);},
+  };
+}
+// Create or refresh the Lumos worker from the current imported generation
+// (bin/lumos-import.mjs). Returns the config fields to save.
+function setupLumosWorker(){
+  const pointer=path.join(DATA_DIR,'lumos','home','current.json');
+  if(!fs.existsSync(pointer))throw new Error('Import Lumos state first (bin/lumos-import.mjs)');
+  const home=JSON.parse(fs.readFileSync(pointer,'utf8')).path;
+  const persona=fs.readFileSync(path.join(home,'persona','LUMOS.md'),'utf8');
+  const tools=JSON.stringify([...new Set(['shell','exec_command','write_stdin','apply_patch','read_file','write_file','list_files','view_image','skills','update_plan','capabilities','request_tool','tool_request_status','browser','shared_note','ask_worker','memory_recall','openbubbles_operation'])].filter(n=>coreTools.some(t=>t.function.name===n)));
+  const role='Personal assistant for Jesse over iMessage: research, writing, scheduling, media and PC operations';
+  let id=config().lumos.botId;
+  if(id&&q('SELECT id FROM bots WHERE id=?').get(id))q('UPDATE bots SET name=?,role=?,instructions=?,tools=?,approval_rules=?,default_model=? WHERE id=?').run('Lumos',role,persona,tools,'[]','claude-sonnet',id);
+  else id=Number(q("INSERT INTO bots (name, role, instructions, color, effort, shape, approval_rules, model, default_model, tools) VALUES (?,?,?,?,?,?,?,?,?,?)").run('Lumos',role,persona,'#c9b2e8','medium','blob','[]','auto','claude-sonnet',tools).lastInsertRowid);
+  // Seed private working memory from the imported Hermes memory; the lumos-memory
+  // connector keeps it current after each write.
+  const read=f=>{try{return fs.readFileSync(path.join(home,'memories',f),'utf8').split('§').map(s=>s.trim()).filter(Boolean);}catch{return [];}};
+  const mem=path.join(botDir(id),'MEMORY.md');
+  if(!fs.existsSync(mem)||/^# What Lumos has learned\s*$/.test(fs.readFileSync(mem,'utf8')))fs.writeFileSync(mem,'## MEMORY\n'+read('MEMORY.md').map(s=>'- '+s).join('\n')+'\n\n## USER PROFILE\n'+read('USER.md').map(s=>'- '+s).join('\n')+'\n');
+  writeBotBrief(parseBot(q('SELECT * FROM bots WHERE id=?').get(id)));
+  let jobs=[];try{jobs=JSON.parse(fs.readFileSync(path.join(home,'schedules.json'),'utf8'));}catch{}
+  for(const job of jobs)lumosSchedules.upsert({...job,enabled:false});
+  writeLumosSkillsReview(home);
+  broadcast('state_changed',{});
+  return {botId:id,homeDir:home};
+}
+// Classify every imported Hermes skill so Lumos (and the Skills team) know which
+// can be followed as-is, which need Hermes tool names translated, and which need review.
+function writeLumosSkillsReview(home){
+  const {skills}=discoverSkills([path.join(home,'skills')],{limit:1000});
+  const review=skills.map(s=>{
+    // Only the apple/ category needs a Mac; elsewhere a passing macOS mention is not a blocker.
+    const rel=path.relative(home,s.path).split(path.sep).join('/'),blockers=[...new Set(s.blockers||[])];
+    const relevant=blockers.filter(b=>!/Apple|macOS/.test(b)),hermesOnly=relevant.length&&relevant.every(b=>/Hermes/.test(b));
+    return {name:s.name,path:rel,class:/^skills\/apple\//.test(rel)?'unavailable':!relevant.length?'ready':hermesOnly?'adapt':'review',blockers};
+  });
+  fs.writeFileSync(path.join(home,'skills-review.json'),JSON.stringify({generatedAt:new Date().toISOString(),counts:review.reduce((a,r)=>(a[r.class]=(a[r.class]||0)+1,a),{}),skills:review},null,2));
+}
+// After a rollback to Hermes, list memory written on Nimbus since the import.
+// Nothing is merged back automatically.
+function writeLumosDivergence(home){
+  const lines=['# Lumos memory written on Nimbus since the cutover','',`Generated ${new Date().toISOString()}. Review and copy anything worth keeping into the Hermes memory by hand.`,''];
+  for(const f of ['MEMORY.md','USER.md']){
+    const split=p=>{try{return fs.readFileSync(p,'utf8').split('§').map(s=>s.trim()).filter(Boolean);}catch{return [];}};
+    const base=new Set(split(path.join(home,'baseline',f))),now=split(path.join(home,'memories',f));
+    lines.push('## '+f,'',...now.filter(s=>!base.has(s)).map(s=>'- '+s),'');
+  }
+  fs.writeFileSync(path.join(home,'divergence-'+Date.now()+'.md'),lines.join('\n'));
+}
+// Local administration only: the cutover switch script turns Lumos on or off.
+route('POST','/api/lumos/admin',async(req,res)=>{
+  if(!adminAuth(req))return json(res,403,{error:'Local administration required'});
+  const b=await body(req),patch={};
+  if(typeof b.enable==='boolean')patch.enabled=b.enable;
+  if(typeof b.schedules==='boolean')patch.schedulesEnabled=b.schedules;
+  if(typeof b.botId==='number')patch.botId=b.botId;
+  if(typeof b.homeDir==='string')patch.homeDir=b.homeDir;
+  if(typeof b.python==='string')patch.python=b.python;
+  if(b.setup===true){try{Object.assign(patch,setupLumosWorker());}catch(error){return json(res,400,{error:error.message});}}
+  if(b.enable===false&&config().lumos.homeDir){try{writeLumosDivergence(config().lumos.homeDir);}catch(error){console.error('Lumos divergence report:',error.message);}}
+  try{saveConfig({lumos:patch});}catch(error){return json(res,400,{error:error.message});}
+  if(typeof b.schedules==='boolean')for(const job of lumosSchedules.list())lumosSchedules.setEnabled(job.id,b.schedules);
+  json(res,200,{...(await lumos.reconfigure()),schedulesEnabled:config().lumos.schedulesEnabled});
+});
 const memoryPins={
     "home/state/brain-links/links.sqlite3":  "8a27698145538700a73a79f9970a22842f6214b39e5d68da3883942579af6e13",
     "integrations/openhuman_memory/chunks.db":  "10272d4e4d4aadc8c7360d5328a0d26052a6b1a182e5a2f1c44b0344075fe248",
@@ -1278,6 +1381,6 @@ server.listen(PORT, HOST, () => {
 });
 
 let closing=false;
-async function shutdown(code=0) { if(closing)return;closing=true;server.close();await ownedScheduler.stop();await drainRuntime();await terminals.close();await closeLocalService();await connectors.close();await browsers.close();db.close();process.exit(code); }
+async function shutdown(code=0) { if(closing)return;closing=true;server.close();await lumos.stop().catch(()=>{});await lumosSchedules.stop().catch(()=>{});await ownedScheduler.stop();await drainRuntime();await terminals.close();await closeLocalService();await connectors.close();await browsers.close();db.close();process.exit(code); }
 process.on('SIGTERM',()=>shutdown());
 process.on('SIGINT',()=>shutdown());

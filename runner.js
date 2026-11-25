@@ -482,7 +482,9 @@ async function execute(runId,prompt) {
     successorRuntime?.gate(runId);diagnosticWake?.gate(runId);
     const cwd=writeBotBrief(bot),isRoom=run.thread.startsWith('room:');
     const existing=run.checkpoint?JSON.parse(run.checkpoint):null;
-    const keepConversation=!isRoom&&!run.parent_run&&!['schedule','tool-development','api','hermes','lumos','openbubbles'].includes(run.source);
+    // Lumos topics are single-member rooms with their own continuing conversation.
+    // Orchestrator tasks submitted with source lumos stay isolated like before.
+    const keepConversation=!run.parent_run&&(isRoom?run.source==='lumos':!['schedule','tool-development','api','hermes','lumos','openbubbles'].includes(run.source));
     // Delegated assignments and incoming integration jobs own their checkpoints
     // and supplied context. Borrowing another conversation can mix old results
     // into a different request or redirect an upstream task's follow-up.
@@ -495,7 +497,7 @@ async function execute(runId,prompt) {
       const scheduledQuiet=run.source==='schedule'&&run.quiet;
       const quiet=run.quiet&&!scheduledQuiet?'\nThis is a quiet check. Reply ALL_CLEAR and a short status if no action is needed.':'';
       if(scheduledQuiet)state.messages.push({role:'user',content:'Delivery context: this scheduled task is quiet. Perform the following task unchanged and retain its result without external notification. Higher-priority safety instructions still apply.'});
-      state.messages.push({role:'user',content:(isRoom?roomContext(Number(run.thread.slice(5)))+'\nCurrent task:\n':'')+prompt+quiet}); save();
+      state.messages.push({role:'user',content:(isRoom&&run.source!=='lumos'?roomContext(Number(run.thread.slice(5)))+'\nCurrent task:\n':'')+prompt+quiet}); save();
     }
     q("UPDATE runs SET status='routing',started_at=COALESCE(started_at,unixepoch()),ended_at=NULL WHERE id=?").run(runId);
     const body={steps:[],status:'running',effort:bot.effort,started:Date.now(),source:run.source};

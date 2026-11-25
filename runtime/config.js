@@ -3,6 +3,34 @@ import { createHash } from 'node:crypto';
 import {validateMcpScopes,policyHash,policyView} from './mcp-scope.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// Lumos (iMessage) connection settings; file-only (see runtime/lumos-config.js).
+export const LUMOS_DEFAULTS={
+  enabled:false,
+  ingressPort:8646,
+  bridgeUrl:'http://127.0.0.1:12345',
+  bridgeConfigPath:'F:/Projects/Lumos/OpenBubblesResearch/bridge/config.json',
+  ownerConfigPath:'F:/Projects/Lumos/HermesPilot/route.json',
+  completeUrl:'http://127.0.0.1:12436/complete',
+  botId:null,
+  homeDir:'',
+  schedulesEnabled:false,
+  python:'',
+  topicTimeoutSeconds:12,
+};
+const loopback=(value,label)=>{
+  let url;try{url=new URL(value);}catch{throw new Error(`Invalid Lumos ${label}`);}
+  if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||url.username||url.password)throw new Error(`Lumos ${label} must be a loopback http URL`);
+};
+export function validateLumosConfig(l){
+  if(typeof l?.enabled!=='boolean'||typeof l.schedulesEnabled!=='boolean')throw new Error('Lumos enabled and schedulesEnabled must be booleans');
+  if(!Number.isInteger(l.ingressPort)||l.ingressPort<1024||l.ingressPort>65535)throw new Error('Invalid Lumos ingress port');
+  loopback(l.bridgeUrl,'bridge URL');loopback(l.completeUrl,'completion URL');
+  if(l.botId!==null&&(!Number.isSafeInteger(l.botId)||l.botId<1))throw new Error('Invalid Lumos worker id');
+  for(const key of ['bridgeConfigPath','ownerConfigPath','homeDir','python'])if(typeof l[key]!=='string')throw new Error(`Invalid Lumos ${key}`);
+  if(!Number.isFinite(l.topicTimeoutSeconds)||l.topicTimeoutSeconds<2||l.topicTimeoutSeconds>20)throw new Error('Invalid Lumos topic timeout');
+  if(l.enabled&&(!l.botId||!l.homeDir))throw new Error('Lumos needs botId and homeDir before it can be enabled');
+  return l;
+}
 
 export const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const configOverridePresent = Object.hasOwn(process.env, 'NIMBUS_CONFIG');
@@ -20,6 +48,8 @@ export const defaults = {
   cloud: { enabled: true, codexBin: 'auto', maxConcurrent: 3,
     models: { luna: 'auto', terra: 'auto', sol: 'auto', astra: 'auto' } },
   // Claude subscription through Claude Code, used beside Codex (never instead of it).
+  // Lumos (iMessage) on Nimbus. Off until the cutover switch enables it.
+  lumos: LUMOS_DEFAULTS,
   claude: { enabled: true, bin: 'auto', maxConcurrent: 2, disabledTiers: [],
     models: { 'claude-haiku': 'auto', 'claude-sonnet': 'auto', 'claude-opus': 'auto', 'claude-fable': 'auto' } },
   local: { enabled: true, baseUrl: 'http://127.0.0.1:12438/v1', model: 'nimbus-local',
@@ -50,6 +80,7 @@ export function validateConfig(c) {
   for(const [key,min,max] of [['maxHistoryChars',24000,900000],['maxToolChars',256,32000]])if(!Number.isSafeInteger(c.context[key])||c.context[key]<min||c.context[key]>max)throw new Error(`Invalid context ${key}`);
   for(const value of [c.toolDevelopment.maxAutomaticContinuations,c.toolDevelopment.maxAutomaticRepairs])if(!Number.isInteger(value)||value<0||value>10)throw new Error('Automatic tool recovery limits must be integers from 0 to 10');
   validateMcpScopes(c);
+  validateLumosConfig(c.lumos);
   if (!['bounded','progress'].includes(c.workers.executionMode)) throw new Error('Invalid execution mode');
   if (!['rules', 'all'].includes(c.workers?.permissionMode)) throw new Error('Invalid worker permission mode');
   for (const [label, value, min, max] of [

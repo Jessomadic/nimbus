@@ -10,7 +10,9 @@ export async function dispatchOpenBubbles(bot,args,{runId,signal,openBubblesAuth
  const deps=authorities.get(openBubblesAuthority);
  if(!deps)throw new Error('OpenBubbles disabled');
  if(!JSON.parse(bot.tools||'[]').includes('openbubbles_operation'))throw new Error('Tool not enabled for this worker');
- const {store,reader,sink}=deps,c=store.correlation(runId,bot.id);
+ const {store,reader,sink,stage}=deps,c=store.correlation(runId,bot.id);
+ // Lumos runs may name local files; the host stages them as private content refs.
+ if(args?.kind==='attachments'&&Array.isArray(args.files)&&typeof stage==='function')args={...args,files:args.files.map(f=>f&&typeof f.path==='string'&&!f.ref?stage(f.path,c):f)};
  const ledger=store.ledger(c);
  const plans=planRequests(args,{chat:c.chat,ledger});
  store.prepare(c,args.operationId,plans);const results=[];

@@ -1,0 +1,29 @@
+{
+  "comment": "Byte-identical copies of Hermes files. server.py refuses to start if any 'files' hash differs. 'ported_from' records the Hermes sources whose logic lumos_memory.py re-implements; they are not imported.",
+  "hermes_source": "F:/Projects/Lumos/H",
+  "hermes_commit": "5307e93252ac655cd13fadbd561c0995142138c6",
+  "pinned_at": "2026-11-24",
+  "files": {
+    "store.py": {
+      "source": "plugins/memory/holographic/store.py",
+      "sha256": "f1905db94f186feef2af3875fbbfc84c4a8193229a8494c276dfbfc7f2703f96"
+    },
+    "retrieval.py": {
+      "source": "plugins/memory/holographic/retrieval.py",
+      "sha256": "3ddd8a92de1c6a588e6085cc9969a350fda00f86a6007c3eedee5a50788b714d"
+    },
+    "holographic.py": {
+      "source": "plugins/memory/holographic/holographic.py",
+      "sha256": "036d966dd43bb260b851b08b06b693a8c5849a9df09449ce61815e11ba5834fd"
+    },
+    "threat_patterns.py": {
+      "source": "tools/threat_patterns.py",
+      "sha256": "a27cb85ce18e93485959537cf054608df76b9e78c36607be5865069f679c7664"
+    }
+  },
+  "ported_from": {
+    "plugins/memory/holographic/__init__.py": "6bed8a1dcfe2e41b9fa85c73a691f9c1ab88455cd51a198ba88d251f344aebaa",
+    "tools/memory_tool_store.py": "2a44cc0ea35066a4320395d63997f26011525c9ffe04183e562e16575837f488",
+    "tools/memory_tool.py": "50adfa27c2619022cd8eed0b7d95153a00a1e244c6dc9b05a4b14b92a554fb30"
+  }
+}

@@ -36,7 +36,7 @@ export function registerRuntimeRoutes({ route, body, json, reviewAuthority }) {
   });
   route('GET','/api/runtime/config',(req,res)=>{const c=config();delete c.mcpServers;json(res,200,c);});
   route('PUT','/api/runtime/config',async(req,res)=>{
-    const patch=await body(req);if(patch.mcpServers)throw new Error('Configure MCP definitions in the local configuration file; credentials are not returned through this endpoint.');
+    const patch=await body(req);if(patch.lumos)throw new Error('Lumos settings are changed by Switch-LumosBackend.ps1 or nimbus.config.json, not this endpoint.');if(patch.mcpServers)throw new Error('Configure MCP definitions in the local configuration file; credentials are not returned through this endpoint.');
     try{const c=await updateRuntimeConfig(patch);approvePendingPermissions();delete c.mcpServers;broadcast('state_changed',{});json(res,200,c);}
     catch(error){const c=config();delete c.mcpServers;json(res,error.statusCode||500,{error:error.message,config:c});}
   });
