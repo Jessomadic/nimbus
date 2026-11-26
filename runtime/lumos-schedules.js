@@ -21,7 +21,17 @@ export function wakes(output){
   try{const gate=JSON.parse(lines.at(-1).trim());return !(gate&&typeof gate==='object'&&gate.wakeAgent===false);}catch{return true;}
 }
 
-export function createLumosSchedules({db,getConfig,send,clock=()=>new Date(),spawnProcess=spawn,log=console,catchUpMinutes=20}){
+// Nimbus's .env may set TZ to an IANA name (America/New_York) for Node. On
+// Windows, Python and other C-runtime programs cannot parse that form and fall
+// back to UTC (live 2026-11-26: the 08:00 tracker check saw +00:00 and refused
+// to run). Such children use the Windows time zone instead.
+export function scriptEnvironment(base,platform=process.platform){
+  const env={...base};
+  if(platform==='win32'&&typeof env.TZ==='string'&&env.TZ.includes('/'))delete env.TZ;
+  return env;
+}
+
+export function createLumosSchedules({db,getConfig,send,clock=()=>new Date(),spawnProcess=spawn,log=console,catchUpMinutes=20,platform=process.platform}){
   db.exec(SCHEDULE_SCHEMA);
   const q=sql=>db.prepare(sql);
   const cfg=()=>getConfig().lumos;
@@ -37,7 +47,7 @@ export function createLumosSchedules({db,getConfig,send,clock=()=>new Date(),spa
   function runScript(job){
     const l=cfg(),scripts=path.join(l.homeDir,'scripts'),file=path.join(scripts,job.script);
     if(path.dirname(file)!==scripts||!fs.existsSync(file))return Promise.resolve({code:-1,stdout:'',stderr:'Script not found: '+job.script});
-    const env={...process.env,HERMES_CRON_EXECUTION_ID:randomBytes(16).toString('hex'),PYTHONIOENCODING:'utf-8'};
+    const env={...scriptEnvironment(process.env,platform),HERMES_CRON_EXECUTION_ID:randomBytes(16).toString('hex'),PYTHONIOENCODING:'utf-8'};
     return new Promise(resolve=>{
       const child=spawnProcess(l.python||'python',[file],{cwd:l.homeDir,env,windowsHide:true,stdio:['ignore','pipe','pipe']});
       let stdout='',stderr='';

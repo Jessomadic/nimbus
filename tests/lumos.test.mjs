@@ -7,7 +7,7 @@ import http from 'node:http';
 import {DatabaseSync} from 'node:sqlite';
 import {EventEmitter} from 'node:events';
 import {createLumos,bubbles} from '../runtime/lumos.js';
-import {createLumosSchedules,wakes} from '../runtime/lumos-schedules.js';
+import {createLumosSchedules,wakes,scriptEnvironment} from '../runtime/lumos-schedules.js';
 import {loadLumosRoute,validateLumosConfig,LUMOS_DEFAULTS} from '../runtime/lumos-config.js';
 import {LumosTopics} from '../runtime/lumos-topics.js';
 
@@ -186,6 +186,21 @@ test('schedules run a script once per fire, honor the wake gate and report failu
   assert.equal(new Set(sent.map(x=>x[1])).size,2);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM lumos_schedule_runs').get().n,3);
   assert.equal(wakes(''),false);assert.equal(wakes('text\n{"wakeAgent": true}'),true);
+});
+
+test('schedule scripts on Windows do not get an IANA TZ the C runtime reads as UTC (live 2026-11-26 08:00 miss)',async()=>{
+  const db=new DatabaseSync(':memory:'),dir=fs.mkdtempSync(path.join(os.tmpdir(),'lumos-sched-'));
+  fs.mkdirSync(path.join(dir,'scripts'));fs.writeFileSync(path.join(dir,'scripts','ok.py'),'');
+  const seen=[],spawnProcess=(cmd,args,opts)=>{seen.push(opts.env.TZ);const c=new EventEmitter();c.stdout=new EventEmitter();c.stderr=new EventEmitter();setImmediate(()=>c.emit('close',0));return c;};
+  const at=new Date(2026,10,26,8,0,5),cfg={lumos:{...LUMOS_DEFAULTS,enabled:true,schedulesEnabled:true,botId:7,homeDir:dir}};
+  const realTz=process.env.TZ,realNow=Date.now;process.env.TZ='America/New_York';Date.now=()=>at.getTime();
+  try{
+    const s=createLumosSchedules({db,getConfig:()=>cfg,send:async()=>{},clock:()=>new Date(at),spawnProcess,log:{error(){}},platform:'win32'});
+    s.upsert({id:'day',name:'day',cron:'0 8 * * *',script:'ok.py',enabled:true});await s.tick();
+  }finally{Date.now=realNow;if(realTz===undefined)delete process.env.TZ;else process.env.TZ=realTz;}
+  assert.deepEqual(seen,[undefined],'the Windows script falls back to the system time zone');
+  assert.equal(scriptEnvironment({TZ:'America/New_York'},'linux').TZ,'America/New_York','other platforms keep TZ');
+  assert.equal(scriptEnvironment({TZ:'EST5EDT'},'win32').TZ,'EST5EDT','a C-runtime TZ form is kept');
 });
 
 test('schedules still fire after earlier ticks found Lumos disabled or nothing due (live 2026-11-25 miss)',async()=>{
