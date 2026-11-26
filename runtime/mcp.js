@@ -32,12 +32,16 @@ export async function invokeConnector(binding,owner,args,{signal,timeout=120000}
   return {...result,nimbusConnector:{provenance,...(result.isError?{error:'Connector reported an error'}:{})}};
 }
 
+// Process settings, not credentials. Redacting their values (e.g. PYTHONDONTWRITEBYTECODE="1")
+// rewrote every "1" in connector results, corrupting dates, numbers and transcripts.
+const NON_SECRET_ENV=new Set(['PYTHONDONTWRITEBYTECODE','PYTHONUNBUFFERED','PYTHONIOENCODING','PYTHONUTF8','PYTHONPATH','PYTHONHOME','HOME','USERPROFILE','TEMP','TMP','TMPDIR','APPDATA','LOCALAPPDATA','PATH','NODE_ENV','LANG','LC_ALL','TZ']);
 function configuredSecrets(definition){
-  const values=[...Object.values(definition.headers||{}),...Object.values(definition.env||{})];
+  const values=[...Object.values(definition.headers||{}),...Object.entries(definition.env||{}).filter(([k])=>!NON_SECRET_ENV.has(String(k).toUpperCase())).map(([,v])=>v)];
   if(definition.url)try{const u=new URL(definition.url);values.push(decodeURIComponent(u.username),decodeURIComponent(u.password));for(const [k,v] of u.searchParams)if(/token|secret|password|key|signature/i.test(k))values.push(v);}catch{}
-  return values.filter(v=>typeof v==='string'&&v.length>0).flatMap(v=>[v,v.replace(/^(?:Bearer|Basic)\s+/i,'')]).filter(Boolean).sort((a,b)=>b.length-a.length);
+  // Same 4-character floor as cleanConnectorError: shorter values cannot be meaningful secrets.
+  return values.filter(v=>typeof v==='string').flatMap(v=>[v,v.replace(/^(?:Bearer|Basic)\s+/i,'')]).filter(v=>v.length>=4).sort((a,b)=>b.length-a.length);
 }
-function sanitizeConfiguredValue(value,definition){
+export function sanitizeConfiguredValue(value,definition){
   for(const secret of configuredSecrets(definition))value=sanitizeConnectorValue(value,secret);
   return value;
 }
