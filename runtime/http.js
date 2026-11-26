@@ -14,11 +14,13 @@ import { events, event } from './journal.js';
 import { redact, encodeRedacted } from '../redact.js';
 import {toolRequestSummary} from './tool-development-view.js';
 import {createTaskSubmission,orchestratorStatus} from './orchestrator.js';
+import {getLumos} from './lumos-registry.js';
+const lumosState=()=>{try{return getLumos()?.status?.()||null;}catch{return null;}};
 
 export function registerRuntimeRoutes({ route, body, json, reviewAuthority }) {
   const submitTask=createTaskSubmission({db,query:q,runTask:runBot,getTask:taskResult});
   const submission=orchestratorOnly=>async(req,res)=>{try{const result=submitTask(await body(req),{orchestratorOnly});return json(res,result.status,result.body);}catch(error){if(error.statusCode)return json(res,error.statusCode,{error:error.message,code:error.code});throw error;}};
-  route('GET','/api/orchestrator',(req,res)=>{try{return json(res,200,orchestratorStatus(q('SELECT id,name,template,parent_bot_id,model,default_model,effort FROM bots ORDER BY id').all()));}catch(error){if(error.statusCode)return json(res,error.statusCode,{error:error.message,code:error.code});throw error;}});
+  route('GET','/api/orchestrator',(req,res)=>{try{return json(res,200,orchestratorStatus(q('SELECT id,name,template,parent_bot_id,model,default_model,effort FROM bots ORDER BY id').all(),{lumos:lumosState()}));}catch(error){if(error.statusCode)return json(res,error.statusCode,{error:error.message,code:error.code});throw error;}});
   route('POST','/api/orchestrator/tasks',submission(true));
   route('GET','/api/tool-requests',(req,res,p,url)=>{const runId=url.searchParams.has('runId')?Number(url.searchParams.get('runId')):undefined;if(runId!==undefined&&(!Number.isSafeInteger(runId)||runId<1))return json(res,400,{error:'runId must be a positive task ID'});const result=toolDevelopment.list({runId,limit:50});return json(res,200,{...result,requests:result.requests.map(toolRequestSummary)});});
   route('GET','/api/tool-requests/:id',(req,res,p)=>{const request=toolDevelopment.get(p.id);return json(res,request?200:404,request||{error:'Tool-development request not found'});});
@@ -28,11 +30,11 @@ export function registerRuntimeRoutes({ route, body, json, reviewAuthority }) {
   route('GET','/api/runtime',async(req,res)=>{
     const [cloud,local,hardware,claude]=await Promise.all([cloudStatus(),localCatalog(),resources(),claudeStatus()]);
     const c=config();
-    let contact;try{contact=orchestratorStatus(q('SELECT id,name,template,parent_bot_id,model,default_model,effort FROM bots ORDER BY id').all());}catch(error){contact={configured:false,error:error.message};}
+    const live=lumosState();let contact;try{contact=orchestratorStatus(q('SELECT id,name,template,parent_bot_id,model,default_model,effort FROM bots ORDER BY id').all(),{lumos:live});}catch(error){contact={configured:false,error:error.message};}
     json(res,200,{cloud:{ok:cloud.ok,subscription:cloud.subscription,plan:cloud.plan,tiers:openaiCatalogTiers(cloud,config()),models:cloud.models,runtime:cloud.runtime,error:cloud.error},
       claude:{ok:claude.ok,allowedTiers:claude.allowedTiers,excludedTiers:claude.excludedTiers,enabled:claude.enabled,subscription:claude.subscription,mode:claude.mode,plan:claude.plan,tokenAt:claude.tokenAt,limited:claude.limited,models:claude.models,error:claude.error},local,hardware,
       queues:runtimeQueues(),browserGroups:browsers.snapshot(),configuration:{localModel:c.local.model,routerModel:c.routing.routerModel||'shared loaded model',resourceCeiling:c.local.resourceCeiling},
-      lumos:{connected:false,phase:contact.configured?'Orchestrator contact ready; Hermes/Lumos bridge is not configured':'Orchestrator setup required; Hermes/Lumos bridge is not configured',contactConfigured:contact.configured,taskEndpoint:'/api/orchestrator/tasks',orchestrator:contact.orchestrator||null,...(contact.error?{error:contact.error}:{})}});
+      lumos:{connected:!!live?.ready,phase:live?.ready?'Lumos is served by Nimbus over iMessage':(contact.configured?'Orchestrator contact ready; Lumos on Nimbus is '+(live?(live.enabled?'not ready':'disabled'):'not configured'):'Orchestrator setup required; Lumos on Nimbus is '+(live?(live.enabled?'not ready':'disabled'):'not configured')),...(live?{uncertain:live.uncertain,schedulesEnabled:live.schedulesEnabled}:{}),contactConfigured:contact.configured,taskEndpoint:'/api/orchestrator/tasks',orchestrator:contact.orchestrator||null,...(contact.error?{error:contact.error}:{})}});
   });
   route('GET','/api/runtime/config',(req,res)=>{const c=config();delete c.mcpServers;json(res,200,c);});
   route('PUT','/api/runtime/config',async(req,res)=>{

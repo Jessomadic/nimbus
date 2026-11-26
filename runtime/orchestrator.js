@@ -47,11 +47,18 @@ export function resolveTaskWorker(body,bots,{orchestratorOnly=false}={}){
   if(orchestratorOnly){const coordinator=resolveOrchestrator(bots);if(selected&&Number(selected.id)!==Number(coordinator.id))throw new OrchestratorError('The canonical Orchestrator endpoint does not accept a redirect to another worker.',400,'orchestrator_redirect_rejected');return coordinator;}
   return selected||resolveOrchestrator(bots);
 }
-export function orchestratorStatus(bots){
+// lumos: the running Lumos status (runtime/lumos.js status()), when Nimbus serves it.
+export function lumosBridge(lumos){
+  const contacts=['hermes','lumos'];
+  if(!lumos||(!lumos.enabled&&!lumos.ready&&lumos.botId==null))return {connected:false,status:'not_configured',contacts,message:'This endpoint is the designated Nimbus contact for Hermes/Lumos. No bridge connection, credentials or live integration has been configured or verified.'};
+  if(lumos.ready)return {connected:true,status:'connected',contacts,botId:lumos.botId??null,message:'Lumos (iMessage) is served by Nimbus. Lumos hands work to this Orchestrator with lumos_handoff and relays the result when the run ends.'};
+  return {connected:false,status:lumos.enabled?'not_ready':'disabled',contacts,botId:lumos.botId??null,message:lumos.enabled?'Lumos on Nimbus is enabled but not ready.':'Lumos on Nimbus is installed but disabled (Lumos may be running on Hermes).'};
+}
+export function orchestratorStatus(bots,{lumos}={}){
   const coordinator=resolveOrchestrator(bots,{required:false});
   return{configured:!!coordinator,orchestrator:coordinator?{id:Number(coordinator.id),name:coordinator.name,template:coordinator.template,parent_bot_id:null,model:coordinator.model||'auto',default_model:coordinator.default_model||'',effort:coordinator.effort||null}:null,
     coordinators:roster(bots).filter(bot=>bot.template===ORCHESTRATOR_PROFILE_ID&&bot.parent_bot_id!=null).map(bot=>({id:Number(bot.id),name:bot.name,parent_bot_id:Number(bot.parent_bot_id)})),
-    taskEndpoint:'/api/orchestrator/tasks',bridge:{connected:false,status:'not_configured',contacts:['hermes','lumos'],message:'This endpoint is the designated Nimbus contact for Hermes/Lumos. No bridge connection, credentials or live integration has been configured or verified.'},
+    taskEndpoint:'/api/orchestrator/tasks',bridge:lumosBridge(lumos),
     ...(!coordinator?{setupRequired:true,message:'Create the unique Orchestrator profile through bin/setup-orchestrator.mjs --apply.'}:{})};
 }
 export function planOrchestratorSetup(bots){

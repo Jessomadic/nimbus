@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
-import {ORCHESTRATOR_PROFILE_ID,resolveOrchestrator,resolveTaskWorker,orchestratorStatus,planOrchestratorSetup,createTaskSubmission} from '../runtime/orchestrator.js';
+import {ORCHESTRATOR_PROFILE_ID,resolveOrchestrator,resolveTaskWorker,orchestratorStatus,planOrchestratorSetup,createTaskSubmission,lumosBridge} from '../runtime/orchestrator.js';
 import {setupOrchestrator} from '../bin/setup-orchestrator.mjs';
 import {ROLE_PROFILES} from '../runtime/roles.js';
 
@@ -62,6 +62,14 @@ test('Coordinator resolution uses the unique profile and refuses name collisions
   assert.throws(()=>resolveOrchestrator([worker(6,'Orchestrator','custom')]),errorCode('orchestrator_name_collision'));
   assert.throws(()=>resolveOrchestrator([...bots,worker(5,'Second Root','orchestrator')]),errorCode('ambiguous_orchestrator'));
   assert.throws(()=>resolveOrchestrator([worker(5,'Orchestrator','orchestrator',31)]),errorCode('orchestrator_has_parent'));
+});
+
+test('Discovery reports the live Lumos bridge when Nimbus serves Lumos (live 2026-11-26: it said not_configured while Lumos was connected)',()=>{
+  const live=orchestratorStatus(roster(),{lumos:{enabled:true,ready:true,botId:45}});
+  assert.equal(live.bridge.connected,true);assert.equal(live.bridge.status,'connected');assert.equal(live.bridge.botId,45);
+  assert.equal(lumosBridge({enabled:false,ready:false,botId:45}).status,'disabled');
+  assert.equal(lumosBridge({enabled:true,ready:false}).status,'not_ready');
+  assert.equal(lumosBridge(null).status,'not_configured');
 });
 
 test('Discovery and setup plan are honest about the unconfigured Hermes/Lumos bridge and preserve nonnull parents',()=>{
