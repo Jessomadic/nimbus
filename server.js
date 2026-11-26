@@ -862,7 +862,7 @@ const lumosSchedules=createLumosSchedules({db,getConfig:config,send:async(text,t
 setLumos(lumos);
 lumos.start().catch(error=>console.error('Lumos listener did not start:',error.message));
 lumosSchedules.start();
-route('GET','/api/lumos/status',(req,res)=>json(res,200,{...lumos.status(),schedules:lumosSchedules.list(),schedulesEnabled:config().lumos.schedulesEnabled}));
+route('GET','/api/lumos/status',(req,res)=>json(res,200,{...lumos.status(),schedules:lumosSchedules.list(),schedulerLastTickAt:lumosSchedules.lastTickAt(),schedulesEnabled:config().lumos.schedulesEnabled}));
 // The lumos-memory server's CLI modes (integration/lumos-memory/server.py).
 function lumosMemoryHooks(){
   const py='F:/Projects/Lumos/HermesPilot/integrations/.venv/Scripts/python.exe',script=path.join(ROOT,'integration','lumos-memory','server.py'),home=path.join(DATA_DIR,'lumos','home');

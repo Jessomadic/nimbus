@@ -188,12 +188,31 @@ test('schedules run a script once per fire, honor the wake gate and report failu
   assert.equal(wakes(''),false);assert.equal(wakes('text\n{"wakeAgent": true}'),true);
 });
 
+test('schedules still fire after earlier ticks found Lumos disabled or nothing due (live 2026-11-25 miss)',async()=>{
+  const db=new DatabaseSync(':memory:'),dir=fs.mkdtempSync(path.join(os.tmpdir(),'lumos-sched-'));
+  fs.mkdirSync(path.join(dir,'scripts'));fs.writeFileSync(path.join(dir,'scripts','ok.py'),'');
+  const sent=[],spawnProcess=()=>{const c=new EventEmitter();c.stdout=new EventEmitter();c.stderr=new EventEmitter();setImmediate(()=>{c.stdout.emit('data','Evening check.');c.emit('close',0);});return c;};
+  let now=new Date(2026,10,25,11,18,0);
+  const cfg={lumos:{...LUMOS_DEFAULTS,enabled:false,schedulesEnabled:false,botId:7,homeDir:dir}};
+  const s=createLumosSchedules({db,getConfig:()=>cfg,send:async(text)=>sent.push(text),clock:()=>new Date(now),spawnProcess,log:{error(){}}});
+  s.upsert({id:'evening',name:'evening',cron:'30 18 * * *',script:'ok.py',enabled:true});
+  const realNow=Date.now;Date.now=()=>now.getTime();
+  try{
+    await s.tick();                                   // startup: Lumos still off
+    cfg.lumos.enabled=true;cfg.lumos.schedulesEnabled=true;
+    now=new Date(2026,10,25,12,0,0);await s.tick();   // on, nothing due
+    now=new Date(2026,10,25,18,30,5);await s.tick();  // due
+  }finally{Date.now=realNow;}
+  assert.deepEqual(sent,['Evening check.']);
+  assert.ok(s.lastTickAt(),'status reports the last scheduler pass');
+});
+
 test('each turn gets remembered facts and the owner message is offered for learning after the reply',async t=>{
   const extracted=[];
   const f=await fixture(t,{memory:{prefetch:async text=>text.includes('coffee')?['Jesse drinks oat-milk lattes']:[],extract:async m=>extracted.push(m)}});
   f.post(f.webhook(1,'Order my usual coffee'));await settle(f);
   const run=f.db.prepare('SELECT * FROM runs').get();
-  assert.match(run.prompt,/Remembered facts that may be relevant[^]*oat-milk lattes/);
+  assert.match(run.prompt,/^Order my usual coffee\n\n<remembered-facts>\nRemembered facts that may be relevant[^]*NOT part of Jesse's message[^]*- Jesse drinks oat-milk lattes\n<\/remembered-facts>$/);
   f.finishRun(run.id,'done','Ordered.');await settle(f);
   assert.deepEqual(extracted,[[{role:'user',content:'Order my usual coffee'}]]);
 });

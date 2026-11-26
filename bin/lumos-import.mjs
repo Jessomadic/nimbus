@@ -31,7 +31,7 @@ function walk(dir){const out=[];if(!fs.existsSync(dir))return out;for(const e of
 // The Lumos persona for Nimbus: SOUL.md without the Hermes identity line, plus
 // the owner rules from AGENTS.md that still apply. Hermes-only routing, source
 // and gateway notes are left out.
-export function renderPersona(soul,agents){
+export function renderPersona(soul,agents,home){
   const body=soul.replace(/^You are Hermes Agent, built by Nous Research\.\s*/,'');
   const keep=[];
   for(const para of String(agents||'').split(/\n\s*\n/)){
@@ -42,7 +42,7 @@ export function renderPersona(soul,agents){
 ${body.trim()}
 
 ## Nimbus notes
-- Your final answer is sent to Jesse as iMessage bubbles automatically (one bubble per paragraph). Use openbubbles_operation only for files (kind "attachments" with files:[{path}]), reactions, typing, edits, unsends or effects.
+${home?`- ${homeNote(home)}\n`:''}- Your final answer is sent to Jesse as iMessage bubbles automatically (one bubble per paragraph). Use openbubbles_operation only for files (kind "attachments" with files:[{path}]), reactions, typing, edits, unsends or effects.
 - Do not ask questions through other channels; ask in your reply.
 - Voice memos and audio arrive as files: transcribe them with transcribe_local_audio (rich-tools) before answering. Images: inspect them with view_image.
 - Reminders and follow-up checks: use lumos_reminder (kind "message" for a reminder text, kind "task" for a check you should run later and report).
@@ -62,6 +62,9 @@ ${keep.map(p=>'- '+p).join('\n')}
 `;
 }
 
+export function homeNote(home){
+  return `Your Lumos home is ${home}. Your data (tracker tracker, weather runs, feedback), scripts, memories and skills live there, and the scheduled checks run from there. Remembered facts and skills may still name F:\\Projects\\Lumos\\HermesPilot\\home or Documents\\HermesPilot\\home: that is the retired Hermes copy, which Nimbus never reads. Use the same relative path under your Lumos home, and never read or change the Hermes copy.`;
+}
 export function ensureIntegrationsLink(root,target){
   const link=path.join(root,'integrations');
   if(!fs.existsSync(target))return {linked:false,reason:'missing '+target};
@@ -94,7 +97,7 @@ for(const item of plan){
 const after=Object.entries(before).filter(([rel,h])=>sha(path.join(hermes,rel))!==h).map(([rel])=>rel);
 manifest.sourceUnchanged=after.length===0;manifest.changedDuringCopy=after;
 fs.mkdirSync(path.join(gen,'persona'),{recursive:true});
-fs.writeFileSync(path.join(gen,'persona','LUMOS.md'),renderPersona(fs.readFileSync(path.join(hermes,'SOUL.md'),'utf8'),fs.existsSync(agentsFile)?fs.readFileSync(agentsFile,'utf8'):''));
+fs.writeFileSync(path.join(gen,'persona','LUMOS.md'),renderPersona(fs.readFileSync(path.join(hermes,'SOUL.md'),'utf8'),fs.existsSync(agentsFile)?fs.readFileSync(agentsFile,'utf8'):'',gen));
 // Original memory text, kept for the divergence report after a rollback.
 fs.mkdirSync(path.join(gen,'baseline'),{recursive:true});
 for(const f of ['MEMORY.md','USER.md'])if(fs.existsSync(path.join(gen,'memories',f)))fs.copyFileSync(path.join(gen,'memories',f),path.join(gen,'baseline',f));

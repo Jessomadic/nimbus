@@ -25,7 +25,7 @@ export function createLumosSchedules({db,getConfig,send,clock=()=>new Date(),spa
   db.exec(SCHEDULE_SCHEMA);
   const q=sql=>db.prepare(sql);
   const cfg=()=>getConfig().lumos;
-  let timer=null,running=null;
+  let timer=null,running=null,lastTickAt=null;
   function upsert(job){
     if(!isValidCron(job.cron))throw new Error('Invalid cron expression for '+job.name);
     if(!/^[\w.-]+\.py$/.test(job.script))throw new Error('Schedule scripts must be .py files in the Lumos scripts folder');
@@ -60,9 +60,15 @@ export function createLumosSchedules({db,getConfig,send,clock=()=>new Date(),spa
     try{await send(text,'nimbus-sched-'+createHash('sha256').update(key).digest('hex').slice(0,40));q("UPDATE lumos_schedule_runs SET state='sent',updated_at=? WHERE fire_key=?").run(Math.floor(Date.now()/1000),key);}
     catch(error){q("UPDATE lumos_schedule_runs SET state='uncertain',error=?,updated_at=? WHERE fire_key=?").run(String(error.message).slice(0,500),Math.floor(Date.now()/1000),key);log.error('Lumos schedule send:',error.message);}
   }
-  async function tick(){
+  function tick(){
     if(running)return running;
-    running=(async()=>{
+    // Clear the busy marker in .finally, never inside the async body: a pass with
+    // no await (Lumos disabled, nothing due) would finish before running was even
+    // assigned, leaving it set for good and silently stopping every later fire.
+    running=runTick().finally(()=>{running=null;});
+    return running;
+  }
+  async function runTick(){
       try{
         // A fire claimed before a crash is uncertain; it is never re-run.
         q("UPDATE lumos_schedule_runs SET state='uncertain',error='interrupted',updated_at=? WHERE state IN ('running','sending') AND updated_at<?").run(Math.floor(Date.now()/1000),Math.floor(Date.now()/1000)-300);
@@ -77,12 +83,10 @@ export function createLumosSchedules({db,getConfig,send,clock=()=>new Date(),spa
           }
         }
       }catch(error){log.error('Lumos schedules:',error.message);}
-      finally{running=null;}
-    })();
-    return running;
+      lastTickAt=new Date().toISOString();
   }
   return {
-    upsert,list,setEnabled,tick,
+    upsert,list,setEnabled,tick,lastTickAt:()=>lastTickAt,
     start(){timer??=setInterval(()=>{tick();},30000);timer.unref?.();tick();},
     async stop(){if(timer){clearInterval(timer);timer=null;}await running;},
   };

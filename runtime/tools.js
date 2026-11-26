@@ -78,6 +78,17 @@ export const coreTools = [
   ...specialistTools
 ];
 function workerPath(botId, relative = '.') { return path.resolve(botDir(botId), relative); }
+// Since the cutover Lumos owns a Nimbus copy of its Hermes home. The Hermes home
+// (and its older Documents location, still named in remembered facts) is the
+// stopped backend's state: reading it gives stale data and writing it edits data
+// Nimbus never uses. Any Lumos tool call naming it is refused with the Nimbus path.
+const HERMES_HOME=/[A-Za-z]:(?:\\\\|\\|\/)+(?:Projects(?:\\\\|\\|\/)+Lumos|Users(?:\\\\|\\|\/)+[^\\\/"]+(?:\\\\|\\|\/)+Documents)(?:\\\\|\\|\/)+HermesPilot(?:\\\\|\\|\/)+home(?![\w-])/i;
+export function lumosHermesHomeError(args,homeDir){
+  const text=JSON.stringify(args??{});
+  const match=text.match(HERMES_HOME);
+  if(!match)return null;
+  return {error:`${match[0].replace(/\\\\/g,'\\')} is the old Hermes copy of your Lumos home; Hermes is stopped and Nimbus never reads it. Use your Nimbus Lumos home instead: ${homeDir||'(not configured)'} (same layout: data, scripts, memories, skills). Re-run the step with that path.`,code:'hermes_home_retired',lumosHome:homeDir||null};
+}
 function sharedPath(key) {
   const root = path.join(DATA_DIR, 'shared');
   const file = path.resolve(root, key);
@@ -133,6 +144,8 @@ export function connectorImages(bot,result){
 }
 export async function executeTool(bot, name, args, { signal, bindings, askWorker, workerResult, updatePlan, askUser,sendChildContext,questionInbox,answerWorkerQuestion,escalateWorkerQuestion,availableTools,connectorErrors,runId,requestTool,toolRequestStatus,projectRecovery,projectSuccessorHandoff,openBubblesAuthority } = {}) {
   signal?.throwIfAborted();
+  // Cheap text check first: config() reads the config file, and most calls never name the Hermes home.
+  if(HERMES_HOME.test(JSON.stringify(args??{}))&&bot.id===config().lumos?.botId){const stale=lumosHermesHomeError(args,config().lumos.homeDir);if(stale)return stale;}
   // Dispatch memory only after the conversation-scope gate below.
   if(runId!==undefined&&q('SELECT delegation_scope FROM runs WHERE id=?').get(runId)?.delegation_scope==='conversation'){
     const scopeError=conversationToolError(name,args);if(scopeError)return scopeError;

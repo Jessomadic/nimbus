@@ -44,4 +44,6 @@ test('Lumos import copies a consistent generation, renders the persona, maps sch
   const review=JSON.parse(fs.readFileSync(path.join(gen,'skills-review.json'),'utf8'));
   assert.equal(review.skills.length,80);assert.ok(review.toolMap.image_generate);
   assert.match(persona,/design_render/);assert.match(persona,/Never call python3/);
+  assert.ok(persona.includes('Your Lumos home is '+out.generation),'persona names this generation as the Lumos home');
+  assert.match(persona,/retired Hermes copy/);
 });
