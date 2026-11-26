@@ -26,10 +26,25 @@ TOOL = {
 }
 
 
+# ddgs "auto" often returns nothing for a query that works a second later (live 2026-11-25:
+# "Node.js 26 release date" failed twice, then returned 5). Fall back across keyless engines.
+BACKENDS = ("auto", "brave", "mojeek", "yahoo", "duckduckgo", "startpage")
+
+
 def search(query: str, limit: int) -> list[dict]:
     from ddgs import DDGS
-    results = DDGS().text(query, max_results=limit) or []
-    return [{"title": r.get("title", ""), "url": r.get("href") or r.get("url", ""), "snippet": r.get("body", "")} for r in results]
+    errors = []
+    for backend in BACKENDS:
+        try:
+            results = DDGS().text(query, max_results=limit, backend=backend) or []
+        except Exception as exc:  # "No results found" is raised as an exception
+            errors.append(f"{backend}: {exc}")
+            continue
+        hits = [{"title": r.get("title", ""), "url": r.get("href") or r.get("url", ""), "snippet": r.get("body", "")} for r in results]
+        if hits:
+            return hits
+        errors.append(f"{backend}: no results")
+    raise RuntimeError("No results from any engine (" + "; ".join(errors)[:600] + ")")
 
 
 def handle(msg: dict) -> dict | None:
@@ -61,6 +76,10 @@ def handle(msg: dict) -> dict | None:
 
 
 def main() -> None:
+    # MCP stdio is UTF-8. The Windows default (cp1252) turned "—" into "�" and crashed the
+    # server on characters outside cp1252 (live 2026-11-25: U+2011 in a search snippet).
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
     stdout = sys.stdout
     for line in sys.stdin:
         line = line.strip()

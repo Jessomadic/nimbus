@@ -17,6 +17,7 @@ import {timingSafeEqual,createHash} from 'node:crypto';
 import {MIME,MAX_FILE,chunks} from './openbubbles-protocol.js';
 import {OpenBubblesStore} from './openbubbles-store.js';
 import {hostAuthority,attachHostRun,dispatchOpenBubbles} from './openbubbles-dispatch.js';
+import {resolveOrchestrator} from './orchestrator.js';
 import {LumosTopics} from './lumos-topics.js';
 import {cronMatches,isValidCron} from './cron.js';
 import {serviceManualRequested,MANUAL_ROUTE} from './lumos-manual.js';
@@ -26,7 +27,8 @@ CREATE TABLE IF NOT EXISTS lumos_delivery(run_id INTEGER PRIMARY KEY,guid TEXT N
 CREATE TABLE IF NOT EXISTS lumos_notes(id TEXT PRIMARY KEY,guid TEXT,text TEXT NOT NULL,state TEXT NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS lumos_run_model(run_id INTEGER PRIMARY KEY,tier TEXT NOT NULL,effort TEXT NOT NULL,reason TEXT);
 CREATE TABLE IF NOT EXISTS lumos_reviews(id INTEGER PRIMARY KEY,reviewer_run INTEGER,validator_run INTEGER,state TEXT NOT NULL,exchanges TEXT NOT NULL,created_at INTEGER NOT NULL,note TEXT);
-CREATE TABLE IF NOT EXISTS lumos_reminders(id TEXT PRIMARY KEY,kind TEXT NOT NULL,text TEXT NOT NULL,at INTEGER,cron TEXT,topic TEXT,state TEXT NOT NULL,created_at INTEGER NOT NULL,created_run INTEGER,last_fire TEXT,fires INTEGER NOT NULL DEFAULT 0);`;
+CREATE TABLE IF NOT EXISTS lumos_reminders(id TEXT PRIMARY KEY,kind TEXT NOT NULL,text TEXT NOT NULL,at INTEGER,cron TEXT,topic TEXT,state TEXT NOT NULL,created_at INTEGER NOT NULL,created_run INTEGER,last_fire TEXT,fires INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS lumos_handoffs(id TEXT PRIMARY KEY,child_run INTEGER NOT NULL UNIQUE,parent_run INTEGER,parent_thread TEXT,parent_source TEXT,topic TEXT,task TEXT NOT NULL,state TEXT NOT NULL,followup_run INTEGER,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);`;
 const BINDING='lumos',GENERATION=1;
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TERMINAL={done:'success',error:'failure',needs_review:'failure',stopped:'cancelled',interrupted:'failure'};
@@ -399,6 +401,58 @@ export function createLumos({db,getConfig,loadRoute,insertRun,enqueue,stopRun,pa
     }
   }
 
+  // --- Handoffs to the Nimbus Orchestrator ------------------------------------
+  // Lumos hands long or multi-step work to the Orchestrator and answers Jesse at once.
+  // The Orchestrator run is independent (no parent link, so it outlives Lumos's turn).
+  // When it ends, a follow-up Lumos run in the same conversation relays the result;
+  // over iMessage that reply is delivered like a task reminder. Each report is claimed once.
+  const HANDOFF_END=['done','error','stopped','needs_review','interrupted','paused'];
+  function handoff(bot,args,runId){
+    if(bot.id!==cfg().botId)throw new Error('lumos_handoff is only available to Lumos');
+    const action=args?.action||'create';
+    if(action==='list')return {handoffs:q("SELECT h.id,h.child_run AS runId,h.task,h.state,r.status FROM lumos_handoffs h LEFT JOIN runs r ON r.id=h.child_run ORDER BY h.created_at DESC LIMIT 20").all()};
+    if(action!=='create')throw new Error('action must be create or list');
+    const task=String(args.task||'').trim(),context=String(args.context||'').trim();
+    if(!task||task.length>8000)throw new Error('task is required (up to 8000 characters)');
+    if(context.length>20000)throw new Error('context is limited to 20000 characters');
+    // The canonical root Orchestrator (team orchestrators share the template but have a parent).
+    let orchestrator;try{orchestrator=resolveOrchestrator(q('SELECT * FROM bots ORDER BY id').all(),{required:false});}catch{orchestrator=null;}
+    if(!orchestrator)return {error:'No unique Nimbus Orchestrator is configured; do the work yourself or tell Jesse.'};
+    const parent=runId?q('SELECT thread,source FROM runs WHERE id=?').get(runId):null;
+    const topic=runId?q("SELECT topic FROM ob_inbox WHERE binding=? AND run_id=?").get(BINDING,runId)?.topic||null:null;
+    const id='h'+Date.now().toString(36)+Math.random().toString(36).slice(2,5);
+    const prompt='Task handed off by Lumos, Jesse\'s iMessage assistant. Do the work end to end and finish with a short, plain report Lumos can relay to Jesse: what was done, what was verified, and anything he must do.\n\nTask:\n'+task+(context?'\n\nContext from Lumos:\n'+context:'');
+    const child=tx(()=>{
+      const childRun=insertRun({botId:orchestrator.id,thread:'bot:'+orchestrator.id,prompt,source:'lumos',originRequestId:'lumos-handoff:'+id});
+      q("INSERT INTO lumos_handoffs(id,child_run,parent_run,parent_thread,parent_source,topic,task,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'waiting',?,?)").run(id,childRun,runId||null,parent?.thread||null,parent?.source||null,topic,task,now(),now());
+      return childRun;
+    });
+    enqueue(child);
+    return {handedOff:id,to:orchestrator.name,runId:child,status:'queued',note:'Tell Jesse in your reply that the Orchestrator is working on it. You will be started again with its result to report; do not wait or poll.'};
+  }
+  function checkHandoffs(){
+    const waiting=q(`SELECT h.*,r.status AS child_status FROM lumos_handoffs h JOIN runs r ON r.id=h.child_run WHERE h.state='waiting' AND r.status IN (${HANDOFF_END.map(()=>'?').join(',')})`).all(...HANDOFF_END);
+    for(const h of waiting){
+      if(q("UPDATE lumos_handoffs SET state='reporting',updated_at=? WHERE id=? AND state='waiting'").run(now(),h.id).changes!==1)continue;
+      const report=q("SELECT body FROM messages WHERE run_id=? AND kind IN ('text','error','quiet') ORDER BY id DESC LIMIT 1").get(h.child_run)?.body||'(no final report)';
+      const prompt=`Result of work you handed to the Nimbus Orchestrator (handoff ${h.id}, run #${h.child_run}, status: ${h.child_status}).\n\nThe task was:\n${h.task}\n\nThe Orchestrator's final report:\n${String(report).slice(0,8000)}\n\nTell Jesse the outcome now: what was done, what was verified, and anything he must do. If it did not finish, say so plainly. Do not hand the same work off again unless he asks.`;
+      const imessage=h.parent_source==='lumos'&&h.topic;
+      const followup=tx(()=>{
+        let id;
+        if(imessage){
+          const guid='handoff:'+h.id;
+          id=insertRun({botId:cfg().botId,thread:threadForTopic(h.topic),prompt,source:'lumos',originRequestId:'lumos-handoff-result:'+h.id});
+          q("INSERT INTO ob_inbox VALUES(?,?,?,?,?,?,?,'text',?)").run(BINDING,GENERATION,-(Date.now()%2147483647),guid,digest(guid),h.topic,id,JSON.stringify({handoff:h.id}));
+          q("INSERT INTO lumos_delivery(run_id,guid,state,updated_at) VALUES(?,?,'waiting',?)").run(id,guid,now());
+        }else id=insertRun({botId:cfg().botId,thread:h.parent_thread||'bot:'+cfg().botId,prompt,source:'lumos-handoff',originRequestId:'lumos-handoff-result:'+h.id});
+        q("UPDATE lumos_handoffs SET state='reported',followup_run=?,updated_at=? WHERE id=?").run(id,now(),h.id);
+        return id;
+      });
+      if(imessage)attachHostRun(followup,authority);
+      enqueue(followup);
+    }
+  }
+
   // --- Voice replies (pluggable local voice server) ---------------------------
   async function speak(bot,args,runId,{spawnProcess}={}){
     if(bot.id!==cfg().botId)throw new Error('lumos_speak is only available to Lumos');
@@ -420,7 +474,7 @@ export function createLumos({db,getConfig,loadRoute,insertRun,enqueue,stopRun,pa
 
   // --- Lifecycle -------------------------------------------------------------
   let delivering=null;
-  const tick=async()=>{if(delivering)return delivering;delivering=(async()=>{try{await deliver();if(ready()){await queueWork();await fireReminders();advanceReviews();}}catch(error){lastError=error.message;log.error('Lumos delivery:',error.message);}finally{delivering=null;}})();return delivering;};
+  const tick=async()=>{if(delivering)return delivering;delivering=(async()=>{try{await deliver();if(ready()){await queueWork();await fireReminders();checkHandoffs();advanceReviews();}}catch(error){lastError=error.message;log.error('Lumos delivery:',error.message);}finally{delivering=null;}})();return delivering;};
   async function start(){
     const l=cfg();
     try{route=loadRoute(l);ensureBinding();lastError=null;}catch(error){route=null;authority=null;lastError=error.message;}
@@ -453,5 +507,5 @@ export function createLumos({db,getConfig,loadRoute,insertRun,enqueue,stopRun,pa
   }
   // Re-read config (after enable/disable) and pick up a changed route.
   async function reconfigure(){try{route=loadRoute(cfg());ensureBinding();lastError=null;}catch(error){route=null;authority=null;lastError=error.message;}tick();return status();}
-  return {start,stop,status,reconfigure,handleWebhook,tick,topics,store,deliver,processInbox:queueWork,reminder,fireReminders,advanceReviews,speak,modelFor:runId=>q('SELECT tier,effort,reason FROM lumos_run_model WHERE run_id=?').get(runId)||null};
+  return {start,stop,status,reconfigure,handleWebhook,tick,topics,store,deliver,processInbox:queueWork,reminder,fireReminders,handoff,checkHandoffs,advanceReviews,speak,modelFor:runId=>q('SELECT tier,effort,reason FROM lumos_run_model WHERE run_id=?').get(runId)||null};
 }

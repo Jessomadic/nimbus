@@ -20,9 +20,11 @@ export function connectorAllowed(binding,owner){
   const b=registry.get(binding);if(!b||b.owner!==owner||!b.live())return false;
   try{const c=b.current();validateMcpScopes(c,{credentialResolver:true});return c.principal?.id===owner&&transportHash(c.mcpServers[b.server]||{})===b.transport&&permits(c.mcpServers[b.server],c.principal,c.mcpScopeGroups,b.tool);}catch{return false;}
 }
-export async function invokeConnector(binding,owner,args,{signal,timeout=120000}={}){
+export async function invokeConnector(binding,owner,args,{signal,timeout}={}){
   signal?.throwIfAborted();if(!connectorAllowed(binding,owner))throw new Error('MCP connector authorization denied');
   const b=registry.get(binding),provenance={owner,server:b.server,tool:b.tool,canonicalName:b.canonical};
+  // Per-connector deadline (validated 1 s..15 min in mcp-scope.js); e.g. a local model that loads on demand.
+  timeout??=b.definition.callTimeoutMs||120000;
   // No await between authorization and submission. Cached connections are not permissions.
   let result;
   try{result=await b.client.callTool({name:b.tool,arguments:args},undefined,{signal,timeout});}

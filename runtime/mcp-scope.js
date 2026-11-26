@@ -33,6 +33,7 @@ export function validateMcpScopes(c,{credentialResolver=false}={}){
       }
     }
     if(Object.hasOwn(def,'initTimeoutMs')&&(!Number.isInteger(def.initTimeoutMs)||def.initTimeoutMs<100||def.initTimeoutMs>120000))throw new Error('Invalid MCP initialization deadline');
+    if(Object.hasOwn(def,'callTimeoutMs')&&(!Number.isInteger(def.callTimeoutMs)||def.callTimeoutMs<1000||def.callTimeoutMs>900000))throw new Error('Invalid MCP call deadline');
     if(Object.hasOwn(def,'enabled')&&typeof def.enabled!=='boolean')throw new Error('Invalid MCP enabled flag');
     if(Object.hasOwn(def,'reviewedTools')&&(!Array.isArray(def.reviewedTools)||def.reviewedTools.length>10000||new Set(def.reviewedTools).size!==def.reviewedTools.length||def.reviewedTools.some(t=>!identifier(t))))throw new Error('Invalid MCP reviewed tool allowlist');
     // Never silently treat an unresolved reference as a literal credential.

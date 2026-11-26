@@ -305,3 +305,48 @@ test('voice replies: refused clearly without a voice server; with one, audio is 
   assert.ok(ffmpegArgs.includes('aac')&&ffmpegArgs.at(-1).endsWith('.m4a'));
   assert.equal(f.db.prepare("SELECT COUNT(*) n FROM ob_content WHERE run_id=?").get(run.id).n,1,'audio staged as private content');
 });
+
+test('handoffs: Lumos hands work to the Orchestrator, replies at once, and relays the result over iMessage exactly once',async t=>{
+  const f=await fixture(t);
+  f.post(f.webhook(1,'build me a tracker dashboard'));await settle(f);
+  const origin=f.db.prepare('SELECT * FROM runs').get();
+  assert.throws(()=>f.lumos.handoff({id:99},{task:'x'},origin.id),/only available to Lumos/);
+  assert.match(f.lumos.handoff({id:7},{task:'Build the dashboard.'},origin.id).error,/No unique Nimbus Orchestrator/);
+  // Team orchestrators share the template but have a parent; only the root one receives handoffs.
+  f.db.exec('ALTER TABLE bots ADD COLUMN parent_bot_id INTEGER');
+  f.db.prepare("INSERT INTO bots(id,name,tools,template,model) VALUES(22,'Orchestrator','[]','orchestrator','auto')").run();
+  f.db.prepare("INSERT INTO bots(id,name,tools,template,model,parent_bot_id) VALUES(41,'Memory Orchestrator','[]','orchestrator','auto',22)").run();
+  assert.throws(()=>f.lumos.handoff({id:7},{task:'  '},origin.id),/task is required/);
+  const h=f.lumos.handoff({id:7},{task:'Build the tracker dashboard.',context:'Tracker is in the Lumos home.'},origin.id);
+  assert.equal(h.to,'Orchestrator');assert.equal(h.status,'queued');
+  const child=f.db.prepare('SELECT * FROM runs WHERE id=?').get(h.runId);
+  assert.equal(child.bot_id,22);assert.equal(child.thread,'bot:22');assert.equal(child.parent_run,null,'independent of the Lumos turn');
+  assert.match(child.prompt,/Build the tracker dashboard\.[\s\S]*Tracker is in the Lumos home\./);
+  assert.ok(f.runs.includes(h.runId),'the Orchestrator run is queued');
+  // Lumos answers Jesse right away; the handoff stays open while the Orchestrator works.
+  f.finishRun(origin.id,'done','On it: the Orchestrator is building it.');await settle(f);
+  assert.equal(f.sent.at(-1).message,'On it: the Orchestrator is building it.');
+  f.db.prepare("UPDATE runs SET status='running' WHERE id=?").run(h.runId);f.lumos.checkHandoffs();
+  assert.equal(f.db.prepare("SELECT count(*) n FROM runs WHERE origin_request_id LIKE 'lumos-handoff-result:%'").get().n,0);
+  f.finishRun(h.runId,'done','Dashboard built at F:/x/dashboard.html and checked.');
+  f.lumos.checkHandoffs();f.lumos.checkHandoffs();
+  const followups=f.db.prepare("SELECT * FROM runs WHERE origin_request_id LIKE 'lumos-handoff-result:%'").all();
+  assert.equal(followups.length,1,'reported exactly once');
+  assert.equal(followups[0].bot_id,7);assert.equal(followups[0].thread,origin.thread,'same conversation');assert.equal(followups[0].source,'lumos');
+  assert.match(followups[0].prompt,/status: done[\s\S]*Dashboard built at F:\/x\/dashboard\.html/);
+  f.finishRun(followups[0].id,'done','Your dashboard is ready.');await settle(f);
+  assert.equal(f.sent.at(-1).message,'Your dashboard is ready.');
+  assert.ok(!f.completed.some(c=>String(c.guid).startsWith('handoff:')),'handoff results never touch the relay ledger');
+  assert.deepEqual(f.lumos.handoff({id:7},{action:'list'},origin.id).handoffs.map(x=>[x.state,x.status]),[['reported','done']]);
+});
+
+test('handoffs from a Nimbus chat report back into that chat, not over iMessage',async t=>{
+  const f=await fixture(t);
+  f.db.prepare("INSERT INTO bots VALUES(22,'Orchestrator','[]','orchestrator','auto')").run();
+  const parent=Number(f.db.prepare("INSERT INTO runs(bot_id,thread,prompt,status,source) VALUES(7,'bot:7','x','running','user')").run().lastInsertRowid);
+  const h=f.lumos.handoff({id:7},{task:'Summarize the logs.'},parent);
+  f.finishRun(h.runId,'error','Could not read the logs.');f.lumos.checkHandoffs();
+  const followup=f.db.prepare("SELECT * FROM runs WHERE origin_request_id LIKE 'lumos-handoff-result:%'").get();
+  assert.equal(followup.thread,'bot:7');assert.equal(followup.source,'lumos-handoff');assert.match(followup.prompt,/status: error[\s\S]*Could not read the logs/);
+  assert.equal(f.db.prepare("SELECT count(*) n FROM lumos_delivery WHERE run_id=?").get(followup.id).n,0,'no iMessage delivery');
+});
