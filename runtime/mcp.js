@@ -16,6 +16,7 @@ import {redact} from '../redact.js';
 import {permits,validateMcpScopes,transportHash,reviewedReadOnly} from './mcp-scope.js';
 import {UncertainAction} from './action-error.js';
 const registry=new WeakMap();
+export const MCP_INHERITED_ENV=['PATH','Path','PATHEXT','HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','USERNAME','SYSTEMROOT','SystemRoot','SYSTEMDRIVE','WINDIR','TEMP','TMP','COMSPEC','APPDATA','LOCALAPPDATA','PROGRAMDATA','PROGRAMFILES','PROGRAMFILES(X86)','COMMONPROGRAMFILES','PROCESSOR_ARCHITECTURE','NUMBER_OF_PROCESSORS','OS','PSModulePath'];
 export function connectorAllowed(binding,owner){
   const b=registry.get(binding);if(!b||b.owner!==owner||!b.live())return false;
   try{const c=b.current();validateMcpScopes(c,{credentialResolver:true});return c.principal?.id===owner&&transportHash(c.mcpServers[b.server]||{})===b.transport&&permits(c.mcpServers[b.server],c.principal,c.mcpScopeGroups,b.tool);}catch{return false;}
@@ -138,7 +139,10 @@ export class WorkerConnectors {
           command = process.execPath; args = [cli, ...args];
         }
         const env = {};
-        for (const key of ['PATH','Path','HOME','USERPROFILE','SYSTEMROOT','SystemRoot','TEMP','TMP','COMSPEC','APPDATA','LOCALAPPDATA','PROGRAMFILES']) if (process.env[key]) env[key] = process.env[key];
+        // Minimal, non-secret system environment. PATHEXT is required on Windows: without it
+        // PowerShell inside a server treats an .exe as a document (live 2026-11-25: the local
+        // specialist's "& lms.exe ps | ConvertFrom-Json" failed with "Cannot run a document").
+        for (const key of MCP_INHERITED_ENV) if (process.env[key]) env[key] = process.env[key];
         transport = new StdioClientTransport({ command, args, cwd: definition.cwd, env: { ...env, ...definition.env }, stderr: 'pipe' });
       }
       // SDK clears its process pointer before awaiting exit. All cleanup callers
