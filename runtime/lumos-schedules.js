@@ -23,7 +23,7 @@ export function wakes(output){
 
 // Nimbus's .env may set TZ to an IANA name (America/New_York) for Node. On
 // Windows, Python and other C-runtime programs cannot parse that form and fall
-// back to UTC (live 2026-11-26: the 08:00 tracker check saw +00:00 and refused
+// back to UTC (live 2026-11-26: the 08:00 weather check saw +00:00 and refused
 // to run). Such children use the Windows time zone instead.
 export function scriptEnvironment(base,platform=process.platform){
   const env={...base};

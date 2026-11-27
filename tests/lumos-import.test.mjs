@@ -14,6 +14,11 @@ test('Lumos import copies a consistent generation, renders the persona, maps sch
   const base=fs.mkdtempSync(path.join(os.tmpdir(),'lumos-import-')),home=path.join(base,'HermesPilot','home'),data=path.join(base,'nimbus-data');
   fs.mkdirSync(path.join(base,'HermesPilot','integrations','knowledge_tools'),{recursive:true});
   for(const d of ['memories','cron','scripts','skills/productivity/demo','data/weather_runs'])fs.mkdirSync(path.join(home,d),{recursive:true});
+  fs.writeFileSync(path.join(home,'data','weather_runs','2026-11-01.json'),'{"status":"ok"}');fs.writeFileSync(path.join(home,'data','feedback.json'),'{}');
+  const tracker=new DatabaseSync(path.join(home,'data','tracker.sqlite3'));tracker.exec("PRAGMA journal_mode=WAL;CREATE TABLE reports(id INTEGER PRIMARY KEY,note TEXT);INSERT INTO reports(note) VALUES('kept')");
+  // The skill review lists the owner's own skills, so it comes from the private data folder.
+  fs.mkdirSync(path.join(data,'lumos'),{recursive:true});
+  fs.writeFileSync(path.join(data,'lumos','skills-review.json'),JSON.stringify({toolMap:{image_generate:'design_render'},skills:Array.from({length:80},(_,i)=>({name:'skill-'+i,class:'ready'}))}));
   fs.writeFileSync(path.join(home,'SOUL.md'),'You are Hermes Agent, built by Nous Research. Be direct.\n\nAccuracy matters.');
   fs.writeFileSync(path.join(base,'HermesPilot','AGENTS.md'),'# Lumos integration contract\n\nGemma, Luna routing details.\n\nOwner execution policy (2026-09-30): approvals off.\n\nKeep OpenBubbles/Apple activation unchanged. Test messages only to the owner.');
   fs.writeFileSync(path.join(home,'memories','MEMORY.md'),'fact one§fact two');fs.writeFileSync(path.join(home,'memories','USER.md'),'likes short replies');
@@ -23,13 +28,19 @@ test('Lumos import copies a consistent generation, renders the persona, maps sch
   const db=new DatabaseSync(path.join(home,'state.db'));db.exec("PRAGMA journal_mode=WAL;CREATE TABLE messages(id INTEGER PRIMARY KEY,content TEXT);INSERT INTO messages(content) VALUES('hello')");
   const before=sha(path.join(home,'memories','MEMORY.md'));
   const out=JSON.parse(execFileSync(process.execPath,['--no-warnings',path.join(ROOT,'bin','lumos-import.mjs'),'--hermes-home',home],{env:{...process.env,NIMBUS_DATA:data},encoding:'utf8'}));
-  db.close();
+  db.close();tracker.close();
   assert.equal(out.sourceUnchanged,true);
   const gen=out.generation;
   assert.equal(JSON.parse(fs.readFileSync(path.join(data,'lumos','home','current.json'),'utf8')).path,gen);
   const copy=new DatabaseSync(path.join(gen,'state.db'),{readOnly:true});
   assert.equal(copy.prepare('SELECT content FROM messages').get().content,'hello','WAL content is in the consistent copy');copy.close();
   assert.equal(fs.readFileSync(path.join(gen,'memories','MEMORY.md'),'utf8'),'fact one§fact two');
+  const trackerCopy=new DatabaseSync(path.join(gen,'data','tracker.sqlite3'),{readOnly:true});
+  assert.equal(trackerCopy.prepare('SELECT note FROM reports').get().note,'kept','data/ databases are backed up with their WAL content');trackerCopy.close();
+  assert.ok(fs.existsSync(path.join(gen,'data','weather_runs','2026-11-01.json'))&&fs.existsSync(path.join(gen,'data','feedback.json')),'the rest of data/ is copied');
+  const copied=JSON.parse(fs.readFileSync(path.join(gen,'manifest.json'),'utf8')).files;
+  assert.ok(!copied.some(f=>/-(wal|shm)$/.test(f.path)),'no WAL side files are copied');
+  assert.equal(copied.find(f=>f.path==='data/tracker.sqlite3')?.kind,'sqlite');
   assert.ok(fs.existsSync(path.join(gen,'skills','productivity','demo','SKILL.md')));
   assert.ok(fs.existsSync(path.join(gen,'baseline','USER.md')));
   const persona=fs.readFileSync(path.join(gen,'persona','LUMOS.md'),'utf8');

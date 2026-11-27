@@ -23,9 +23,11 @@ const gen=path.join(root,'gen-'+stamp);
 const sha=file=>createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 const FILES=['SOUL.md','memories/MEMORY.md','memories/USER.md','topic-sessions.json','service-manual-policy.json','cron/jobs.json'];
-const DBS=['memory_store.db','state.db','data/tracker_outcomes.sqlite3'];
-const TREES=['skills','scripts','data/weather_runs'];
-const EXTRA=['data/tracker_feedback.json'];
+const DBS=['memory_store.db','state.db'];
+// Everything under data/ (trackers, run records, feedback) comes along. SQLite files
+// there are copied with an online backup; their -wal/-shm files are not copied.
+const TREES=['skills','scripts','data'];
+const sqliteData=rel=>rel.startsWith('data/')&&/\.(sqlite3?|db)$/i.test(rel);
 
 function walk(dir){const out=[];if(!fs.existsSync(dir))return out;for(const e of fs.readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,e.name);if(e.isSymbolicLink())continue;if(e.isDirectory()){if(['__pycache__','.hub'].includes(e.name))continue;out.push(...walk(p));}else if(e.isFile())out.push(p);}return out;}
 // The Lumos persona for Nimbus: SOUL.md without the Hermes identity line, plus
@@ -63,7 +65,7 @@ ${keep.map(p=>'- '+p).join('\n')}
 }
 
 export function homeNote(home){
-  return `Your Lumos home is ${home}. Your data (tracker tracker, weather runs, feedback), scripts, memories and skills live there, and the scheduled checks run from there. Remembered facts and skills may still name F:\\Projects\\Lumos\\HermesPilot\\home or Documents\\HermesPilot\\home: that is the retired Hermes copy, which Nimbus never reads. Use the same relative path under your Lumos home, and never read or change the Hermes copy.`;
+  return `Your Lumos home is ${home}. Your data (trackers, run records, feedback), scripts, memories and skills live there, and the scheduled checks run from there. Remembered facts and skills may still name F:\\Projects\\Lumos\\HermesPilot\\home or Documents\\HermesPilot\\home: that is the retired Hermes copy, which Nimbus never reads. Use the same relative path under your Lumos home, and never read or change the Hermes copy.`;
 }
 export function ensureIntegrationsLink(root,target){
   const link=path.join(root,'integrations');
@@ -76,9 +78,13 @@ export function ensureIntegrationsLink(root,target){
 const isMain=process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url);
 if(isMain){
 const plan=[];
-for(const rel of [...FILES,...EXTRA])if(fs.existsSync(path.join(hermes,rel)))plan.push({rel,kind:'file'});
+for(const rel of FILES)if(fs.existsSync(path.join(hermes,rel)))plan.push({rel,kind:'file'});
 for(const rel of DBS)if(fs.existsSync(path.join(hermes,rel)))plan.push({rel,kind:'sqlite'});
-for(const tree of TREES)for(const file of walk(path.join(hermes,tree)))plan.push({rel:path.relative(hermes,file).replaceAll('\\','/'),kind:'file'});
+for(const tree of TREES)for(const file of walk(path.join(hermes,tree))){
+  const rel=path.relative(hermes,file).replaceAll('\\','/');
+  if(/-(wal|shm)$/i.test(rel))continue;
+  plan.push({rel,kind:sqliteData(rel)?'sqlite':'file'});
+}
 if(dry){console.log(JSON.stringify({hermes,destination:gen,items:plan.length,sqlite:plan.filter(p=>p.kind==='sqlite').map(p=>p.rel)},null,2));process.exit(0);}
 if(!fs.existsSync(path.join(hermes,'SOUL.md')))throw new Error('Not a Hermes home: '+hermes);
 const before=Object.fromEntries(plan.map(p=>[p.rel,sha(path.join(hermes,p.rel))]));
@@ -110,8 +116,9 @@ fs.writeFileSync(path.join(gen,'manifest.json'),JSON.stringify(manifest,null,2))
 // their private runtime at <two levels above the Lumos home>/integrations, which is
 // HermesPilot/integrations under Hermes. Give the Nimbus home root the same link.
 ensureIntegrationsLink(root,path.join(path.dirname(hermes),'integrations'));
-// The audited skill review (bin/lumos-skills-review.json) travels with every generation.
-const review=path.join(path.dirname(fileURLToPath(import.meta.url)),'lumos-skills-review.json');
+// The audited skill review travels with every generation. It lists the owner's own
+// skills, so it lives in the private data folder (data/lumos/skills-review.json), not in git.
+const review=path.join(DATA_DIR,'lumos','skills-review.json');
 if(fs.existsSync(review))fs.copyFileSync(review,path.join(gen,'skills-review.json'));
 fs.writeFileSync(path.join(root,'current.json.part'),JSON.stringify({generation:path.basename(gen),path:gen,at:manifest.createdAt},null,2));
 fs.renameSync(path.join(root,'current.json.part'),path.join(root,'current.json'));

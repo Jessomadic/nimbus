@@ -7,7 +7,7 @@ const home='F:\\Nimbus\\data\\lumos\\home\\gen-x';
 test('Lumos tool calls naming the retired Hermes home are refused with the Nimbus path (live 2026-11-25 edits)',()=>{
   // Exact shapes from the live runs: shell commands and apply_patch paths.
   for(const args of [
-    {command:'$p="F:\\Projects\\Lumos\\HermesPilot\\home\\data\\tracker_outcomes.sqlite3"; python q.py $p'},
+    {command:'$p="F:\\Projects\\Lumos\\HermesPilot\\home\\data\\tracker.sqlite3"; python q.py $p'},
     {edits:[{operation:'update',path:'F:\\Projects\\Lumos\\HermesPilot\\home\\scripts\\weather_check.py'}]},
     {path:'F:/Projects/Lumos/HermesPilot/home/memories/MEMORY.md'},
     {command:'cd f:\\projects\\lumos\\hermespilot\\home\\scripts'},
@@ -22,7 +22,7 @@ test('Lumos tool calls naming the retired Hermes home are refused with the Nimbu
 
 test('the guard leaves the Nimbus home, the shared integrations runtime and look-alike names alone',()=>{
   for(const args of [
-    {path:home+'\\data\\tracker_outcomes.sqlite3'},
+    {path:home+'\\data\\tracker.sqlite3'},
     {command:'python F:\\Projects\\Lumos\\HermesPilot\\integrations\\knowledge_tools\\run.py'},
     {path:'F:\\Projects\\Lumos\\HermesPilot\\home-notes.txt'},
     {path:'F:\\Projects\\Lumos\\HermesPilot\\homework'},
