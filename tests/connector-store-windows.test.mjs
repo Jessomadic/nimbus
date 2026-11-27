@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createWindowsConnectorStore as create} from '../runtime/connector-store-windows.js';
-const python='C:/Users/Jesse Copas/AppData/Local/Programs/Python/Python312/python.exe'.replaceAll('/',String.fromCharCode(92));
+const python=[process.env.LOCALAPPDATA||'C:/Users/Example User/AppData/Local','Programs/Python/Python312/python.exe'].join('/').replaceAll('/',String.fromCharCode(92));
 test('native store missing enrollment denies before helper launch',async()=>{
  const store=create({python});
  await assert.rejects(store.read({sourceId:'missing',revision:1,ownerSid:'S-1-5-21-123'}),/Protected connector/);
