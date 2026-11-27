@@ -858,6 +858,7 @@ const lumosSchedules=createLumosSchedules({db,getConfig:config,send:async(text,t
   const l=config().lumos,r=loadLumosRoute(l);
   const response=await fetch(l.bridgeUrl+'/api/v1/message/text',{method:'POST',headers:{authorization:'Bearer '+r.token,'content-type':'application/json'},body:JSON.stringify({chatGuid:r.chat,message:text.slice(0,3900),tempGuid})});
   const ack=await response.json().catch(()=>({}));if(!response.ok||ack.status!==200)throw new Error('Bridge did not confirm the scheduled message');
+  try{lumos.recordSent('sched:'+tempGuid,text);}catch(error){console.error('Lumos schedule record:',error.message);}
 }});
 setLumos(lumos);
 lumos.start().catch(error=>console.error('Lumos listener did not start:',error.message));
